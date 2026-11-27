@@ -180,3 +180,7 @@ Left-click to dig · Right-click or F to flag · G to use a held power-up · R t
 - `server.py`: the authoritative game server (aiohttp HTTP + WebSocket). It handles rooms, mine generation, scoring and reach checks. Tune `W`, `H`, `MINES`, `REACH`, etc. at the top.
 - `static/game.js`: the Three.js client (rendering, movement, effects, sound). It loads Three.js from the jsDelivr CDN, so browsers need internet access.
 - `static/index.html`, `static/style.css`: the page and HUD.
+
+## License
+
+[MIT](LICENSE)
