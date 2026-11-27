@@ -17,7 +17,7 @@ import torch
 
 from .env import MineEnv
 from .models import load_model, save_model, safe_name
-from .policy import Spec, choose, upgrade
+from .policy import Spec, choose, upgrade, head_start
 
 # Every hyperparameter the lab exposes. The lab UI builds its form from this list.
 # live=True means it can be changed while a run is in progress.
@@ -60,6 +60,8 @@ SCHEMA = [
         {"key": "radius", "label": "Vision radius", "type": "int", "default": 3, "min": 1, "max": 7, "help": "The bot sees a (2r+1)² window of tiles around itself."},
         {"key": "hidden", "label": "Hidden layers", "type": "text", "default": "64", "help": "Comma-separated layer sizes, e.g. 64 or 128,64."},
         {"key": "activation", "label": "Activation", "type": "select", "options": ["tanh", "relu", "elu"], "default": "tanh"},
+        {"key": "head_start", "label": "Head start (logic hint)", "type": "bool", "default": False,
+         "help": "Model type 5 only, needs hidden layers of 11+ units. Wires the logic hint straight into new networks: dig a neighbour the numbers prove safe, never one they prove mined, walk to the nearest safe tile. Evolution refines it from there. Not applied when starting from a model that is already type 5."},
         {"key": "action_masking", "label": "Mask invalid actions", "type": "bool", "default": True, "help": "Never pick moves off the board or digs on revealed tiles."},
         {"key": "action_noise", "label": "Action noise", "type": "float", "default": 0.0, "min": 0, "max": 5, "step": 0.05, "live": True, "help": "Gumbel noise on action choice (exploration)."},
     ]},
@@ -233,9 +235,11 @@ def _train(cfg, cmd_q, evt_q):
     dev_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
 
     pop = spec.init(P, device)
+    hinted = False                                      # seeded from a v5 model: it has its own wiring
     if cfg["seed_model"]:
         m = load_model(cfg["seed_model"])
         old = m["spec_obj"]
+        hinted = old.version >= 5
         if 2 <= old.version < spec.version and (old.radius, old.hidden, old.activation) == (
                 spec.radius, spec.hidden, spec.activation):
             m["weights"] = upgrade(old, m["weights"], spec)     # warm-start a newer model from an older one
@@ -246,6 +250,8 @@ def _train(cfg, cmd_q, evt_q):
         w = m["weights"].to(device)
         pop = w.unsqueeze(0) + torch.randn(P, spec.n_params, device=device) * cfg["sigma"]
         pop[0] = w
+    if cfg.get("head_start") and spec.version >= 5 and not hinted:
+        head_start(spec, pop)
 
     _put(evt_q, {"t": "status", "state": "running", "device": dev_name, "params": spec.n_params,
                  "arch": spec.describe(), "cfg": cfg})

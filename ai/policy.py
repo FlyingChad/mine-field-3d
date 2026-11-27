@@ -159,6 +159,64 @@ def _v4_to_v5(old, w):
     return torch.cat([W1n.reshape(-1), b1] + [t.reshape(-1) for Wb in rest for t in Wb])
 
 
+HEAD_DIG = 8.0    # head start: logit pull toward digging a proven-safe neighbour (and away from a proven mine)
+HEAD_MOVE = 2.0   # head start: logit pull toward the nearest proven-safe tile
+
+
+def head_start(spec, pop):
+    """Wire the v5 logic hint straight into a population's networks (in place; pop (P, n_params)).
+
+    11 hidden units in every layer are taken over (the ones with the weakest outgoing weights in
+    pop[0], so the rest of what a seeded network knows is untouched): 9 carry "safe minus mine" for
+    each tile in reach to its dig action, and 2 carry the direction to the nearest safe tile to the
+    moves. A head-started bot therefore digs proven-safe tiles, never digs proven mines, and walks to
+    the nearest safe tile when none is in reach; everything else (no hint on the board) is the
+    network's own. Evolution is free to change all of it afterwards."""
+    from .env import N_CHANNELS_V5, N_GLOBAL_V5, NEAR, MOVES, DIG0
+    if spec.version < 5:
+        raise ValueError("the head start needs model type 5 (the logic hint)")
+    circuits = []          # (input weights {input index: w}, output weights {action: w})
+    r, K = spec.radius, 2 * spec.radius + 1
+    KK = K * K
+    safe0, mine0 = (N_CHANNELS_V5 - 3) * KK, (N_CHANNELS_V5 - 2) * KK
+    for k, (dy, dx) in enumerate(NEAR):
+        cell = (r + dy) * K + (r + dx)
+        circuits.append(({safe0 + cell: 3.0, mine0 + cell: -3.0}, {DIG0 + k: HEAD_DIG}))
+    g0 = N_CHANNELS_V5 * KK + N_GLOBAL_V5 - 4          # nearest safe dy, dx, distance, present
+    circuits.append(({g0: 1.5}, {m: HEAD_MOVE * dy for m, (dy, dx) in enumerate(MOVES)}))
+    circuits.append(({g0 + 1: 1.5}, {m: HEAD_MOVE * dx for m, (dy, dx) in enumerate(MOVES)}))
+    n = len(circuits)
+    if not spec.hidden or min(spec.hidden) < n:
+        raise ValueError(f"the head start needs hidden layers of at least {n} units")
+
+    P = pop.shape[0]
+    layers, o = [], 0                                  # (W view (P, i, out), b view (P, out)) per layer
+    for i, out in spec.layers:
+        Wv = pop[:, o:o + i * out].view(P, i, out); o += i * out
+        bv = pop[:, o:o + out]; o += out
+        layers.append((Wv, bv))
+    # the units to take over in each hidden layer: weakest outgoing weights
+    units = [layers[j + 1][0][0].norm(dim=1).argsort()[:n].tolist() for j in range(len(spec.hidden))]
+    for c, (ins, outs) in enumerate(circuits):
+        W, b = layers[0]
+        u = units[0][c]
+        W[:, :, u] = 0; b[:, u] = 0
+        for idx, w in ins.items():
+            W[:, idx, u] = w
+        for j in range(1, len(layers)):
+            W, b = layers[j]
+            W[:, u, :] = 0                             # the old unit no longer feeds anything else
+            if j < len(layers) - 1:
+                v = units[j][c]
+                W[:, :, v] = 0; b[:, v] = 0
+                W[:, u, v] = 2.0
+                u = v
+            else:
+                for a, w in outs.items():
+                    W[:, u, a] = w
+    return pop
+
+
 def choose(logits, mask=None, noise=0.0):
     """Greedy action choice, optionally restricted to valid actions and perturbed with Gumbel noise."""
     if noise > 0:

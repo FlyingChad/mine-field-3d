@@ -516,6 +516,40 @@ class LogicHint(unittest.TestCase):
         self.assertFalse(bool((safe & mines.view(1, S.H, S.W)).any()))
         self.assertFalse(bool((mine & ~mines.view(1, S.H, S.W)).any()))
 
+    def test_head_start_digs_proven_safe_tiles(self):
+        from ai.env import MineEnv, NEAR, DIG0, FLAG0
+        from ai.policy import Spec, head_start, choose
+        torch.manual_seed(2)
+        s = Spec(2, [32, 16], "tanh", 5)
+        pop = s.init(4)
+        keep = pop.clone()
+        head_start(s, pop)
+        self.assertGreater(int((pop == keep).all(0).sum()), s.n_params // 2, "most of each network is untouched")
+        with self.assertRaises(ValueError):
+            head_start(Spec(2, [8], "tanh", 5), Spec(2, [8], "tanh", 5).init(1))
+        e = MineEnv(64, 1, 14, 14, 30, 40, 3, device="cpu", rich=True, mode="race", extras=True, powers=True,
+                    params={"dig_practice": 1.0})
+        near = torch.tensor(NEAR)
+        checked = 0
+        for _ in range(25):
+            safe, mine = e.logic()
+            a = choose(s.forward(pop[:1], e.observe(0, 2, 5)[None])[0], e.mask(0, 5))
+            ty, tx = e.pos[:, 0, 0:1] + near[:, 0], e.pos[:, 0, 1:2] + near[:, 1]
+            inb = (ty >= 0) & (ty < 14) & (tx >= 0) & (tx < 14)
+            at = lambda t: t[torch.arange(64)[:, None], ty.clamp(0, 13), tx.clamp(0, 13)] & inb
+            ok = at(safe) & e.mask(0, 5)[:, DIG0:FLAG0]
+            live = ~e.done
+            dig = (a >= DIG0) & (a < FLAG0)
+            k = (a - DIG0).clamp(0, 8)
+            for n in range(64):
+                if live[n] and ok[n].any():
+                    checked += 1
+                    self.assertTrue(bool(dig[n]) and bool(ok[n, k[n]]), "a proven-safe tile in reach gets dug")
+                if live[n] and dig[n]:
+                    self.assertFalse(bool(at(mine)[n, k[n]]), "never digs a proven mine")
+            e.step(a[:, None])
+        self.assertGreater(checked, 20)
+
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class Curriculum(unittest.TestCase):
