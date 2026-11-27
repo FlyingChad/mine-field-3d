@@ -1,0 +1,1284 @@
+"""Mine Field 3D - multiplayer competitive minesweeper server.
+
+Run:  .venv\\Scripts\\python server.py   (then open http://localhost:8080)
+Players on your network can join via http://<your-ip>:8080
+"""
+import asyncio
+import json
+import math
+import random
+import secrets
+import time
+from collections import deque
+from pathlib import Path
+
+from aiohttp import WSMsgType, web
+
+import layouts
+
+ROOT = Path(__file__).parent
+STATIC = ROOT / "static"
+
+W, H = 48, 48          # grid size in tiles; the layout decides which of them are floor
+FIELD_SIZE = 32        # the "field" layout is a FIELD_SIZE x FIELD_SIZE square in the middle of the grid
+MINE_DENSITY = 150 / 1024   # mines per floor tile (~15%, the classic 150 on 32x32)
+MINES = 150            # only used before a room exists; rooms use Room.n_mines
+TILE = 2.0             # world units per tile
+REACH = 1              # tiles (Chebyshev) from the player's tile they can dig/flag: 1 = own tile + 8 neighbours
+REACH_SLACK = 0.3      # extra tolerance (in tiles) for network lag when checking the player's position
+STUN_SECONDS = 3.0
+MINE_PENALTY = -10
+FLAG_CORRECT = 3       # awarded at round end for each flag on a mine
+FLAG_WRONG = -3        # charged when your flag is dug up and it was safe
+NEXT_ROUND_DELAY = 12
+TICK_HZ = 15
+ACTION_COOLDOWN = 0.08
+
+# power-ups: buried under random safe tiles, exposed when dug up, collected by walking onto them.
+# They are a game-layer feature and are NOT simulated in ai/env.py (bots use them by heuristic).
+ITEM_DENSITY = 28 / 1024    # power-ups per floor tile
+ITEM_WEIGHTS = {"scatter": 4, "shield": 3, "radar": 3, "boots": 3,
+                "freeze": 3, "gold": 3, "shockwave": 2, "blink": 3,
+                "apple": 5, "potion": 2}
+FOOD = {"apple": 25, "potion": 60}   # HP healed; food is only picked up when you are hurt
+HELD = ["", "scatter", "freeze", "shockwave", "blink"]  # held items (used with G); the rest act on pickup
+THROW_RANGE = 6        # tiles (Chebyshev) a scatter bomb can be thrown
+SCATTER_RADIUS = 2     # 2 -> a 5x5 area is re-covered
+SCATTER_MINES = 6      # fresh mines scattered into that area
+SCATTER_FUSE = 1.6     # seconds between the throw and the blast
+SCATTER_STUN = 1.5
+RADAR_RADIUS = 4
+RADAR_SECONDS = 8
+BOOTS_SECONDS = 10
+BOOTS_SPEED = 1.6      # movement multiplier (client movement; bots use it server-side)
+FREEZE_RANGE = 10      # tiles the freeze beam travels
+FREEZE_WIDTH = 0.9     # tiles: how close to the beam a player must be to get hit
+FREEZE_SECONDS = 4.0
+SHOCK_RADIUS = 3       # tiles (Euclidean) around the user
+SHOCK_STUN = 1.5
+BLINK_RANGE = 8        # tiles (Chebyshev) you can teleport
+GOLD_SECONDS = 12
+GOLD_MULT = 2          # reveal points multiplier while gold rush is active
+
+# health: damage knocks you out at 0 HP; you lose points, sit out RESPAWN_SECONDS and respawn
+# somewhere else at full health. Health is game-layer only and is not simulated in ai/env.py.
+MAX_HP = 100
+MINE_DAMAGE = 35
+SCATTER_DAMAGE = 25
+SHOCK_DAMAGE = 10
+KO_PENALTY = -15
+RESPAWN_SECONDS = 5.0
+
+# boss monsters roam dungeon layouts (game-layer only; not in ai/env.py). They wander, chase players
+# they can see, and wind up a telegraphed ground smash. Players hurt them with a melee attack and
+# with power-ups; the killer gets a reward, everyone who helped gets points for their damage, and the
+# boss drops loot. A new boss appears BOSS_RESPAWN seconds after one dies.
+BOSS_KINDS = {
+    "ogre":   {"name": "Ogre",   "hp": 300, "speed": 3.6, "damage": 30, "aggro": 7},
+    "wraith": {"name": "Wraith", "hp": 180, "speed": 5.6, "damage": 20, "aggro": 9},
+    "golem":  {"name": "Golem",  "hp": 450, "speed": 2.6, "damage": 40, "aggro": 6},
+}
+BOSS_FIRST_DELAY = 8.0     # seconds into a round before the first boss appears
+BOSS_RESPAWN = 40.0
+BOSS_REACH = 1.3           # tiles: starts its wind-up when a target is this close
+BOSS_HIT_RANGE = 1.9       # tiles: the smash hits everyone this close when it lands
+BOSS_WINDUP = 0.75
+BOSS_COOLDOWN = 1.6
+BOSS_SMASH_STUN = 0.8
+ATTACK_DAMAGE = 12         # player melee
+ATTACK_RANGE = 1.7         # tiles
+ATTACK_COOLDOWN = 0.45
+BOSS_KILL_REWARD = 40      # points to whoever lands the killing blow
+BOSS_DAMAGE_POINTS = 10    # +1 point per this much damage dealt to a boss
+BOSS_POWER_DAMAGE = {"scatter": 60, "shockwave": 40, "freeze": 20}
+
+# game modes, chosen by whoever creates the room:
+#   race - everyone for themselves, points decide (the original game)
+#   pvp  - race, plus your melee hits other players and knocking someone out earns KO_REWARD
+#   coop - one team against the dungeon: no friendly fire, no scatter bombs (they only undo the
+#          team's progress), bosses scale with the team, and a shared pool of lives; run out and the
+#          round is lost
+MODES = ["race", "pvp", "coop"]
+PVP_MELEE_DAMAGE = 15
+PVP_MELEE_STUN = 0.35
+KO_REWARD = 20
+COOP_LIVES_BASE = 3           # team lives = this + 1 per player at round start (KOs cost one)
+COOP_BOSS_HP_PER_PLAYER = 0.5 # boss HP x (1 + this * (players - 1))
+
+COLORS = ["#ff5d5d", "#4fa3ff", "#ffd23f", "#4fd67a", "#c77dff", "#ff9f43",
+          "#3ee6d6", "#ff6fb5", "#a3e635", "#f8fafc", "#94a3b8", "#fb7185"]
+# must match REALMS in static/realms.js; a room's realm is chosen by whoever creates it
+REALM_IDS = ["meadow", "desert", "tundra", "volcano", "moon", "candy", "jungle", "reef", "spooky", "neon"]
+# must match the ids in static/characters.js
+CHARACTER_IDS = {"miner", "robot", "knight", "wizard", "astronaut", "ninja",
+                 "cat", "dino", "pirate", "ghost", "mushroom", "penguin",
+                 "dragon", "mech", "alien", "viking", "skeleton", "bee"}
+
+
+def idx(x, y):
+    return y * W + x
+
+
+def neighbors(x, y):
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx or dy:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    yield nx, ny
+
+
+def tile_center(x, y):
+    return (x - W / 2 + 0.5) * TILE, (y - H / 2 + 0.5) * TILE
+
+
+class Player:
+    is_bot = False
+
+    def __init__(self, ws, name, color, char="miner"):
+        self.id = secrets.token_hex(4)
+        self.ws = ws
+        self.name = name
+        self.color = color
+        self.char = char
+        self.score = 0
+        self.x = random.uniform(-W * TILE / 2 + 2, W * TILE / 2 - 2)
+        self.z = random.uniform(-H * TILE / 2 + 2, H * TILE / 2 - 2)
+        self.rot = 0.0
+        self.stun_until = 0.0
+        self.last_action = 0.0
+        self.hp = MAX_HP
+        self.ko_until = 0.0       # > 0 while knocked out
+        self.reset_items()
+
+    def reset_items(self):
+        self.held = None          # one held item at a time: a kind from HELD
+        self.shield = False
+        self.boots_until = 0.0
+        self.gold_until = 0.0
+        self.frozen_until = 0.0
+        self.throw_at = 0.0       # bots: when to try using the held item
+
+    def fx(self, now):
+        """Status bits for the tick message: 1 shield, 2 boots, 4 gold rush, 8 frozen;
+        fx >> 4 is the index of the held item in HELD (0 = nothing)."""
+        return ((1 if self.shield else 0) | (2 if now < self.boots_until else 0)
+                | (4 if now < self.gold_until else 0) | (8 if now < self.frozen_until else 0)
+                | (HELD.index(self.held) << 4 if self.held else 0))
+
+    def tile(self):
+        return (int((self.x / TILE) + W / 2), int((self.z / TILE) + H / 2))
+
+    def roster(self):
+        return {"id": self.id, "name": self.name, "color": self.color, "char": self.char}
+
+
+class NullWS:
+    async def send_str(self, _):
+        pass
+
+
+BOT_SPEED = 7.0  # world units / second, same as a walking player
+
+
+class Boss:
+    STATES = {"wander": 0, "chase": 1, "windup": 2, "frozen": 3, "stunned": 4}
+
+    def __init__(self, kind, x, z):
+        self.id = "b" + secrets.token_hex(3)
+        self.kind = kind
+        s = BOSS_KINDS[kind]
+        self.name, self.max_hp, self.speed, self.damage, self.aggro = s["name"], s["hp"], s["speed"], s["damage"], s["aggro"]
+        self.hp = self.max_hp
+        self.x, self.z, self.rot = x, z, 0.0
+        self.state = "wander"
+        self.path: list[tuple[int, int]] = []
+        self.target = None
+        self.next_path = 0.0
+        self.windup_until = self.cooldown_until = self.frozen_until = self.stun_until = 0.0
+        self.dmg_by: dict[str, int] = {}
+
+    def tile(self):
+        return (int((self.x / TILE) + W / 2), int((self.z / TILE) + H / 2))
+
+    def row(self, now):
+        st = "frozen" if now < self.frozen_until else "stunned" if now < self.stun_until else self.state
+        return [self.id, self.kind, round(self.x, 2), round(self.z, 2), round(self.rot, 2), self.hp, self.max_hp,
+                self.STATES[st]]
+
+
+class BotPlayer(Player):
+    """A server-side player driven by a trained network (ai/bots.py). Walks tile to tile and obeys
+    exactly the same reach / cooldown / stun rules as humans because it calls the same Room methods."""
+    is_bot = True
+
+    def __init__(self, brain, name, color, char, difficulty, interval):
+        super().__init__(NullWS(), name, color, char)
+        self.brain, self.difficulty, self.interval = brain, difficulty, interval
+        self.tx, self.tz = self.x, self.z   # Room.place() puts the bot on a floor tile
+        self.next_think = 0.0
+
+    def roster(self):
+        return {**super().roster(), "bot": True, "model": self.brain.name, "difficulty": self.difficulty}
+
+
+class Room:
+    def __init__(self, name, realm="meadow", layout="dungeon", mode="race"):
+        self.name = name
+        self.realm = realm if realm in REALM_IDS else random.choice(REALM_IDS)
+        self.layout_kind = layout if layout in layouts.LAYOUTS else "dungeon"
+        self.mode = mode if mode in MODES else "race"
+        self.players: dict[str, Player] = {}
+        self.round_task = None
+        self.kos: list[str] = []
+        self.new_round()
+
+    # ---------- round lifecycle ----------
+    def new_round(self):
+        # a fresh dungeon every round (the field is always the same square)
+        self.floor = layouts.make(self.layout_kind, W, H, field_size=(FIELD_SIZE, FIELD_SIZE))
+        self.floor_tiles = [i for i in range(W * H) if self.floor[i]]
+        self.n_mines = round(MINE_DENSITY * len(self.floor_tiles))
+        self.mines = None            # set of tile indices, generated on first dig
+        self.counts = None
+        self.revealed = bytearray(W * H)
+        self.flags: dict[int, str] = {}  # tile index -> player id
+        self.booms: set[int] = set()
+        self.safe_left = len(self.floor_tiles) - self.n_mines
+        self.state = "playing"
+        self.round_ends_at = None
+        self.started_at = time.time()
+        self.round_id = getattr(self, "round_id", 0) + 1
+        self.buried: dict[int, str] = {}   # tile index -> item kind, still under a cover
+        self.items: dict[int, str] = {}    # tile index -> item kind, lying on a revealed tile
+        self.bomb_seq = 0
+        self.bosses: dict[str, Boss] = {}
+        self.next_boss_at = time.time() + BOSS_FIRST_DELAY
+        self.lives = COOP_LIVES_BASE + len(getattr(self, "players", {}) or {})
+        self.failed = False
+
+    @property
+    def coop(self):
+        return self.mode == "coop"
+
+    def hits_players(self):
+        """Do player-made attacks (power-ups, melee) affect other players? Not in co-op."""
+        return not self.coop
+
+    # ---------- bosses ----------
+    def boss_target_count(self):
+        if self.layout_kind != "dungeon" or self.state != "playing":
+            return 0
+        return 2 if len(self.players) >= 4 else 1
+
+    def walkable_step(self, x, y, dx, dy):
+        """8-way step on floor that doesn't cut through a wall corner."""
+        if not self.is_floor(x + dx, y + dy):
+            return False
+        return not (dx and dy) or (self.is_floor(x + dx, y) and self.is_floor(x, y + dy))
+
+    def bfs(self, start, goal=None, max_depth=None):
+        """Breadth-first search over floor tiles. With a goal: the path to it (excluding start).
+        Without: every reachable tile within max_depth steps."""
+        sx, sy = start
+        prev = {start: None}
+        q = deque([(start, 0)])
+        while q:
+            (x, y), d = q.popleft()
+            if goal is not None and (x, y) == goal:
+                path = []
+                node = goal
+                while node != start:
+                    path.append(node)
+                    node = prev[node]
+                return path[::-1]
+            if max_depth is not None and d >= max_depth:
+                continue
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if (dx or dy) and (x + dx, y + dy) not in prev and self.walkable_step(x, y, dx, dy):
+                        prev[(x + dx, y + dy)] = (x, y)
+                        q.append(((x + dx, y + dy), d + 1))
+        return [] if goal is not None else list(prev)
+
+    def line_of_sight(self, ax, az, bx, bz):
+        d = math.hypot(bx - ax, bz - az)
+        steps = max(1, int(d / (TILE / 3)))
+        for k in range(1, steps):
+            t = k / steps
+            if not self.is_floor(int((ax + (bx - ax) * t) / TILE + W / 2), int((az + (bz - az) * t) / TILE + H / 2)):
+                return False
+        return True
+
+    async def update_bosses(self, now, dt):
+        if self.state != "playing":
+            return
+        want = self.boss_target_count()
+        if len(self.bosses) < want and now >= self.next_boss_at:
+            kind = random.choice(list(BOSS_KINDS))
+            x, z = self.spawn_point(list(self.players.values()))
+            b = Boss(kind, x, z)
+            if self.coop:   # a bigger team faces a tougher boss
+                b.max_hp = b.hp = round(b.max_hp * (1 + COOP_BOSS_HP_PER_PLAYER * max(0, len(self.players) - 1)))
+            self.bosses[b.id] = b
+            self.next_boss_at = now + 6.0     # stagger a second spawn
+            await self.broadcast({"t": "bossSpawn", "id": b.id, "kind": kind, "name": b.name, "x": round(x, 2), "z": round(z, 2)})
+        for b in list(self.bosses.values()):
+            if now < b.frozen_until or now < b.stun_until:
+                continue
+            if b.state == "windup":
+                if now >= b.windup_until:
+                    await self.boss_smash(b, now)
+                continue
+            # pick a target: the nearest visible, conscious player within aggro range
+            best = None
+            for q in self.players.values():
+                if q.ko_until:
+                    continue
+                d = math.hypot(q.x - b.x, q.z - b.z)
+                limit = b.aggro * TILE * (1.5 if q.id == b.target else 1.0)
+                if d <= limit and (best is None or d < best[0]) and self.line_of_sight(b.x, b.z, q.x, q.z):
+                    best = (d, q)
+            if best:
+                d, q = best
+                b.target, b.state = q.id, "chase"
+                if d <= BOSS_REACH * TILE and now >= b.cooldown_until:
+                    b.state, b.windup_until, b.path = "windup", now + BOSS_WINDUP, []
+                    b.rot = math.atan2(q.x - b.x, q.z - b.z)
+                    await self.broadcast({"t": "bossAtk", "id": b.id, "x": round(b.x, 2), "z": round(b.z, 2),
+                                          "r": BOSS_HIT_RANGE, "t0": BOSS_WINDUP})
+                    continue
+                if now >= b.next_path or not b.path:
+                    b.path = self.bfs(b.tile(), q.tile())[:12]
+                    b.next_path = now + 0.6
+                speed = b.speed
+            else:
+                b.target = None
+                if b.state != "wander":
+                    b.state, b.path = "wander", []
+                if not b.path and now >= b.next_path:
+                    options = self.bfs(b.tile(), max_depth=10)
+                    goal = random.choice(options) if options else None
+                    b.path = self.bfs(b.tile(), goal) if goal else []
+                    b.next_path = now + random.uniform(1.0, 3.0)
+                speed = b.speed * 0.55
+            # walk along the path
+            if b.path:
+                tx, tz = tile_center(*b.path[0])
+                dx, dz = tx - b.x, tz - b.z
+                d = math.hypot(dx, dz)
+                step = speed * dt
+                if d <= step:
+                    b.x, b.z = tx, tz
+                    b.path.pop(0)
+                else:
+                    b.x += dx / d * step
+                    b.z += dz / d * step
+                    b.rot = math.atan2(dx, dz)
+
+    async def boss_smash(self, b, now):
+        b.state, b.cooldown_until = "chase", now + BOSS_COOLDOWN
+        hit, shielded = [], []
+        for q in self.players.values():
+            if q.ko_until or math.hypot(q.x - b.x, q.z - b.z) > BOSS_HIT_RANGE * TILE:
+                continue
+            if self._absorb(q):
+                shielded.append(q.id)
+            else:
+                q.stun_until = max(q.stun_until, now + BOSS_SMASH_STUN)
+                self.hurt(q, b.damage, now)
+                hit.append(q.id)
+        await self.broadcast({"t": "bossSmash", "id": b.id, "x": round(b.x, 2), "z": round(b.z, 2), "r": BOSS_HIT_RANGE,
+                              "hit": hit, "shielded": shielded, "damage": b.damage, "stun": BOSS_SMASH_STUN})
+        await self.flush_kos()
+
+    async def damage_boss(self, b, dmg, by, stagger=0.0):
+        if b.id not in self.bosses or dmg <= 0:
+            return
+        dmg = min(dmg, b.hp)
+        b.hp -= dmg
+        if by:
+            b.dmg_by[by] = b.dmg_by.get(by, 0) + dmg
+            b.target = by if by in self.players else b.target
+        if stagger:
+            b.stun_until = max(b.stun_until, time.time() + stagger)
+            if b.state == "windup":
+                b.state = "chase"          # a stagger interrupts the wind-up
+        await self.broadcast({"t": "bossHit", "id": b.id, "by": by, "dmg": dmg, "hp": b.hp,
+                              "x": round(b.x, 2), "z": round(b.z, 2)})
+        if b.hp <= 0:
+            await self.boss_down(b, by)
+
+    async def boss_down(self, b, killer):
+        self.bosses.pop(b.id, None)
+        self.next_boss_at = time.time() + BOSS_RESPAWN
+        rewards = {pid: d // BOSS_DAMAGE_POINTS for pid, d in b.dmg_by.items() if pid in self.players}
+        if killer in self.players:
+            rewards[killer] = rewards.get(killer, 0) + BOSS_KILL_REWARD
+        for pid, pts in rewards.items():
+            self.players[pid].score += pts
+        # loot: a potion plus two random power-ups on floor tiles around the boss
+        bx, by_ = b.tile()
+        spots = [(x, y) for x, y in self.bfs((bx, by_), max_depth=2)
+                 if idx(x, y) not in self.items and idx(x, y) not in self.buried and idx(x, y) not in (self.mines or ())]
+        random.shuffle(spots)
+        kinds = ["potion"] + random.choices([k for k in ITEM_WEIGHTS if k not in FOOD and not (self.coop and k == "scatter")], k=2)
+        loot = []
+        for (x, y), k in zip(spots, kinds):
+            self.items[idx(x, y)] = k
+            loot.append([x, y, k])
+        await self.broadcast({"t": "bossDown", "id": b.id, "name": b.name, "killer": killer,
+                              "x": round(b.x, 2), "z": round(b.z, 2), "loot": loot, "rewards": rewards})
+
+    async def attack(self, p):
+        """Player melee swing: hits the nearest boss in range."""
+        now = time.time()
+        if self.state != "playing" or now < p.stun_until or now - getattr(p, "last_attack", 0) < ATTACK_COOLDOWN:
+            return
+        p.last_attack = now
+        await self.broadcast({"t": "swing", "pid": p.id})
+        near = [(math.hypot(b.x - p.x, b.z - p.z), b) for b in self.bosses.values()]
+        if self.mode == "pvp":   # in PvP your sword also hits other players
+            near += [(math.hypot(q.x - p.x, q.z - p.z), q) for q in self.players.values() if q is not p and not q.ko_until]
+        near = [nb for nb in near if nb[0] <= ATTACK_RANGE * TILE]
+        if not near:
+            return
+        target = min(near, key=lambda nb: nb[0])[1]
+        if isinstance(target, Boss):
+            await self.damage_boss(target, ATTACK_DAMAGE, p.id)
+            return
+        shielded = self._absorb(target)
+        if not shielded:
+            target.stun_until = max(target.stun_until, now + PVP_MELEE_STUN)
+            self.hurt(target, PVP_MELEE_DAMAGE, now, by=p.id)
+        await self.broadcast({"t": "hitPlayer", "pid": p.id, "target": target.id, "shielded": shielded,
+                              "dmg": 0 if shielded else PVP_MELEE_DAMAGE, "x": round(p.x, 2), "z": round(p.z, 2)})
+        await self.flush_kos()
+
+    def is_floor(self, x, y):
+        return 0 <= x < W and 0 <= y < H and self.floor[y * W + x] == 1
+
+    def nb(self, x, y):
+        """Neighbouring floor tiles (walls are never revealed, flagged or mined)."""
+        return [(nx, ny) for nx, ny in neighbors(x, y) if self.floor[ny * W + nx]]
+
+    def spawn_point(self, avoid=()):
+        """A random floor tile centre, preferring ones away from other players."""
+        best = None
+        for _ in range(12):
+            i = random.choice(self.floor_tiles)
+            x, z = tile_center(i % W, i // W)
+            d = min((math.hypot(x - q.x, z - q.z) for q in avoid), default=99)
+            if best is None or d > best[0]:
+                best = (d, x, z)
+            if d > 8 * TILE:
+                break
+        return best[1], best[2]
+
+    def place(self, p):
+        p.x, p.z = self.spawn_point([q for q in self.players.values() if q is not p])
+        p.move_lock = time.time() + 0.4
+        if p.is_bot:
+            p.tx, p.tz = p.x, p.z
+
+    def generate(self, sx, sy):
+        forbidden = {idx(sx, sy)} | {idx(nx, ny) for nx, ny in neighbors(sx, sy)}
+        candidates = [i for i in self.floor_tiles if i not in forbidden]
+        self.mines = set(random.sample(candidates, min(self.n_mines, len(candidates))))
+        self.recount()
+        safe = [i for i in candidates if i not in self.mines]
+        n_items = min(len(safe), round(ITEM_DENSITY * len(self.floor_tiles)))
+        pool = {k: w for k, w in ITEM_WEIGHTS.items() if not (self.coop and k == "scatter")}
+        kinds = random.choices(list(pool), weights=list(pool.values()), k=n_items)
+        self.buried = dict(zip(random.sample(safe, n_items), kinds))
+
+    def recount(self):
+        self.counts = [0] * (W * H)
+        for m in self.mines:
+            mx, my = m % W, m // W
+            for nx, ny in neighbors(mx, my):
+                self.counts[idx(nx, ny)] += 1
+
+    def mines_left(self):
+        total = self.n_mines if self.mines is None else len(self.mines)
+        return total - len(self.flags) - len(self.booms)
+
+    def snapshot(self):
+        tiles = []
+        for i in range(W * H):
+            if self.revealed[i]:
+                tiles.append([i % W, i // W, -1 if i in self.booms else self.counts[i]])
+        return {
+            "state": self.state,
+            "layout": "".join("1" if v else "0" for v in self.floor),
+            "layoutKind": self.layout_kind,
+            "mode": self.mode,
+            "lives": self.lives if self.coop else None,
+            "tiles": tiles,
+            "flags": [[i % W, i // W, pid] for i, pid in self.flags.items()],
+            "items": [[i % W, i // W, k] for i, k in self.items.items()],
+            "minesLeft": self.mines_left(),
+            "safeLeft": self.safe_left,
+            "next": max(0, (self.round_ends_at or 0) - time.time()),
+            "mines": self.all_mines() if self.state == "over" else [],
+        }
+
+    def all_mines(self):
+        return [[m % W, m // W] for m in (self.mines or [])]
+
+    # ---------- messaging ----------
+    async def broadcast(self, msg):
+        data = json.dumps(msg, separators=(",", ":"))
+        dead = []
+        for p in list(self.players.values()):
+            try:
+                await p.ws.send_str(data)
+            except Exception:
+                dead.append(p)
+        for p in dead:
+            self.players.pop(p.id, None)
+
+    async def send_roster(self):
+        await self.broadcast({"t": "roster", "players": [p.roster() for p in self.players.values()]})
+
+    # ---------- actions ----------
+    def can_act(self, p, x, y):
+        now = time.time()
+        if self.state != "playing" or now < p.stun_until:
+            return False
+        if now - p.last_action < ACTION_COOLDOWN:
+            return False
+        if not self.is_floor(x, y):
+            return False
+        # distance (in tiles) from the player's actual position to the target tile's centre;
+        # a neighbouring tile's centre is at most REACH + 0.5 away from anywhere on the player's tile
+        cx, cz = (x - W / 2 + 0.5) * TILE, (y - H / 2 + 0.5) * TILE
+        if max(abs(p.x - cx), abs(p.z - cz)) / TILE > REACH + 0.5 + REACH_SLACK:
+            return False
+        p.last_action = now
+        return True
+
+    async def dig(self, p, x, y):
+        if not self.can_act(p, x, y):
+            return
+        i = idx(x, y)
+        if self.mines is None:
+            self.generate(x, y)
+
+        if self.revealed[i]:
+            await self.chord(p, x, y)
+            return
+        if self.flags.get(i) == p.id:
+            return  # can't dig your own flag; remove it first
+        await self.open_tiles(p, [(x, y)])
+
+    async def chord(self, p, x, y):
+        i = idx(x, y)
+        if i in self.booms or self.counts[i] == 0:
+            return
+        marked = [(nx, ny) for nx, ny in self.nb(x, y)
+                  if idx(nx, ny) in self.flags or idx(nx, ny) in self.booms]
+        if len(marked) != self.counts[i]:
+            return
+        targets = [(nx, ny) for nx, ny in self.nb(x, y)
+                   if not self.revealed[idx(nx, ny)] and idx(nx, ny) not in self.flags]
+        if targets:
+            await self.open_tiles(p, targets)
+
+    async def open_tiles(self, p, starts):
+        # a mine among the starts explodes first (only the first one)
+        for x, y in starts:
+            if idx(x, y) in self.mines:
+                await self.explode(p, x, y)
+                return
+
+        opened, penalties, exposed = [], {}, []
+        queue = deque(starts)
+        while queue:
+            x, y = queue.popleft()
+            i = idx(x, y)
+            if self.revealed[i] or i in self.mines:
+                continue
+            self.revealed[i] = 1
+            self.safe_left -= 1
+            opened.append([x, y, self.counts[i]])
+            kind = self.buried.pop(i, None)
+            if kind:
+                self.items[i] = kind
+                exposed.append([x, y, kind])
+            owner = self.flags.pop(i, None)
+            if owner:
+                penalties[owner] = penalties.get(owner, 0) + FLAG_WRONG
+            if self.counts[i] == 0:
+                for nx, ny in self.nb(x, y):
+                    if not self.revealed[idx(nx, ny)]:
+                        queue.append((nx, ny))
+        if not opened:
+            return
+        gain = len(opened) * (GOLD_MULT if time.time() < p.gold_until else 1)
+        p.score += gain
+        for pid, amt in penalties.items():
+            if pid in self.players:
+                self.players[pid].score += amt
+        await self.broadcast({
+            "t": "reveal", "pid": p.id, "tiles": opened,
+            "gain": gain, "penalties": penalties, "items": exposed,
+            "minesLeft": self.mines_left(), "safeLeft": self.safe_left,
+        })
+        if self.safe_left == 0:
+            await self.end_round()
+
+    async def explode(self, p, x, y):
+        i = idx(x, y)
+        self.revealed[i] = 1
+        self.booms.add(i)
+        owner = self.flags.pop(i, None)
+        shielded = p.shield
+        now = time.time()
+        if shielded:  # the shield soaks the whole hit
+            p.shield = False
+            penalty, stun, damage = 0, 0, 0
+        else:
+            penalty, stun, damage = MINE_PENALTY, STUN_SECONDS, MINE_DAMAGE
+            p.score += penalty
+            p.stun_until = now + stun
+            self.hurt(p, damage, now)
+        await self.broadcast({
+            "t": "boom", "pid": p.id, "x": x, "y": y, "penalty": penalty, "shielded": shielded,
+            "stun": stun, "damage": damage, "flagOwner": owner, "minesLeft": self.mines_left(),
+        })
+        await self.flush_kos()
+
+    # ---------- health ----------
+    def hurt(self, q, amount, now, by=None):
+        """Take `amount` HP from q. At 0 HP q is knocked out: KO_PENALTY points, drops its held
+        item, sits out RESPAWN_SECONDS and then respawns elsewhere (Room.respawns).
+        In PvP, `by` (another player) earns KO_REWARD; in co-op every KO costs the team a life."""
+        if q.ko_until or amount <= 0:
+            return False
+        q.hp = max(0, q.hp - amount)
+        if q.hp > 0:
+            return False
+        q.ko_until = now + RESPAWN_SECONDS
+        q.stun_until = max(q.stun_until, q.ko_until)
+        q.score += KO_PENALTY
+        q.held = None
+        reward = 0
+        if self.mode == "pvp" and by and by != q.id and by in self.players:
+            self.players[by].score += KO_REWARD
+            reward = KO_REWARD
+        if self.coop:
+            self.lives = max(0, self.lives - 1)
+        self.kos.append((q.id, by if reward else None, reward))
+        return True
+
+    async def flush_kos(self):
+        while self.kos:
+            pid, by, reward = self.kos.pop(0)
+            await self.broadcast({"t": "ko", "pid": pid, "penalty": KO_PENALTY, "respawn": RESPAWN_SECONDS,
+                                  "by": by, "reward": reward, "lives": self.lives if self.coop else None})
+        if self.coop and self.lives <= 0 and self.state == "playing":
+            self.failed = True
+            await self.end_round()
+
+    async def respawns(self, now):
+        for q in list(self.players.values()):
+            if q.ko_until and now >= q.ko_until:
+                q.ko_until, q.hp, q.stun_until = 0.0, MAX_HP, 0.0
+                q.frozen_until = 0.0
+                self.place(q)
+                await self.broadcast({"t": "respawn", "pid": q.id, "x": round(q.x, 2), "z": round(q.z, 2), "hp": q.hp})
+
+    # ---------- power-ups ----------
+    async def pickups(self, now):
+        if self.state != "playing" or not self.items:
+            return
+        for p in list(self.players.values()):
+            if now < p.stun_until:
+                continue
+            x, y = p.tile()
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            i = idx(x, y)
+            kind = self.items.get(i)
+            if (not kind or (kind in HELD and p.held) or (kind == "shield" and p.shield)
+                    or (kind in FOOD and p.hp >= MAX_HP)):
+                continue
+            del self.items[i]
+            dur = 0
+            if kind in FOOD:
+                heal = min(FOOD[kind], MAX_HP - p.hp)
+                p.hp += heal
+                await self.broadcast({"t": "pickup", "pid": p.id, "x": x, "y": y, "kind": kind, "dur": 0,
+                                      "heal": heal, "hp": p.hp})
+                continue
+            if kind in HELD:
+                p.held = kind
+                p.throw_at = now + random.uniform(1.5, 4.0)
+            elif kind == "shield":
+                p.shield = True
+            elif kind == "boots":
+                p.boots_until, dur = now + BOOTS_SECONDS, BOOTS_SECONDS
+            elif kind == "gold":
+                p.gold_until, dur = now + GOLD_SECONDS, GOLD_SECONDS
+            await self.broadcast({"t": "pickup", "pid": p.id, "x": x, "y": y, "kind": kind, "dur": dur})
+            if kind == "radar":
+                near = [[m % W, m // W] for m in self.mines
+                        if max(abs(m % W - x), abs(m // W - y)) <= RADAR_RADIUS
+                        and not self.revealed[m] and m not in self.flags]
+                try:
+                    await p.ws.send_str(json.dumps({"t": "radar", "mines": near, "dur": RADAR_SECONDS}))
+                except Exception:
+                    pass
+
+    async def use(self, p, x, y):
+        """Use the held item, aimed at tile (x, y) where it needs aiming."""
+        now = time.time()
+        if self.state != "playing" or now < p.stun_until or not p.held or self.mines is None:
+            return
+        if p.held == "shockwave":
+            return await self.shockwave(p)
+        if not (0 <= x < W and 0 <= y < H):
+            return
+        cx, cz = tile_center(x, y)
+        dist = max(abs(p.x - cx), abs(p.z - cz)) / TILE - 0.5 - REACH_SLACK
+        if p.held == "scatter" and dist <= THROW_RANGE:
+            await self.throw(p, x, y)
+        elif p.held == "freeze" and dist <= FREEZE_RANGE:
+            await self.freeze(p, cx, cz)
+        elif p.held == "blink" and dist <= BLINK_RANGE and self.is_floor(x, y):
+            await self.blink(p, x, y)
+
+    def _absorb(self, q):
+        if q.shield:
+            q.shield = False
+            return True
+        return False
+
+    async def freeze(self, p, tx, tz):
+        """Fire an ice beam from p toward (tx, tz); the first other player near the beam is frozen."""
+        p.held = None
+        dx, dz = tx - p.x, tz - p.z
+        d = math.hypot(dx, dz) or 1.0
+        ux, uz = dx / d, dz / d
+        length = FREEZE_RANGE * TILE
+        # dungeon walls stop the beam
+        step = TILE / 4
+        for k in range(1, int(length / step) + 1):
+            bx, bz = p.x + ux * step * k, p.z + uz * step * k
+            if not self.is_floor(int(bx / TILE + W / 2), int(bz / TILE + H / 2)):
+                length = step * (k - 1)
+                break
+        best = None
+        targets = (list(self.players.values()) if self.hits_players() else []) + list(self.bosses.values())
+        for q in targets:
+            if q is p:
+                continue
+            rx, rz = q.x - p.x, q.z - p.z
+            along = rx * ux + rz * uz
+            width = FREEZE_WIDTH * TILE * (1.6 if isinstance(q, Boss) else 1.0)   # bosses are big
+            if 0 < along <= length and abs(rx * uz - rz * ux) <= width and (best is None or along < best[0]):
+                best = (along, q)
+        end = best[0] if best else length
+        target, shielded, boss_hit = None, False, None
+        now = time.time()
+        if best and isinstance(best[1], Boss):
+            boss_hit = best[1]
+            target = boss_hit.id
+            boss_hit.frozen_until = now + FREEZE_SECONDS
+            if boss_hit.state == "windup":
+                boss_hit.state = "chase"
+        elif best:
+            q = best[1]
+            target = q.id
+            shielded = self._absorb(q)
+            if not shielded:
+                q.frozen_until = now + FREEZE_SECONDS
+                q.stun_until = max(q.stun_until, q.frozen_until)
+        await self.broadcast({"t": "zap", "pid": p.id, "from": [round(p.x, 2), round(p.z, 2)],
+                              "to": [round(p.x + ux * end, 2), round(p.z + uz * end, 2)],
+                              "target": target, "boss": boss_hit is not None, "shielded": shielded, "dur": FREEZE_SECONDS})
+        if boss_hit:
+            await self.damage_boss(boss_hit, BOSS_POWER_DAMAGE["freeze"], p.id)
+
+    async def shockwave(self, p):
+        p.held = None
+        now = time.time()
+        hit, shielded = [], []
+        for q in (self.players.values() if self.hits_players() else ()):
+            if q is p or math.hypot(q.x - p.x, q.z - p.z) > SHOCK_RADIUS * TILE:
+                continue
+            if self._absorb(q):
+                shielded.append(q.id)
+            else:
+                q.stun_until = max(q.stun_until, now + SHOCK_STUN)
+                self.hurt(q, SHOCK_DAMAGE, now, by=p.id)
+                hit.append(q.id)
+        await self.broadcast({"t": "shock", "pid": p.id, "x": round(p.x, 2), "z": round(p.z, 2),
+                              "r": SHOCK_RADIUS, "hit": hit, "shielded": shielded, "stun": SHOCK_STUN,
+                              "damage": SHOCK_DAMAGE})
+        await self.flush_kos()
+        for b in list(self.bosses.values()):
+            if math.hypot(b.x - p.x, b.z - p.z) <= SHOCK_RADIUS * TILE:
+                await self.damage_boss(b, BOSS_POWER_DAMAGE["shockwave"], p.id, stagger=1.0)
+
+    async def blink(self, p, x, y):
+        p.held = None
+        fx, fz = p.x, p.z
+        p.x, p.z = tile_center(x, y)
+        p.move_lock = time.time() + 0.4  # ignore client moves sent before it saw the blink
+        if p.is_bot:
+            p.tx, p.tz = p.x, p.z
+        await self.broadcast({"t": "blink", "pid": p.id, "from": [round(fx, 2), round(fz, 2)],
+                              "to": [p.x, p.z]})
+
+    async def throw(self, p, x, y):
+        p.held = None
+        self.bomb_seq += 1
+        bid = self.bomb_seq
+        await self.broadcast({"t": "throw", "id": bid, "pid": p.id, "x": x, "y": y,
+                              "fuse": SCATTER_FUSE, "r": SCATTER_RADIUS})
+        asyncio.create_task(self.detonate_later(bid, p.id, x, y, self.round_id))
+
+    async def detonate_later(self, bid, pid, x, y, rid):
+        await asyncio.sleep(SCATTER_FUSE)
+        if self.round_id != rid or self.state != "playing":
+            return
+        await self.scatter(bid, pid, x, y)
+
+    async def scatter(self, bid, pid, x, y):
+        """Re-cover a (2R+1)^2 area: wipe its revealed tiles, flags, craters, items and mines,
+        then scatter SCATTER_MINES fresh mines into it. Players caught inside are knocked out."""
+        r = SCATTER_RADIUS
+        area = [idx(ax, ay) for ay in range(y - r, y + r + 1) for ax in range(x - r, x + r + 1)
+                if self.is_floor(ax, ay)]
+        if len(area) < 2:
+            return
+        for i in area:
+            self.revealed[i] = 0
+            self.booms.discard(i)
+            self.mines.discard(i)
+            self.flags.pop(i, None)
+            self.items.pop(i, None)
+            self.buried.pop(i, None)
+        added = random.sample(area, min(SCATTER_MINES, len(area) - 1))
+        self.mines.update(added)
+        self.recount()
+        self.safe_left = sum(1 for i in self.floor_tiles if not self.revealed[i] and i not in self.mines)
+
+        # area tiles go back to hidden; revealed tiles on the rim get their new counts
+        changed = [[i % W, i // W, -2] for i in area]
+        rim = set()
+        for i in area:
+            for nx, ny in self.nb(i % W, i // W):
+                j = idx(nx, ny)
+                if self.revealed[j] and j not in self.booms and j not in area:
+                    rim.add(j)
+        changed += [[j % W, j // W, self.counts[j]] for j in rim]
+
+        now, hit, shielded = time.time(), [], []
+        cx, cz = tile_center(x, y)
+        for q in (self.players.values() if self.hits_players() else ()):
+            if max(abs(q.x - cx), abs(q.z - cz)) <= (r + 0.5) * TILE:
+                if self._absorb(q):
+                    shielded.append(q.id)
+                else:
+                    q.stun_until = max(q.stun_until, now + SCATTER_STUN)
+                    self.hurt(q, SCATTER_DAMAGE, now, by=pid)
+                    hit.append(q.id)
+        await self.broadcast({
+            "t": "scatter", "id": bid, "pid": pid, "x": x, "y": y, "r": r, "added": len(added),
+            "tiles": changed, "hit": hit, "shielded": shielded, "stun": SCATTER_STUN, "damage": SCATTER_DAMAGE,
+            "minesLeft": self.mines_left(), "safeLeft": self.safe_left,
+        })
+        await self.flush_kos()
+        for b in list(self.bosses.values()):
+            if max(abs(b.x - cx), abs(b.z - cz)) <= (r + 0.5) * TILE:
+                await self.damage_boss(b, BOSS_POWER_DAMAGE["scatter"], pid, stagger=1.2)
+
+    async def flag(self, p, x, y):
+        if not self.can_act(p, x, y):
+            return
+        i = idx(x, y)
+        if self.revealed[i]:
+            return
+        owner = self.flags.get(i)
+        if owner is None:
+            self.flags[i] = p.id
+            new = p.id
+        elif owner == p.id:
+            del self.flags[i]
+            new = None
+        else:
+            return  # someone else's flag; you may dig it at your own risk
+        await self.broadcast({"t": "flag", "x": x, "y": y, "pid": new, "minesLeft": self.mines_left()})
+
+    async def update_bots(self, now, dt):
+        for p in list(self.players.values()):
+            if not p.is_bot:
+                continue
+            dx, dz = p.tx - p.x, p.tz - p.z
+            d = math.hypot(dx, dz)
+            if p.held and now >= p.throw_at and self.state == "playing" and now >= p.stun_until:
+                await self.bot_use(p, now)
+            if d > 1e-3:
+                step = BOT_SPEED * dt * (BOOTS_SPEED if now < p.boots_until else 1)
+                if d <= step:
+                    p.x, p.z = p.tx, p.tz
+                else:
+                    p.x += dx / d * step
+                    p.z += dz / d * step
+                p.rot = math.atan2(dx, dz)
+                continue
+            if self.state != "playing" or now < p.next_think or now < p.stun_until:
+                continue
+            p.next_think = now + p.interval
+            x, y = p.tile()
+            v2 = getattr(p.brain, "version", 1) >= 2
+            prey = list(self.bosses.values()) + ([q for q in self.players.values() if q is not p and not q.ko_until]
+                                                 if self.mode == "pvp" else [])
+            can_hit = any(math.hypot(b.x - p.x, b.z - p.z) <= ATTACK_RANGE * TILE for b in prey)
+            # v1 models know nothing about combat, so a heuristic swings for them; v2 models decide themselves
+            if not v2 and can_hit:
+                await self.attack(p)
+                continue
+            # heuristic (not learned): when hurt, walk toward visible food nearby
+            if p.hp <= MAX_HP - 40:
+                food = [(max(abs(i % W - x), abs(i // W - y)), i) for i, k in self.items.items() if k in FOOD]
+                food = [f for f in food if f[0] <= 8]
+                if food:
+                    _, i = min(food)
+                    sx, sy = (i % W > x) - (i % W < x), (i // W > y) - (i // W < y)
+                    for cx, cy in ((x + sx, y + sy), (x + sx, y), (x, y + sy)):
+                        if (cx, cy) != (x, y) and self.is_floor(cx, cy):
+                            p.tx, p.tz = tile_center(cx, cy)
+                            break
+                    else:
+                        cx = None
+                    if cx is not None:
+                        continue
+            mates = [q for q in self.players.values() if q is not p and not q.ko_until]
+            extra = None
+            if v2:   # what a v2 model also sees: its health, the mode, teammates and the nearest boss
+                boss = min(self.bosses.values(), key=lambda b: math.hypot(b.x - p.x, b.z - p.z), default=None)
+                extra = {"hp": p.hp / MAX_HP, "mode": self.mode, "attack_ok": can_hit,
+                         "allies": [q.tile() for q in mates] if self.coop else [],
+                         "boss": (*boss.tile(), boss.hp / boss.max_hp, boss.state == "windup") if boss else None}
+                others = [] if self.coop else [q.tile() for q in mates]
+            else:
+                others = [q.tile() for q in self.players.values() if q is not p]
+            kind, ox, oy = p.brain.decide(W, H, self.revealed, self.counts, self.booms, self.flags, p.id, (x, y), others,
+                                          floor=self.floor, extra=extra)
+            if kind == "attack":
+                await self.attack(p)
+                continue
+            tx, ty = x + ox, y + oy
+            if not self.is_floor(tx, ty):
+                continue
+            if kind == "move":
+                p.tx, p.tz = tile_center(tx, ty)
+            elif kind == "dig":
+                await self.dig(p, tx, ty)
+            else:
+                await self.flag(p, tx, ty)
+
+    async def bot_use(self, p, now):
+        """Heuristics for held items (not learned): aim at the nearest opponent in range,
+        shockwave when someone is close, blink toward unexplored ground. Otherwise retry later."""
+        px, py = p.tile()
+        foes = []
+        for q in (self.players.values() if self.hits_players() else ()):   # teammates aren't targets in co-op
+            if q is not p and now >= q.stun_until:
+                qx, qy = q.tile()
+                if 0 <= qx < W and 0 <= qy < H:
+                    foes.append((max(abs(qx - px), abs(qy - py)), qx, qy))
+        for b in self.bosses.values():   # bosses are fair game too
+            bx, by = b.tile()
+            foes.append((max(abs(bx - px), abs(by - py)), bx, by))
+        foes.sort()
+        rng = {"scatter": THROW_RANGE, "freeze": FREEZE_RANGE - 1, "shockwave": SHOCK_RADIUS - 1}.get(p.held)
+        if rng is not None:
+            if foes and foes[0][0] <= rng:
+                return await self.use(p, foes[0][1], foes[0][2])
+        elif p.held == "blink":
+            # the reachable tile with the most hidden tiles around it
+            best, best_n = None, 2
+            for _ in range(40):
+                x = min(max(px + random.randint(-BLINK_RANGE, BLINK_RANGE), 0), W - 1)
+                y = min(max(py + random.randint(-BLINK_RANGE, BLINK_RANGE), 0), H - 1)
+                if not self.revealed[idx(x, y)] or idx(x, y) in self.booms:
+                    continue
+                n = sum(1 for nx, ny in self.nb(x, y) if not self.revealed[idx(nx, ny)])
+                if n > best_n:
+                    best, best_n = (x, y), n
+            if best:
+                return await self.use(p, *best)
+        p.throw_at = now + 1.0
+
+    async def end_round(self):
+        self.state = "over"
+        bonuses = {}
+        for i, pid in self.flags.items():
+            if i in self.mines and pid in self.players:
+                bonuses[pid] = bonuses.get(pid, 0) + FLAG_CORRECT
+        for pid, b in bonuses.items():
+            self.players[pid].score += b
+        self.round_ends_at = time.time() + NEXT_ROUND_DELAY
+        standings = sorted(self.players.values(), key=lambda q: -q.score)
+        await self.broadcast({
+            "t": "over",
+            "mode": self.mode, "failed": self.failed,
+            "team": sum(q.score for q in standings) if self.coop else None,
+            "results": [{"id": q.id, "name": q.name, "color": q.color, "score": q.score,
+                         "flagBonus": bonuses.get(q.id, 0)} for q in standings],
+            "mines": self.all_mines(),
+            "next": NEXT_ROUND_DELAY,
+            "duration": round(time.time() - self.started_at),
+        })
+        self.round_task = asyncio.create_task(self.restart_later())
+
+    async def restart_later(self):
+        await asyncio.sleep(NEXT_ROUND_DELAY)
+        self.new_round()
+        spawns = {}
+        for q in self.players.values():
+            q.score = 0
+            q.stun_until = 0
+            q.hp, q.ko_until = MAX_HP, 0.0
+            q.reset_items()
+            self.place(q)   # the new layout has different floor, so everyone gets a fresh spawn
+            spawns[q.id] = [round(q.x, 2), round(q.z, 2)]
+        await self.broadcast({"t": "round", "snapshot": self.snapshot(), "spawns": spawns})
+
+
+rooms: dict[str, Room] = {}
+
+
+def clean(s, n, default):
+    s = "".join(ch for ch in str(s or "") if ch.isprintable()).strip()[:n]
+    return s or default
+
+
+def pick_char(c):
+    return c if c in CHARACTER_IDS else "miner"
+
+
+def pick_color(room, wanted, me=None):
+    """Honour the requested colour if nobody else in the room has it, else the first free one."""
+    used = {p.color for p in room.players.values() if p is not me}
+    if wanted in COLORS and wanted not in used:
+        return wanted
+    if me is not None:
+        return me.color
+    return next((c for c in COLORS if c not in used), random.choice(COLORS))
+
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+    room = player = None
+    try:
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                continue
+            try:
+                data = json.loads(msg.data)
+                t = data.get("t")
+            except Exception:
+                continue
+
+            if t == "join" and player is None:
+                room_name = clean(data.get("room"), 24, "lobby").lower()
+                existing = rooms.get(room_name)
+                if existing and len(existing.players) >= MAX_PLAYERS:
+                    await ws.send_str(json.dumps({"t": "error", "message": f"Room “{room_name}” is full ({MAX_PLAYERS} players). Pick another one."}))
+                    continue
+                room = existing or rooms.setdefault(
+                    room_name, Room(room_name, data.get("realm"), data.get("layout"), data.get("mode")))
+                color = pick_color(room, data.get("color"))
+                player = Player(ws, clean(data.get("name"), 16, "Sweeper"), color, pick_char(data.get("char")))
+                room.place(player)
+                room.players[player.id] = player
+                if room.coop and room.state == "playing":
+                    room.lives += 1          # every teammate brings a life to the shared pool
+                await ws.send_str(json.dumps({
+                    "t": "welcome", "id": player.id, "room": room.name,
+                    "cfg": {"w": W, "h": H, "mines": room.n_mines, "tile": TILE, "reach": REACH, "realm": room.realm,
+                            "mode": room.mode,
+                            "throwRange": THROW_RANGE, "scatterRadius": SCATTER_RADIUS, "bootsSpeed": BOOTS_SPEED,
+                            "freezeRange": FREEZE_RANGE, "blinkRange": BLINK_RANGE, "shockRadius": SHOCK_RADIUS,
+                            "held": HELD, "maxHp": MAX_HP},
+                    "spawn": [player.x, player.z],
+                    "snapshot": room.snapshot(),
+                }))
+                await room.send_roster()
+            elif player is None:
+                continue
+            elif t == "look":  # change name / character / colour mid-game
+                player.name = clean(data.get("name"), 16, player.name)
+                player.char = pick_char(data.get("char"))
+                player.color = pick_color(room, data.get("color"), me=player)
+                await room.send_roster()
+            elif t == "move":
+                if time.time() < getattr(player, "move_lock", 0):
+                    continue
+                try:
+                    lim_x, lim_z = W * TILE / 2 + 6, H * TILE / 2 + 6
+                    nx = max(-lim_x, min(lim_x, float(data["x"])))
+                    nz = max(-lim_z, min(lim_z, float(data["z"])))
+                    # in a dungeon you can't stand inside a wall (the client collides with them too)
+                    if room.layout_kind == "dungeon" and not room.is_floor(int(nx / TILE + W / 2), int(nz / TILE + H / 2)):
+                        continue
+                    player.x, player.z = nx, nz
+                    player.rot = float(data.get("r", 0))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            elif t in ("dig", "flag"):
+                try:
+                    x, y = int(data["x"]), int(data["y"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                await (room.dig if t == "dig" else room.flag)(player, x, y)
+            elif t == "attack":
+                await room.attack(player)
+            elif t in ("use", "throw"):
+                try:
+                    x, y = int(data.get("x", -1)), int(data.get("y", -1))
+                except (TypeError, ValueError):
+                    continue
+                await room.use(player, x, y)
+    finally:
+        if room and player:
+            room.players.pop(player.id, None)
+            if any(not p.is_bot for p in room.players.values()):
+                await room.send_roster()
+            else:  # last human left: close the room (its bots go with it)
+                if room.round_task:
+                    room.round_task.cancel()
+                rooms.pop(room.name, None)
+    return ws
+
+
+# ---------------------------------------------------------------- lobby
+MAX_PLAYERS = len(COLORS)
+
+
+def lobby_summary():
+    """Public list of open rooms for the join screen (no ids or anything private)."""
+    out = []
+    for r in rooms.values():
+        humans = [p for p in r.players.values() if not p.is_bot]
+        bots = [p for p in r.players.values() if p.is_bot]
+        total = len(r.floor_tiles) - (len(r.mines) if r.mines else r.n_mines)
+        done = max(0, total - r.safe_left) if r.mines else 0
+        out.append({
+            "name": r.name, "mode": r.mode, "layout": r.layout_kind, "realm": r.realm, "state": r.state,
+            "humans": len(humans), "bots": len(bots), "max": MAX_PLAYERS,
+            "players": [{"name": p.name, "color": p.color, "char": p.char, "bot": p.is_bot, "score": p.score}
+                        for p in sorted(r.players.values(), key=lambda q: -q.score)][:8],
+            "progress": round(done / total, 3) if total else 0,
+            "bosses": len(r.bosses), "lives": r.lives if r.coop else None,
+            "age": round(time.time() - r.started_at),
+        })
+    out.sort(key=lambda d: (-d["humans"], d["name"]))
+    return out
+
+
+async def api_rooms(_):
+    return web.json_response({"rooms": lobby_summary()}, headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------- bots (used by the lab)
+def rooms_summary():
+    return [{"name": r.name, "realm": r.realm, "layout": r.layout_kind, "mode": r.mode, "state": r.state, "safeLeft": r.safe_left,
+             "players": [{**p.roster(), "score": p.score} for p in r.players.values()]}
+            for r in rooms.values()]
+
+
+async def add_bot(room_name, model, difficulty="normal", char=None):
+    from ai.bots import DIFFICULTY, Brain
+    if not model:
+        raise ValueError("Pick a model for the bot.")
+    room_name = clean(room_name, 24, "lobby").lower()
+    room = rooms.get(room_name) or rooms.setdefault(room_name, Room(room_name))
+    if len(room.players) >= len(COLORS):
+        raise ValueError("That room is full.")
+    brain = Brain(model)
+    difficulty = difficulty if difficulty in DIFFICULTY else "normal"
+    char = char if char in CHARACTER_IDS else random.choice(sorted(CHARACTER_IDS))
+    taken = {p.name for p in room.players.values()}
+    base = clean(brain.name, 13, "Bot")
+    name = next(n for n in [base] + [f"{base} {k}" for k in range(2, 20)] if n not in taken)
+    bot = BotPlayer(brain, name, pick_color(room, None), char, difficulty, DIFFICULTY[difficulty])
+    room.place(bot)
+    room.players[bot.id] = bot
+    if room.coop and room.state == "playing":
+        room.lives += 1
+    await room.send_roster()
+
+
+async def remove_bot(room_name, bot_id):
+    room = rooms.get(str(room_name or ""))
+    p = room and room.players.get(str(bot_id or ""))
+    if p and p.is_bot:
+        room.players.pop(p.id, None)
+        if room.players:
+            await room.send_roster()
+        else:
+            rooms.pop(room.name, None)
+
+
+async def tick_loop(app):
+    async def loop():
+        last = time.time()
+        while True:
+            await asyncio.sleep(1 / TICK_HZ)
+            now = time.time()
+            dt, last = now - last, now
+            for room in list(rooms.values()):
+                if not room.players:
+                    continue
+                try:
+                    await room.update_bots(now, dt)
+                except Exception as e:  # a broken model must not take the game down
+                    print("bot error:", repr(e))
+                await room.update_bosses(now, dt)
+                await room.pickups(now)
+                await room.respawns(now)
+                await room.broadcast({"t": "players", "p": [
+                    [p.id, round(p.x, 2), round(p.z, 2), round(p.rot, 2), p.score,
+                     round(max(0.0, p.stun_until - now), 2), p.fx(now), p.hp]
+                    for p in room.players.values()],
+                    "b": [b.row(now) for b in room.bosses.values()]})
+    task = asyncio.create_task(loop())
+    yield
+    task.cancel()
+
+
+async def index(_):
+    return web.FileResponse(STATIC / "index.html")
+
+
+def make_app():
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/api/rooms", api_rooms)
+    app.router.add_static("/static", STATIC)
+    app.cleanup_ctx.append(tick_loop)
+    try:
+        from ai.lab import Lab
+        Lab(STATIC, rooms_summary, add_bot, remove_bot, sorted(CHARACTER_IDS)).setup(app)
+    except ImportError as e:
+        print(f"AI lab disabled ({e}). Install it with: .venv\\Scripts\\pip install -r requirements-ai.txt")
+    return app
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8080)
+    args = ap.parse_args()
+    print(f"Mine Field 3D running on http://localhost:{args.port}  (AI lab: http://localhost:{args.port}/lab)")
+    web.run_app(make_app(), host=args.host, port=args.port, print=None)

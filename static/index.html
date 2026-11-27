@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d1b2a">
+<title>Mine Field 3D</title>
+<link rel="stylesheet" href="/static/style.css">
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="view"></div>
+
+<div id="join" class="panel center wide">
+  <h1>Mine Field <span>3D</span></h1>
+  <p class="sub">Race your friends across a shared minefield. Dig safe ground for points, flag the mines, and try not to explode.</p>
+  <div id="lobby" class="lobby">
+    <div class="lobbyHead"><span class="lbl">Open rooms</span><span id="lobbyCount" class="hint"></span></div>
+    <div id="roomList" class="roomList"></div>
+  </div>
+  <div class="joinGrid">
+    <div class="previewCol">
+      <canvas id="preview" width="260" height="300"></canvas>
+      <div id="charName" class="charName">Miner</div>
+      <div id="charBlurb" class="blurb"></div>
+    </div>
+    <form id="joinForm">
+      <label>Your name <input id="name" maxlength="16" autocomplete="off" placeholder="Sweeper"></label>
+      <label id="roomField">Room <span class="hint">(join one above, or type a new name to create it)</span>
+        <input id="room" maxlength="24" autocomplete="off" placeholder="lobby"></label>
+      <div id="roomNote" class="roomNote" hidden></div>
+      <div id="realmField">
+        <div class="lbl">Mode, map &amp; realm <span class="hint">(used if you're first in the room)</span></div>
+        <div id="modes" class="layouts modes">
+          <button type="button" data-id="race"><b>Race</b><span>Everyone for themselves. Most points wins.</span></button>
+          <button type="button" data-id="pvp"><b>PvP</b><span>Race, but your sword hits players. KOs score.</span></button>
+          <button type="button" data-id="coop"><b>Co-op</b><span>One team, shared lives, no friendly fire.</span></button>
+        </div>
+        <div id="layouts" class="layouts">
+          <button type="button" data-id="dungeon"><b>Dungeon</b><span>Rooms and corridors to explore. A new one every round.</span></button>
+          <button type="button" data-id="field"><b>Open field</b><span>The classic 32×32 square.</span></button>
+        </div>
+        <div id="realms" class="realms"></div>
+      </div>
+      <div class="lbl">Character</div>
+      <div id="chars" class="chars"></div>
+      <div class="lbl">Colour</div>
+      <div id="colors" class="colors"></div>
+      <button type="submit" id="joinBtn" class="primary">Enter the field</button>
+      <button type="button" id="cancelBtn" class="secondary" hidden>Cancel</button>
+    </form>
+  </div>
+  <div class="rules" id="rules">
+    <div><b>+1</b> per safe tile revealed</div>
+    <div><b>+3</b> per correct flag (scored at round end)</div>
+    <div><b>−3</b> if someone digs up your wrong flag</div>
+    <div><b>−10</b> and a 3 s stun when you hit a mine</div>
+    <div class="items">You have <b>100 HP</b>. Mines take 35, blasts 25, shockwaves 10. At 0 you're knocked out (−15) and respawn after 5 s.
+      Eat <span style="--c:#ff4d4d">Apples</span> (+25) and <span style="--c:#ff6fb5">Health potions</span> (+60) to heal.</div>
+    <div class="items"><b>Bosses</b> roam dungeons: an <span style="--c:#a3e635">Ogre</span>, a fast <span style="--c:#c77dff">Wraith</span> or a tough <span style="--c:#ff9f43">Golem</span>.
+      Step out of the red circle when one winds up. Hit back with <b>R</b> (Attack) and power-ups. The killer gets +40, every helper gets points, and it drops loot.</div>
+    <div class="items">Dig up power-ups and walk over them to grab them. Use a held one with <b>G</b>:
+      <span style="--c:#c77dff">Scatter bomb</span> (re-buries a 5×5 area with new mines),
+      <span style="--c:#3ee6d6">Freeze ray</span> (freezes a rival for 4 s),
+      <span style="--c:#ff6fb5">Shockwave</span> (stuns everyone near you),
+      <span style="--c:#a3e635">Blink</span> (teleport up to 8 tiles).
+      Instant: <span style="--c:#4fa3ff">Shield</span> (soaks one hit),
+      <span style="--c:#ffd23f">Gold rush</span> (double points for 12 s),
+      <span style="--c:#4fd67a">Radar</span> (shows nearby mines),
+      <span style="--c:#ff9f43">Boots</span> (speed boost)</div>
+  </div>
+  <p id="joinError" class="err" hidden></p>
+</div>
+
+<div id="hud" hidden>
+  <div id="stats" class="panel">
+    <div class="room">Room <b id="roomName"></b> · <b id="realmName"></b></div>
+    <div class="hp" title="Health"><i id="hpFill"></i><span id="hpText">100 / 100</span></div>
+    <div id="modeRow" class="modeRow"><span id="modeChip" class="chip"></span><span id="teamInfo"></span></div>
+    <div class="stat"><span class="icon mine"></span><b id="minesLeft">0</b> mines left</div>
+    <div class="stat"><span class="icon safe"></span><b id="safeLeft">0</b> safe tiles left</div>
+    <button id="lookBtn" class="secondary small" type="button">Change character</button>
+  </div>
+  <div id="board" class="panel"><div class="title">Scores</div><ol id="scores"></ol></div>
+  <div id="mapPanel" class="panel"><canvas id="minimap" width="192" height="192"></canvas></div>
+  <div id="help" class="panel">
+    <b>WASD</b> move · <b>Shift</b> sprint · <b>Space</b> jump · <b>Q/E</b> or <b>middle-drag</b> rotate · <b>Wheel</b> zoom<br>
+    <b>Left-click</b> dig · <b>Right-click</b>/<b>F</b> flag · click a satisfied number to clear around it · <b>G</b> use held power-up · <b>R</b> attack
+  </div>
+  <div id="inventory" class="panel" hidden>
+    <div id="invHeld" class="inv" hidden><span id="invHeldDot" class="dot" style="--c:#c77dff"></span><b id="invHeldName">Scatter bomb</b> · <span id="invHeldHint"></span></div>
+    <div id="invGold" class="inv" hidden><span class="dot" style="--c:#ffd23f"></span><b>Gold rush ×2</b> <span id="goldLeft"></span>s</div>
+    <div id="invShield" class="inv" hidden><span class="dot" style="--c:#4fa3ff"></span><b>Shield</b> up</div>
+    <div id="invBoots" class="inv" hidden><span class="dot" style="--c:#ff9f43"></span><b>Boots</b> <span id="bootsLeft"></span>s</div>
+    <div id="invRadar" class="inv" hidden><span class="dot" style="--c:#4fd67a"></span><b>Radar</b> <span id="radarLeft"></span>s</div>
+  </div>
+  <div id="feed"></div>
+  <div id="stun" hidden>STUNNED</div>
+  <!-- touch controls (shown on phones and tablets, or with ?touch=1) -->
+  <div id="touch" hidden>
+    <div id="stick"><div id="knob"></div></div>
+    <div id="tbtns">
+      <button type="button" id="tDig" class="tb dig"><b>⛏</b><span>Dig</span></button>
+      <button type="button" id="tFlag" class="tb"><b>⚑</b><span>Flag</span></button>
+      <button type="button" id="tAttack" class="tb atk"><b>⚔</b><span>Attack</span></button>
+      <button type="button" id="tUse" class="tb sm"><b>★</b><span>Use</span></button>
+      <button type="button" id="tJump" class="tb sm"><b>⤒</b><span>Jump</span></button>
+    </div>
+    <div id="touchHint" class="panel">Walk with the stick, then press <b>⛏ Dig</b> to dig the tile marked in yellow (hold to keep digging) · <b>⚑</b> flags it · or tap any tile next to you · drag to turn, pinch to zoom</div>
+  </div>
+</div>
+
+<div id="results" class="panel center" hidden>
+  <h2 id="resultsTitle">Field cleared!</h2>
+  <p class="sub" id="resultsSub"></p>
+  <ol id="resultsList"></ol>
+  <p class="sub">Next round in <b id="nextIn">0</b>s</p>
+</div>
+
+<script type="module" src="/static/game.js"></script>
+</body>
+</html>

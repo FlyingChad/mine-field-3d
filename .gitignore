@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local AI-lab data: only the starter models (and their run histories) are shared.
+# The lab recreates these folders as needed.
+models/*
+!models/demo.pt
+!models/allmodes.pt
+runs/*
+!runs/demo.json
+!runs/allmodes.json
+configs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

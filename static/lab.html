@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mine Field Lab</title>
+<link rel="stylesheet" href="/static/lab.css">
+</head>
+<body>
+<header>
+  <div class="brand">Mine Field <span>Lab</span></div>
+  <div id="status" class="pill idle"><i></i><span>Idle</span></div>
+  <div id="device" class="muted"></div>
+  <a href="/" class="back" target="_blank">Open the game ↗</a>
+</header>
+
+<div class="layout">
+  <aside class="card" id="trainPanel">
+    <div class="cardHead"><h2>Training</h2></div>
+    <div class="row presets">
+      <select id="presetSel" aria-label="Saved configs"><option value="">Saved configs…</option></select>
+      <button id="presetLoad" class="ghost">Load</button>
+      <button id="presetDel" class="ghost" title="Delete selected config">✕</button>
+    </div>
+    <form id="cfgForm" autocomplete="off"></form>
+    <div class="row">
+      <input id="presetName" placeholder="Config name">
+      <button id="presetSave" class="ghost">Save config</button>
+      <button id="resetCfg" class="ghost" title="Reset to defaults">Defaults</button>
+    </div>
+    <div class="controls">
+      <button id="btnStart" class="primary">Start training</button>
+      <button id="btnPause">Pause</button>
+      <button id="btnStop" class="danger">Stop</button>
+    </div>
+    <button id="btnTweak" class="ghost wide" hidden>Apply live changes (fields marked LIVE)</button>
+    <div class="row">
+      <input id="snapName" placeholder="Snapshot name (optional)">
+      <button id="btnSave">Save best now</button>
+    </div>
+    <p class="muted small" id="archInfo"></p>
+  </aside>
+
+  <main>
+    <nav class="tabs" role="tablist">
+      <button data-tab="progress" class="on">Progress</button>
+      <button data-tab="watch">Watch</button>
+      <button data-tab="models">Models &amp; matches</button>
+      <button data-tab="arena">Deploy bots</button>
+    </nav>
+
+    <section id="tab-progress" class="tab">
+      <div class="row between">
+        <div class="muted small" id="runLabel">No run yet. Configure on the left and press <b>Start training</b>.</div>
+        <select id="runSel" aria-label="Show run"><option value="">Current run</option></select>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="charts">
+        <div class="card chart"><h3>Fitness (score per board)</h3><div class="legend" id="lg-fit"></div><div class="plot" id="ch-fit"></div></div>
+        <div class="card chart"><h3>Tiles revealed per board (population mean)</h3><div class="plot" id="ch-tiles"></div></div>
+        <div class="card chart"><h3>Mines hit per board (population mean)</h3><div class="plot" id="ch-mines"></div></div>
+        <div class="card chart"><h3>Flags per board (population mean)</h3><div class="legend" id="lg-flags"></div><div class="plot" id="ch-flags"></div></div>
+        <div class="card chart" id="card-kos" hidden><h3>Knockouts per board (v2, population mean)</h3><div class="legend" id="lg-kos"></div><div class="plot" id="ch-kos"></div></div>
+        <div class="card chart" id="card-boss" hidden><h3>Boss damage dealt per board (v2, population mean)</h3><div class="plot" id="ch-boss"></div></div>
+      </div>
+      <details class="card tablewrap"><summary>Generation table</summary><div id="genTable"></div></details>
+    </section>
+
+    <section id="tab-watch" class="tab" hidden>
+      <div class="watchGrid">
+        <div class="card">
+          <div class="row wrap">
+            <label class="inline"><input type="radio" name="wsrc" value="run" checked> Current run's best</label>
+            <label class="inline"><input type="radio" name="wsrc" value="models"> Saved models (up to 6, picked in the list below)</label>
+          </div>
+          <div id="watchModels" class="checklist" hidden></div>
+          <div class="row wrap">
+            <label class="tiny">Width <input id="wW" type="number" value="16" min="6" max="48"></label>
+            <label class="tiny">Height <input id="wH" type="number" value="16" min="6" max="48"></label>
+            <label class="tiny">Mines <input id="wM" type="number" value="40" min="1" max="2000"></label>
+            <label class="tiny">Steps <input id="wS" type="number" value="250" min="10" max="5000"></label>
+            <label class="tiny">Layout <select id="wL"><option value="field">Field</option><option value="dungeon">Dungeon</option></select></label>
+            <label class="tiny">Mode (v2) <select id="wMode"><option value="mixed">Mixed</option><option value="race">Race</option><option value="pvp">PvP</option><option value="coop">Co-op</option></select></label>
+            <label class="tiny">Boss (v2) <select id="wBoss"><option value="1">On</option><option value="0">Off</option></select></label>
+            <label class="tiny grow">Speed <input id="wSpeed" type="range" min="1" max="60" value="8"> <b id="wSpeedLbl">8</b>/s</label>
+          </div>
+          <div class="row">
+            <button id="watchStart" class="primary">Watch</button>
+            <button id="watchStop">Stop</button>
+            <span class="muted small" id="watchInfo"></span>
+          </div>
+          <div class="boardWrap"><canvas id="board" width="560" height="560"></canvas></div>
+          <h3>Brain activity: bot 1's network, live</h3>
+          <div class="netWrap"><canvas id="net"></canvas><div id="netTip" class="tip" hidden></div></div>
+          <div class="netKey small muted">
+            <span><i class="ln pos"></i>pushes the next layer up</span>
+            <span><i class="ln neg"></i>pushes it down</span>
+            <span><i class="nd"></i>node brightness = how strongly it fires</span>
+            <span><i class="nd chosen"></i>chosen action</span>
+            <span>Left: the tiles the bot can see (its vision window). Middle: hidden neurons. Right: action probabilities. Only the strongest connections are drawn; pulses show the signal flowing on each step.</span>
+          </div>
+        </div>
+        <div class="card side">
+          <h3>Bots</h3>
+          <div id="watchAgents" class="agents"></div>
+          <h3>Next move: what bot 1 is considering</h3>
+          <div id="prefs" class="prefs"></div>
+          <p class="muted small">On the board, the white tint on bot 1's 3×3 reach shows how strongly it wants to <b>dig</b> each tile. A red border shows how strongly it wants to <b>flag</b> it. These are the network's softmax probabilities over valid actions. The bot always takes the most likely one.</p>
+          <h3>Legend</h3>
+          <ul class="key">
+            <li><span class="sw" style="background:#6fbf4c"></span>Unrevealed</li>
+            <li><span class="sw" style="background:#e3cfa0"></span>Revealed (number = adjacent mines)</li>
+            <li><span class="sw" style="background:#b8322f"></span>Mine that was dug (exploded)</li>
+            <li><span class="sw" style="background:#2b2b33"></span>Mine shown when the episode ends</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-models" class="tab" hidden>
+      <div class="card">
+        <div class="cardHead"><h2>Model library</h2><span class="muted small">Tick models to watch or match them.</span></div>
+        <div class="tablewrap" id="modelTable"></div>
+      </div>
+      <div class="card">
+        <div class="cardHead"><h2>Head-to-head match</h2></div>
+        <p class="muted small">Every game puts all the ticked models (2–6) on one board at once. A win goes to the highest score, and ties share the win.</p>
+        <div class="row wrap">
+          <label class="tiny">Games <input id="mG" type="number" value="200" min="1" max="2000"></label>
+          <label class="tiny">Width <input id="mW" type="number" value="16" min="6" max="48"></label>
+          <label class="tiny">Height <input id="mH" type="number" value="16" min="6" max="48"></label>
+          <label class="tiny">Mines <input id="mM" type="number" value="40" min="1" max="2000"></label>
+          <label class="tiny">Steps <input id="mS" type="number" value="250" min="10" max="5000"></label>
+          <button id="matchRun" class="primary">Run match</button>
+          <button id="matchWatch">Watch them play</button>
+        </div>
+        <div id="matchResult"></div>
+      </div>
+    </section>
+
+    <section id="tab-arena" class="tab" hidden>
+      <div class="card">
+        <div class="cardHead"><h2>Add a bot to a game room</h2></div>
+        <p class="muted small">Bots join as real players with a character. They walk, dig and flag under the same reach and stun rules as people. Difficulty sets how quickly they act. Bots leave when the last human leaves the room.</p>
+        <div class="row wrap">
+          <label class="tiny">Room <input id="bRoom" value="lobby" list="roomList"></label>
+          <datalist id="roomList"></datalist>
+          <label class="tiny">Model <select id="bModel"></select></label>
+          <label class="tiny">Difficulty <select id="bDiff"></select></label>
+          <label class="tiny">Character <select id="bChar"></select></label>
+          <button id="bAdd" class="primary">Add bot</button>
+        </div>
+      </div>
+      <div id="rooms" class="rooms"></div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<div id="tip" class="tip" hidden></div>
+<script src="/static/lab.js"></script>
+</body>
+</html>

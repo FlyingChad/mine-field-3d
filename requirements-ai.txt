@@ -1,0 +1,8 @@
+# AI lab + bots (optional; the game itself only needs requirements.txt)
+# NVIDIA GPU (RTX 50-series needs CUDA 12.8 builds):
+#   .venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   .venv\Scripts\pip install -r requirements-ai.txt
+# CPU only:
+#   .venv\Scripts\pip install torch numpy
+torch>=2.7
+numpy
