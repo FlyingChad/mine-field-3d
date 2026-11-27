@@ -270,6 +270,8 @@ function renderProgress() {
     ['Generation', last.gen ?? '–'], ['Best fitness', fmt(last.best)], ['Elite mean', fmt(last.elite)],
     ['Population mean', fmt(last.mean)], ['Tiles / board', fmt(last.tiles)], ['Mines hit / board', fmt(last.mines_hit, 2)],
     ['Mutation σ', fmt(last.sigma, 4)], ['Seconds / gen', fmt(last.seconds, 2)],
+    ...(last.curriculum !== undefined && last.curriculum !== null
+      ? [['Ease-in', last.curriculum >= 1 ? 'done' : `${Math.round(last.curriculum * 100)}% · ${last.cur_mines} mines · mine ${fmt(last.cur_mine, 1)}`]] : []),
   ];
   $('tiles').replaceChildren(...tiles.map(([k, v]) => el('div', { class: 'tile' }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, String(v)))));
   const xs = h.map((g) => g.gen);

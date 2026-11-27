@@ -44,6 +44,16 @@ SCHEMA = [
          "help": "v3 only. Share of descent boards that start almost fully dug, so bots often get to finish a floor and walk to the stairs."},
         {"key": "bosses", "label": "Bosses", "type": "bool", "default": True, "help": "v2 models only. A boss roams every board, winds up and smashes; bots can attack it."},
     ]},
+    {"group": "Curriculum", "fields": [
+        {"key": "dig_practice", "label": "Dig practice", "type": "float", "default": 0.0, "min": 0, "max": 1, "step": 0.05, "live": True,
+         "help": "Share of boards that start part-dug, with each bot standing at the edge of the dug area, so there's always something to dig next to it. Teaches bots to dig instead of wander. Lower it as they improve."},
+        {"key": "curriculum_gens", "label": "Ease in over (generations)", "type": "int", "default": 0, "min": 0, "max": 100000, "live": True,
+         "help": "0 = off. Otherwise the first N generations start easy and get harder: mines and the mine penalty rise in a straight line from the starting shares below to the values set above."},
+        {"key": "curriculum_mines", "label": "Mines at the start", "type": "float", "default": 0.5, "min": 0.05, "max": 1, "step": 0.05, "live": True,
+         "help": "Share of the Mines setting used in generation 1 of the ease-in."},
+        {"key": "curriculum_mine_penalty", "label": "Mine penalty at the start", "type": "float", "default": 0.2, "min": 0, "max": 1, "step": 0.05, "live": True,
+         "help": "Share of the 'Hit a mine' reward used in generation 1 of the ease-in. Cheap mistakes early let bots find out that digging pays."},
+    ]},
     {"group": "Network", "fields": [
         {"key": "model_version", "label": "Model type", "type": "select", "options": ["4", "3", "2", "1"], "default": "4",
          "help": "4 = also holds power-ups and learns when to use them. 3 = sees spike traps, pickups and the stairs, and learns Descent. 2 = every mode: health, bosses, allies, attack. 1 = classic minesweeper only."},
@@ -155,7 +165,22 @@ def make_env(cfg, n, agents, device, version=None, mode=None):
                    cfg["stun_steps"], rewards_from(cfg), device, cfg.get("layout", "field"),
                    rich=version >= 2, mode=mode or cfg.get("mode", "race"), bosses=cfg.get("bosses", False),
                    extras=version >= 3, powers=version >= 4,
-                   params={"descent_practice": float(cfg.get("descent_practice", 0))})
+                   params={"descent_practice": float(cfg.get("descent_practice", 0)),
+                           "dig_practice": float(cfg.get("dig_practice", 0))})
+
+
+def stage(cfg, gen):
+    """The settings generation `gen` (0-based) is played with, and how far through the ease-in it is
+    (None when the curriculum is off). Mines and the mine penalty rise linearly to the configured values."""
+    n = int(cfg.get("curriculum_gens", 0) or 0)
+    if n <= 0:
+        return cfg, None
+    f = min(1.0, gen / n)
+    ease = lambda start: start + (1 - start) * f
+    out = dict(cfg)
+    out["mines"] = max(1, round(cfg["mines"] * ease(cfg.get("curriculum_mines", 1.0))))
+    out["reward_mine"] = cfg["reward_mine"] * ease(cfg.get("curriculum_mine_penalty", 1.0))
+    return out, f
 
 
 @torch.no_grad()
@@ -265,7 +290,8 @@ def _train(cfg, cmd_q, evt_q):
 
         # ---- evaluate
         t0 = time.time()
-        fitness, stats, cleared = evaluate(spec, pop, cfg, device)
+        play, eased = stage(cfg, gen)
+        fitness, stats, cleared = evaluate(spec, pop, play, device)
         order = torch.argsort(fitness, descending=True)
         pop, fitness = pop[order], fitness[order]
         stats = {k: v[order] for k, v in stats.items()}
@@ -281,6 +307,7 @@ def _train(cfg, cmd_q, evt_q):
             "unflags": stats["unflags"].mean().item(),
             "best_tiles": stats["tiles"][0].item(), "best_mines_hit": stats["mines_hit"][0].item(),
             "clear_rate": cleared,
+            **({"curriculum": eased, "cur_mines": play["mines"], "cur_mine": play["reward_mine"]} if eased is not None else {}),
             **{k: stats[k].mean().item() for k in ("kos", "boss_damage", "boss_kills", "pvp_kos", "items", "spikes", "stairs", "uses") if k in stats},
             "weights": best_vec.float().cpu().numpy(), "spec": spec.to_dict(),
         })

@@ -418,6 +418,44 @@ class LiveRewards(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
+class Curriculum(unittest.TestCase):
+    def test_dig_practice_starts_part_dug_at_the_edge(self):
+        from ai import env as E
+        torch.manual_seed(3)
+        for layout, mines in (("field", 30), ("dungeon", 50)):
+            env = E.MineEnv(64, 2, 16, 16, mines, 50, 3, device="cpu", layout=layout, params={"dig_practice": 1.0})
+            self.assertTrue(bool(env.generated.all()))
+            self.assertFalse(bool((env.revealed & env.mines).any()), "no mine starts dug")
+            self.assertTrue(bool(env.revealed.reshape(64, -1).any(1).all()))
+            c = F.conv2d(env.mines.float()[:, None], torch.ones(1, 1, 3, 3), padding=1)[:, 0].long() - env.mines.long()
+            self.assertTrue(torch.equal(c, env.counts))
+            covered = env.floor & ~env.revealed
+            edge = env.revealed & (F.max_pool2d(covered.float()[:, None], 3, 1, 1)[:, 0] > 0)
+            for a in range(2):
+                y, x = env.pos[:, a, 0], env.pos[:, a, 1]
+                on = edge[torch.arange(64), y, x]
+                self.assertTrue(bool(on.all()), f"{layout}: every agent starts next to something to dig")
+                self.assertTrue(bool(env.mask(a)[:, E.DIG0:E.FLAG0].any(1).all()))
+            r = env.step(torch.full((64, 2), E.DIG0 + 4))      # digging your own (dug) tile does nothing
+            self.assertEqual(float(env.stats["mines_hit"].sum()), 0.0)
+        off = E.MineEnv(16, 1, 16, 16, 30, 50, 3, device="cpu")
+        self.assertFalse(bool(off.generated.any()), "without practice the first dig places the mines")
+
+    def test_ease_in(self):
+        from ai import evolve
+        cfg = evolve.sanitize({"mines": 80, "reward_mine": -10, "curriculum_gens": 10,
+                               "curriculum_mines": 0.5, "curriculum_mine_penalty": 0.2})
+        first, f0 = evolve.stage(cfg, 0)
+        mid, f5 = evolve.stage(cfg, 5)
+        done, f10 = evolve.stage(cfg, 25)
+        self.assertEqual((first["mines"], first["reward_mine"], f0), (40, -2.0, 0.0))
+        self.assertEqual((mid["mines"], round(mid["reward_mine"], 6), f5), (60, -6.0, 0.5))
+        self.assertEqual((done["mines"], done["reward_mine"], f10), (80, -10.0, 1.0))
+        self.assertEqual(cfg["mines"], 80, "the run's own settings are untouched")
+        self.assertEqual(evolve.stage(evolve.sanitize({}), 3)[1], None)
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class InGameBot(unittest.IsolatedAsyncioTestCase):
     async def test_v3_bot_in_descent(self):
         """A v3 brain gets traps, pickups and the goal from a live descent room and acts on them."""

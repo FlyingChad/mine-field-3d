@@ -87,6 +87,9 @@ RICH = dict(max_hp=100, mine_damage=35, smash_damage=30, pvp_damage=15, attack_d
             # radius 1..practice_radius around the first dig, so finishing a floor and finding the
             # stairs comes up often (radius 1 = the safe first dig clears it at once)
             descent_practice=0.0, practice_radius=3,
+            # curriculum: this share of boards (any mode) start part-dug, one or more openings already
+            # flooded, with every agent on dug ground next to covered tiles (see _dig_practice)
+            dig_practice=0.0, practice_openings=3,
             # powers (v4), from server.py's THROW_RANGE, SCATTER_*, FREEZE_*, SHOCK_*, BLINK_RANGE, BOSS_POWER_DAMAGE
             throw_range=6, scatter_radius=2, scatter_mines=6, scatter_damage=25, scatter_stun=3, scatter_boss=60,
             freeze_range=9, freeze_steps=8, freeze_boss=20, shock_radius=3, shock_damage=10, shock_stun=3,
@@ -331,6 +334,35 @@ class MineEnv:
         self.boss_stun = torch.zeros(N, dtype=torch.long, device=dev)
         if self.powers:
             self.stats.update(uses=z(), shielded=z())
+        if self.p["dig_practice"] > 0:
+            self._dig_practice()
+
+    def _dig_practice(self):
+        """Curriculum: a `dig_practice` share of boards start part-dug, so bots learn to dig the edge of
+        the dug area instead of wandering. The mines are placed now (kept off agent 0's 3x3, as on a
+        first dig); the agent's start and up to `practice_openings` - 1 random safe tiles are flooded
+        open; then every agent moves to a random dug tile with a covered neighbour."""
+        N, A, H, W, dev = self.N, self.A, self.H, self.W, self.device
+        pick = torch.rand(N, device=dev) < self.p["dig_practice"]
+        if not bool(pick.any()):
+            return
+        ar = torch.arange(N, device=dev)
+        self._generate(pick, self.pos[:, 0, 0], self.pos[:, 0, 1])
+        safe = self.floor & ~self.mines
+        seed = torch.zeros(N, H, W, dtype=torch.bool, device=dev)
+        seed[ar, self.pos[:, 0, 0], self.pos[:, 0, 1]] = True
+        k = torch.randint(0, max(1, int(self.p["practice_openings"])), (N, 1, 1), device=dev).float()
+        n_safe = safe.reshape(N, -1).sum(1).clamp(min=1).view(N, 1, 1).float()
+        seed |= safe & (torch.rand(N, H, W, device=dev) < k / n_safe)
+        seed &= pick.view(N, 1, 1)
+        self.revealed |= self._flood(seed)
+        covered = self.floor & ~self.revealed
+        edge = self.revealed & ~self.mines & (F.max_pool2d(covered.float().unsqueeze(1), 3, 1, 1).squeeze(1) > 0)
+        ok = pick & edge.reshape(N, -1).any(1)
+        if bool(ok.any()):
+            b = ok.nonzero().squeeze(1)
+            spot = torch.multinomial(edge[b].reshape(b.numel(), -1).float(), A, replacement=True)
+            self.pos[b] = torch.stack([spot // W, spot % W], 2)
 
     # ---------------------------------------------------------------- observations
     def others_mask(self, a, split=False):

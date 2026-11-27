@@ -297,6 +297,10 @@ Open **http://localhost:8080/lab** to evolve neural-network opponents. This need
    - **Model type 1** is the classic minesweeper-only bot.
    - The starter **allmodes** model is a type 2 bot trained this way.
    - The Progress tab shows knockouts and boss damage for type 2 and 3 runs, plus spike hits and pickups for type 3.
+   - **Curriculum** (all LIVE): untrained bots tend to settle on wandering, because walking costs nothing and digging might hit a mine.
+     - *Dig practice* starts that share of boards part-dug, with every bot standing at the edge of the dug area, so there's always something to dig next to it. Try 0.5 at first, and lower it as "Safe digs" climbs.
+     - *Ease in over N generations* starts easy and gets harder. Mines start at *Mines at the start* (a share of the Mines setting) and the mine penalty at *Mine penalty at the start*, and both rise in a straight line to the values you set. Cheap mistakes early let bots find out that digging pays; rising costs then favour the bots that pick safe tiles. The Progress tab shows how far the ease-in has got. Fitness falls as the boards get harder, which is expected.
+     - The **dig-trainer** config (game density, race, no bosses, one bot per board) is a good place to start.
    - **Rewarding careful digs:** *Per safe dig* (+1 by default) pays once for every dig that opens safe ground. *Per tile revealed* pays for every tile, so a lucky dig that floods a big empty area earns far more than a careful dig next to a number. Paying for safe digs as well makes every correct deduction count. The Tiles chart shows "Safe digs" alongside.
    - **Stopping time-wasting:** untrained bots like to toggle a flag on and off, a "safe" way to pass a turn. Two rewards discourage it:
      - *Per step* (−0.02 by default) makes every turn cost a little;
