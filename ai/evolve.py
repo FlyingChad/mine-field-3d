@@ -66,6 +66,8 @@ SCHEMA = [
     ]},
     {"group": "Rewards", "fields": [
         {"key": "reward_reveal", "label": "Per tile revealed", "type": "float", "default": 1, "min": -100, "max": 100, "step": 0.1, "live": True},
+        {"key": "reward_dig", "label": "Per safe dig", "type": "float", "default": 1, "min": -100, "max": 100, "step": 0.1, "live": True,
+         "help": "Paid once for every dig that opens safe ground, however many tiles it opens. Per tile revealed favours lucky digs that flood a big area; this pays for every careful, correct dig the same."},
         {"key": "reward_mine", "label": "Hit a mine", "type": "float", "default": -10, "min": -1000, "max": 100, "step": 0.5, "live": True},
         {"key": "reward_flag_correct", "label": "Correct flag", "type": "float", "default": 3, "min": -100, "max": 100, "step": 0.5, "live": True},
         {"key": "reward_flag_wrong", "label": "Wrong flag", "type": "float", "default": -3, "min": -100, "max": 100, "step": 0.5, "live": True},
@@ -274,7 +276,7 @@ def _train(cfg, cmd_q, evt_q):
             "t": "gen", "gen": gen, "seconds": round(time.time() - t0, 3), "sigma": sigma,
             "best": best_fit, "mean": fitness.mean().item(), "median": fitness.median().item(),
             "elite": fitness[:E].mean().item(), "worst": fitness[-1].item(),
-            "tiles": stats["tiles"].mean().item(), "mines_hit": stats["mines_hit"].mean().item(),
+            "tiles": stats["tiles"].mean().item(), "digs": stats["digs"].mean().item(), "mines_hit": stats["mines_hit"].mean().item(),
             "flags_correct": stats["flags_correct"].mean().item(), "flags_wrong": stats["flags_wrong"].mean().item(),
             "unflags": stats["unflags"].mean().item(),
             "best_tiles": stats["tiles"][0].item(), "best_mines_hit": stats["mines_hit"][0].item(),

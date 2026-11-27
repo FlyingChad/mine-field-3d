@@ -297,6 +297,7 @@ Open **http://localhost:8080/lab** to evolve neural-network opponents. This need
    - **Model type 1** is the classic minesweeper-only bot.
    - The starter **allmodes** model is a type 2 bot trained this way.
    - The Progress tab shows knockouts and boss damage for type 2 and 3 runs, plus spike hits and pickups for type 3.
+   - **Rewarding careful digs:** *Per safe dig* (+1 by default) pays once for every dig that opens safe ground. *Per tile revealed* pays for every tile, so a lucky dig that floods a big empty area earns far more than a careful dig next to a number. Paying for safe digs as well makes every correct deduction count. The Tiles chart shows "Safe digs" alongside.
    - **Stopping time-wasting:** untrained bots like to toggle a flag on and off, a "safe" way to pass a turn. Two rewards discourage it:
      - *Per step* (−0.02 by default) makes every turn cost a little;
      - *Removing own flag* (−0.5) charges for taking your own flag back off.

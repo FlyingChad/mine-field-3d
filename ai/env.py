@@ -75,7 +75,7 @@ ITEM_WEIGHTS = {"scatter": 4, "shield": 3, "radar": 3, "boots": 3, "freeze": 3, 
 
 # unflag: charged when an agent removes its own flag. Training-only shaping that stops bots from
 # toggling a flag on and off as a "safe" way to pass a turn (the lab's default is -0.5).
-DEFAULT_REWARDS = dict(reveal=1.0, mine=-10.0, flag_correct=3.0, flag_wrong=-3.0, step=0.0, clear=0.0, unflag=0.0,
+DEFAULT_REWARDS = dict(reveal=1.0, dig=0.0, mine=-10.0, flag_correct=3.0, flag_wrong=-3.0, step=0.0, clear=0.0, unflag=0.0,
                        ko=-15.0, pvp_ko=20.0, boss_hit=1.0, boss_kill=40.0, item=2.0, floor=10.0, stairs=20.0)
 # rich-mode rules, in tiles and steps (one step is roughly one bot decision in the game)
 RICH = dict(max_hp=100, mine_damage=35, smash_damage=30, pvp_damage=15, attack_damage=12, boss_hp=300,
@@ -294,7 +294,7 @@ class MineEnv:
         self.done = torch.zeros(N, dtype=torch.bool, device=dev)
         self.t = 0
         z = lambda: torch.zeros(N, A, device=dev)
-        self.stats = dict(tiles=z(), mines_hit=z(), flags_correct=z(), flags_wrong=z(), unflags=z())
+        self.stats = dict(tiles=z(), digs=z(), mines_hit=z(), flags_correct=z(), flags_wrong=z(), unflags=z())
         self.cleared = torch.zeros(N, dtype=torch.bool, device=dev)
         self.safe_total = n_floor - self.board_mines
         # rich-mode state
@@ -677,8 +677,10 @@ class MineEnv:
                     seed[s, flat[s]] = True
                     new = self._flood(seed.view(N, H, W))
                     cnt = new.reshape(N, -1).sum(1).float()
-                    self.score[ar, a] += cnt * rw["reveal"]
+                    opened = (cnt > 0).float()     # one safe dig, however many tiles it floods open
+                    self.score[ar, a] += cnt * rw["reveal"] + opened * rw["dig"]
                     self.stats["tiles"][ar, a] += cnt
+                    self.stats["digs"][ar, a] += opened
                     for o in range(A):
                         lost = (new & (self.flag_owner == o)).reshape(N, -1).sum(1).float()
                         self.score[:, o] += lost * rw["flag_wrong"]

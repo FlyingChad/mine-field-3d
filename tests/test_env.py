@@ -55,6 +55,23 @@ class Classic(unittest.TestCase):
         self.assertTrue(bool(env3.done[0]))
         self.assertEqual(float(env3.score[0, 0] - s0[0, 0]), E.DEFAULT_REWARDS["flag_correct"])
 
+    def test_dig_reward_once_per_safe_dig(self):
+        E = self.E
+        rw = {"reveal": 0.0, "dig": 5.0}
+        env = E.MineEnv(1, 1, 8, 8, 10, steps=50, stun=3, rewards=rw, device="cpu")
+        env.pos[0, 0] = torch.tensor([4, 4])
+        r = env.step(torch.tensor([[E.DIG0 + 4]]))
+        self.assertGreater(int(env.revealed.sum()), 1, "the first dig floods open several tiles")
+        self.assertEqual(float(r[0, 0]), 5.0, "but pays the dig reward once")
+        self.assertEqual(float(env.stats["digs"][0, 0]), 1.0)
+        r = env.step(torch.tensor([[E.DIG0 + 4]]))      # the same tile again: nothing opens, nothing paid
+        self.assertEqual(float(r[0, 0]), 0.0)
+        y, x = (~env.revealed[0] & env.mines[0]).nonzero()[0].tolist()
+        env.pos[0, 0] = torch.tensor([y, x])
+        r = env.step(torch.tensor([[E.DIG0 + 4]]))      # a mine is not a safe dig
+        self.assertEqual(float(r[0, 0]), E.DEFAULT_REWARDS["mine"])
+        self.assertEqual(float(env.stats["digs"][0, 0]), 1.0)
+
     def test_dungeon_walls(self):
         E = self.E
         e = E.MineEnv(32, 2, 24, 24, 86, 200, 5, device="cpu", layout="dungeon")

@@ -278,7 +278,9 @@ function renderProgress() {
     { name: 'Elite mean', color: SERIES[1], values: h.map((g) => g.elite) },
     { name: 'Population', color: SERIES[2], values: h.map((g) => g.mean) },
   ], 'lg-fit');
-  lineChart('ch-tiles', xs, [{ name: 'Tiles', color: SERIES[0], values: h.map((g) => g.tiles) }]);
+  lineChart('ch-tiles', xs, [{ name: 'Tiles', color: SERIES[0], values: h.map((g) => g.tiles) },
+    ...(h.some((g) => g.digs !== undefined) ? [{ name: 'Safe digs', color: SERIES[1], values: h.map((g) => g.digs ?? 0) }] : []),
+  ], 'lg-tiles');
   lineChart('ch-mines', xs, [{ name: 'Mines hit', color: SERIES[0], values: h.map((g) => g.mines_hit) }]);
   lineChart('ch-flags', xs, [
     { name: 'Correct', color: SERIES[0], values: h.map((g) => g.flags_correct) },
