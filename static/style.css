@@ -383,3 +383,49 @@ body.spectating .fsBtn { top: calc(78px + env(safe-area-inset-top)); }   /* belo
 .weeklyBtn[hidden] { display: none; }
 body.touch .relics { top: auto; bottom: calc(190px + env(safe-area-inset-bottom)); }
 @media (max-width: 900px) and (min-width: 721px) { .daily .dBoards { grid-template-columns: 1fr 1fr; } }
+
+/* ---- settings ---- */
+.settingsWrap { position: fixed; inset: 0; z-index: 30; background: rgba(4, 8, 14, .55); }
+.settingsWrap[hidden] { display: none; }
+.settings { text-align: left; display: grid; gap: 12px; width: min(420px, calc(100vw - 32px)); }
+.settings h2 { margin: 0 0 4px; text-align: center; }
+.settings .row { display: grid; gap: 4px; font-size: 14px; color: #dbe4ee; }
+.settings .row.check { display: flex; align-items: center; gap: 8px; }
+.settings .row.check input { width: auto; margin: 0; }
+.settings input[type=range] { width: 100%; accent-color: #ffd23f; }
+.settings select { margin: 0; }
+.settings .hint { margin: 0; }
+.cbPreview { display: inline-flex; gap: 6px; margin-left: auto; padding: 2px 8px; border-radius: 6px; background: #e3cfa0; font-weight: 900; }
+.setReload { font-size: 13px; color: #ffd23f; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.setReload[hidden] { display: none; }
+.setReload button { margin: 0; }
+.btnRow { display: flex; gap: 6px; }
+.btnRow #lookBtn { flex: 1; }
+.btnRow #setBtn { width: auto; padding-left: 10px; padding-right: 10px; }
+.topBtns { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: -4px 0 12px; }
+.topBtns .installBtn { margin: 0; }
+.tutBtn { margin: 0; width: auto; padding: 7px 16px; font-size: 14px; font-weight: 800; border-radius: 10px; border: 0;
+  background: #4fd67a; color: #06210f; }
+.tutBtn:hover { filter: brightness(1.08); }
+.ghostBtn { margin: 0; width: auto; padding: 6px 12px; font-size: 13px; border-radius: 9px; background: transparent;
+  color: #c6d1de; border: 1px solid #2c3e55; }
+.ghostBtn:hover { border-color: #ffd23f; color: #fff; }
+body.nohelp #help { display: none; }
+
+/* ---- tutorial ---- */
+.tut { left: 50%; top: 16px; transform: translateX(-50%); width: min(520px, calc(100vw - 32px)); padding: 12px 16px; z-index: 6;
+  border: 1px solid #1f8a5a; }
+.tut .tutHead { display: flex; align-items: baseline; gap: 10px; }
+.tut .tutHead .lbl { margin: 0; color: #4fd67a; white-space: nowrap; }
+.tut .tutHead b { font-size: 17px; }
+.tut p { margin: 6px 0 8px; font-size: 14px; line-height: 1.45; color: #dbe4ee; }
+.tut .tutProg { height: 5px; border-radius: 3px; background: #1c2a3d; overflow: hidden; margin-bottom: 8px; }
+.tut .tutProg i { display: block; height: 100%; background: #4fd67a; border-radius: 3px; transition: width .4s; }
+.tut button { margin: 0; width: auto; }
+.tut button.primary { padding: 8px 16px; font-size: 14px; }
+body.tutorial #help, body.tutorial #quick { display: none !important; }
+body.touch .tut { top: calc(62px + env(safe-area-inset-top)); width: min(520px, calc(100vw - 20px)); padding: 8px 12px; }
+body.touch .tut p { font-size: 13px; }
+.settings .row { text-transform: none; letter-spacing: 0; }
+.settings select { width: 100%; padding: 8px 10px; border-radius: 9px; border: 1px solid #2c3e55; background: #0b1522; color: #fff; font: inherit; }
+.btnRow #setBtn { font-size: 15px; line-height: 1; }

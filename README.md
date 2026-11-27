@@ -317,6 +317,28 @@ Open **http://localhost:8080/lab** to evolve neural-network opponents. This need
 
 Models are saved in `models/`, configs in `configs/` and run histories in `runs/`.
 
+## Tutorial and settings
+
+**New here? Learn to play** on the join screen opens a private practice field: a small open square with a few mines, no traps and no monsters. A panel at the top walks you through nine steps, each finished by doing it:
+1. move;
+2. dig;
+3. read the numbers;
+4. flag a mine;
+5. clear around a number;
+6. pick up a power-up;
+7. use it;
+8. beat a training golem (it never fights back);
+9. finish the field.
+
+Practice rounds don't count towards your stats, aren't recorded as replays and don't show in the lobby. **Leave the tutorial** goes back to the join screen at any time.
+
+**⚙ Settings** (on the join screen, and next to *Change character* in a game; `#settings` in the address opens them directly) are saved in this browser:
+- **Volume**, and a **Screen shake** switch.
+- **Camera turn speed**, for Q/E, middle-drag and touch drag.
+- **Colour-blind friendly numbers:** 2 becomes orange and 3 magenta, so they no longer depend on telling green from red. It applies at once.
+- **Show the controls help** at the bottom of the screen.
+- **Graphics:** Auto (lighter on phones), High or Low. Low means a lower resolution, smaller shadows and less scenery. A reload applies it, and you rejoin your game.
+
 ## Controls
 
 WASD / arrows to move · Shift to sprint · Space to jump · Q/E or middle-drag to rotate the camera · mouse wheel to zoom

@@ -68,6 +68,17 @@ const send = (m) => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
 const IS_TOUCH = new URLSearchParams(location.search).has('touch') || matchMedia('(pointer: coarse)').matches;
 if (IS_TOUCH) document.body.classList.add('touch');
 
+// Settings live in this browser only (localStorage). Graphics quality is read once, when the renderer
+// is made, so changing it reloads the page (a reload resumes your game; see the reconnect code).
+const SETTINGS_KEY = 'mf3d.settings';
+const DEFAULT_SETTINGS = { volume: 0.8, sens: 1, colorblind: false, quality: 'auto', shake: true, help: true };
+const settings = (() => {
+  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { return { ...DEFAULT_SETTINGS }; }
+})();
+const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
+const LOW_GFX = settings.quality === 'low' || (settings.quality === 'auto' && IS_TOUCH);
+document.body.classList.toggle('nohelp', !settings.help);
+
 // Full screen on phones and tablets hides the browser's URL bar. Browsers only allow it on a tap, so
 // it's asked for when you press Join or Watch, and the ⛶ button brings it back after a swipe-out.
 // Installed as an app (manifest.json, "display": "fullscreen") the game starts without the bar anyway.
@@ -97,8 +108,8 @@ $('installBtn').addEventListener('click', async () => {
 });
 
 // ---------------------------------------------------------------- renderer / scene
-const renderer = new THREE.WebGLRenderer({ antialias: !IS_TOUCH, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, IS_TOUCH ? 1.5 : 2));
+const renderer = new THREE.WebGLRenderer({ antialias: !LOW_GFX, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, LOW_GFX ? 1.5 : 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -117,7 +128,7 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff3dd, 2.2);
 sun.position.set(30, 60, 18);
 sun.castShadow = true;
-sun.shadow.mapSize.set(IS_TOUCH ? 1024 : 2048, IS_TOUCH ? 1024 : 2048);
+sun.shadow.mapSize.set(LOW_GFX ? 1024 : 2048, LOW_GFX ? 1024 : 2048);
 Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 160 });
 sun.shadow.bias = -0.0005;
 scene.add(sun);
@@ -130,6 +141,7 @@ addEventListener('resize', () => {
 
 // ---------------------------------------------------------------- textures
 const NUM_COLORS = ['', '#1e6bff', '#1f9d3a', '#e5322d', '#26308f', '#8b1a1a', '#138a8a', '#222222', '#777777'];
+const NUM_COLORS_CB = ['', '#1e6bff', '#e08a00', '#c2349b', '#1b2a6b', '#7a4a12', '#00897b', '#222222', '#777777'];
 function numberTexture(n) {
   const c = document.createElement('canvas'); c.width = c.height = 128;
   const g = c.getContext('2d');
@@ -137,7 +149,7 @@ function numberTexture(n) {
   g.textAlign = 'center'; g.textBaseline = 'middle';
   g.lineWidth = 14; g.strokeStyle = 'rgba(255,255,255,.85)'; g.lineJoin = 'round';
   g.strokeText(String(n), 64, 70);
-  g.fillStyle = NUM_COLORS[n]; g.fillText(String(n), 64, 70);
+  g.fillStyle = (settings.colorblind ? NUM_COLORS_CB : NUM_COLORS)[n]; g.fillText(String(n), 64, 70);
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   t.anisotropy = renderer.capabilities.getMaxAnisotropy();
@@ -301,7 +313,7 @@ function buildWorld(realmId, extent) {
   let seed = 7;
   const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
   realm.decor({ group: worldGroup, rnd, floor: -0.5, lim: Math.max(bw, bh) / 2 + 7, tick: (fn) => worldTicks.push(fn),
-    quality: IS_TOUCH ? 0.5 : 1 });
+    quality: LOW_GFX ? 0.5 : 1 });
 }
 
 function squareOutline(radius, color, opacity) {
@@ -1159,8 +1171,12 @@ function swingFx(pid) {
 
 // ---------------------------------------------------------------- audio
 let actx = null;
+let master = null;   // every sound goes through this gain: the volume setting
 function audio() {
-  if (!actx) { try { actx = new AudioContext(); } catch { actx = null; } }
+  if (!actx) {
+    try { actx = new AudioContext(); master = actx.createGain(); master.gain.value = settings.volume; master.connect(actx.destination); }
+    catch { actx = null; }
+  }
   return actx;
 }
 function tone(freq, dur, { type = 'sine', vol = 0.15, slide = 0, delay = 0 } = {}) {
@@ -1171,7 +1187,7 @@ function tone(freq, dur, { type = 'sine', vol = 0.15, slide = 0, delay = 0 } = {
   o.type = type; o.frequency.setValueAtTime(freq, t0);
   if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), t0 + dur);
   g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-  o.connect(g).connect(a.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+  o.connect(g).connect(master); o.start(t0); o.stop(t0 + dur + 0.02);
 }
 function noise(dur, vol, cutoff) {
   if (quiet()) return;
@@ -1182,7 +1198,7 @@ function noise(dur, vol, cutoff) {
   const src = a.createBufferSource(); src.buffer = buf;
   const f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff;
   const g = a.createGain(); g.gain.value = vol;
-  src.connect(f).connect(g).connect(a.destination); src.start();
+  src.connect(f).connect(g).connect(master); src.start();
 }
 const distVol = (wx, wz) => Math.max(0.12, 1 - Math.hypot(wx - me.x, wz - me.z) / 70);
 const sfx = {
@@ -1330,6 +1346,7 @@ function connect(name, room, { spectate = false } = {}) {
 }
 
 function leaveGame() {
+  startTutorial(false);
   $('hud').hidden = true; $('results').hidden = true; $('reconnect').hidden = true; $('quick').hidden = true;
   $('fade').style.opacity = 0; $('shop').hidden = true; shopOffers = [];
   setSpectating(false);
@@ -1417,6 +1434,7 @@ function handle(m) {
       keyBit = m.cfg.keyBit ?? keyBit; spikeCycle = m.cfg.spikeCycle ?? spikeCycle; spikeUp = m.cfg.spikeUp ?? spikeUp;
       if (m.cfg.quick) quickIds = m.cfg.quick.filter((q) => QUICK[q]);
       resumeSeconds = m.cfg.resumeSeconds ?? resumeSeconds;
+      startTutorial(!!m.cfg.tutorial);
       renderQuick();
       if (m.resumed) feed('Reconnected. You kept your place.');
       ({ w: W, h: H, tile: T, reach: REACH } = m.cfg);
@@ -1984,6 +2002,7 @@ function handle(m) {
         $('resultsSub').textContent += ' Your result is on today\'s leaderboard. The same map comes back next round, so you can try to beat it.';
       }
       renderRecap(m.recap, m.replay);
+      if (tut) $('resultsTitle').textContent = 'Practice field cleared!';
       sfx.win();
       break;
     case 'round':
@@ -2011,7 +2030,117 @@ function handle(m) {
       feed('A new field has been laid. Go!');
       break;
   }
+  if (tut) tutEvent(m);
 }
+
+// ---------------------------------------------------------------- settings panel
+function openSettings() {
+  $('setVolume').value = Math.round(settings.volume * 100);
+  $('setSens').value = settings.sens;
+  $('setCb').checked = settings.colorblind;
+  $('setShake').checked = settings.shake;
+  $('setHelp').checked = settings.help;
+  $('setQuality').value = settings.quality;
+  $('setReload').hidden = true;
+  renderCbPreview();
+  $('settings').hidden = false;
+}
+function closeSettings() { $('settings').hidden = true; }
+function renderCbPreview() {
+  const pal = settings.colorblind ? NUM_COLORS_CB : NUM_COLORS;
+  $('cbPreview').replaceChildren(...[1, 2, 3, 4, 5, 6].map((n) => { const b = document.createElement('b'); b.textContent = n; b.style.color = pal[n]; return b; }));
+}
+$('setVolume').addEventListener('input', (e) => {
+  settings.volume = +e.target.value / 100; saveSettings();
+  if (master) master.gain.value = settings.volume;
+});
+$('setVolume').addEventListener('change', () => { audio(); sfx.pickup(1); });
+$('setSens').addEventListener('input', (e) => { settings.sens = +e.target.value; saveSettings(); });
+$('setShake').addEventListener('change', (e) => { settings.shake = e.target.checked; saveSettings(); });
+$('setHelp').addEventListener('change', (e) => {
+  settings.help = e.target.checked; saveSettings();
+  document.body.classList.toggle('nohelp', !settings.help);
+});
+$('setCb').addEventListener('change', (e) => {
+  settings.colorblind = e.target.checked; saveSettings(); renderCbPreview();
+  for (let n = 1; n <= 8; n++) {   // redraw the number textures in place
+    const mat = numMeshes[n]?.material; if (!mat) continue;
+    mat.map.dispose(); mat.map = numberTexture(n); mat.needsUpdate = true;
+  }
+});
+$('setQuality').addEventListener('change', (e) => {
+  settings.quality = e.target.value; saveSettings();
+  $('setReload').hidden = false;      // the renderer is set up once; a reload applies it (and resumes your game)
+});
+$('setReloadBtn').addEventListener('click', () => location.reload());
+$('setClose').addEventListener('click', closeSettings);
+$('settings').addEventListener('click', (e) => { if (e.target.id === 'settings') closeSettings(); });
+for (const id of ['setBtn', 'setBtnJoin']) $(id).addEventListener('click', (e) => { e.currentTarget.blur(); openSettings(); });
+if (location.hash === '#settings') setTimeout(openSettings, 0);   // a link straight to the settings
+
+// ---------------------------------------------------------------- tutorial
+// A private practice field (room "tutorial-…"; the server keeps it small, gentle and off the lobby).
+// Each step waits for something the player does; some steps ask the server for a prop first.
+const myReveal = (m) => m.t === 'reveal' && m.pid === myId;
+const TUT_STEPS = [
+  { title: 'Move', text: () => IS_TOUCH ? 'Push the stick on the left to walk around. Push it all the way to run.'
+      : 'Walk around with WASD or the arrow keys. Hold Shift to run, and turn the camera with Q / E.', move: 3 },
+  { title: 'Dig', text: () => (IS_TOUCH ? 'Press ⛏ Dig to dig the covered tile marked in yellow.' : 'Left-click a covered tile next to you to dig it.')
+      + ' You can only reach your own tile and the 8 around it. Your first dig is always safe.', on: myReveal },
+  { title: 'Read the numbers', text: 'Each number counts the mines touching that tile, diagonals included: a 1 means exactly one of its covered neighbours is a mine. A blank tile has none, so its neighbours open up on their own. Use the numbers to dig 3 more safe tiles.', on: myReveal, count: 3 },
+  { title: 'Flag a mine', text: () => (IS_TOUCH ? 'Press ⚑ Flag (or long-press a tile)' : 'Right-click a tile or press F')
+      + ' to plant a flag where you\'re sure a mine is. Correct flags pay +3 when the field is cleared; wrong ones cost 3. Digging a mine costs 10 points, 35 health and stuns you.', on: (m) => m.t === 'flag' && m.pid === myId },
+  { title: 'Clear around a number', text: () => 'Once a number has all its mines flagged, ' + (IS_TOUCH ? 'tap it' : 'click it')
+      + ' to dig all its other neighbours at once. Try it, or just dig another safe tile.', on: myReveal },
+  { title: 'Power-ups', text: 'A power-up just appeared nearby: the spinning icon on the dug ground. Power-ups are buried under safe tiles in real games. Walk onto it to pick it up.',
+    enter: () => send({ t: 'tut', what: 'item' }), on: (m) => m.t === 'pickup' && m.pid === myId },
+  { title: 'Use it', text: () => (IS_TOUCH ? 'Press ★ Use' : 'Press G')
+      + ' to use your held power-up. A shockwave stuns everyone around you and hurts monsters. Others need aiming: point at a tile first.', on: (m) => m.t === 'shock' && m.pid === myId },
+  { title: 'Fight', text: () => 'A training golem has appeared. Walk up to it and ' + (IS_TOUCH ? 'press ⚔ Attack' : 'press R')
+      + ' to swing your sword until it falls. Real monsters chase you and wind up a smash: when the red ring fills, get out of it.',
+    enter: () => send({ t: 'tut', what: 'dummy' }), on: (m) => m.t === 'bossDown' },
+  { title: 'Finish the field', text: 'That\'s everything! Real dungeons add monsters that fight back, spike traps, power-ups to find and a locked vault. Clear the rest of this field to finish, or leave whenever you like.',
+    on: (m) => m.t === 'over' },
+];
+let tut = null;
+function startTutorial(on) {
+  tut = on ? { step: -1, count: 0, start: null } : null;
+  $('tut').hidden = !on;
+  document.body.classList.toggle('tutorial', on);
+  if (on) tutGo(0);
+}
+function tutGo(k) {
+  tut.step = k; tut.count = 0; tut.start = null;
+  const done = k >= TUT_STEPS.length;
+  $('tutStep').textContent = done ? 'Done!' : `Step ${k + 1} of ${TUT_STEPS.length}`;
+  $('tutTitle').textContent = done ? 'Tutorial complete' : TUT_STEPS[k].title;
+  const s = TUT_STEPS[k];
+  $('tutText').textContent = done ? 'You know the basics. Pick a mode on the join screen: Race, PvP, Co-op or Descent. The daily dungeon is a good next stop.'
+    : typeof s.text === 'function' ? s.text() : s.text;
+  $('tutBar').style.width = `${Math.min(100, (k / TUT_STEPS.length) * 100)}%`;
+  $('tutSkip').textContent = done ? 'Back to the lobby' : 'Leave the tutorial';
+  $('tutSkip').classList.toggle('primary', done);
+  if (k > 0) sfx.pickup(1);
+  if (!done) s.enter?.();
+}
+function tutEvent(m) {
+  const s = TUT_STEPS[tut.step];
+  if (m.t === 'round') s?.enter?.();     // a fresh field: ask for this step's prop again
+  if (!s?.on || !s.on(m)) return;
+  if (++tut.count >= (s.count || 1)) tutGo(tut.step + 1);
+}
+function tutFrame() {
+  const s = TUT_STEPS[tut.step];
+  if (!s?.move) return;
+  if (!tut.start) { tut.start = [me.x, me.z]; return; }
+  if (Math.hypot(me.x - tut.start[0], me.z - tut.start[1]) >= s.move * T) tutGo(tut.step + 1);
+}
+$('tutSkip').addEventListener('click', () => { leaving = true; ws?.close(); });
+$('tutBtn').addEventListener('click', () => {
+  audio(); goFullscreen(); $('joinError').hidden = true;
+  const id = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) => b.toString(16).padStart(2, '0')).join('');
+  connect($('name').value.trim() || 'Rookie', `tutorial-${id}`);
+});
 
 // ---------------------------------------------------------------- run recap
 // Shown under the results: scores over time (one line per player, in their colour), who did what,
@@ -2628,6 +2757,7 @@ openPicker(false);
 
 const typing = () => document.activeElement?.tagName === 'INPUT';
 addEventListener('keydown', (e) => {
+  if (!$('settings').hidden) { if (e.code === 'Escape') closeSettings(); return; }
   if (!$('join').hidden) { if (e.code === 'Escape' && picker.edit) closePicker(); return; }
   if (typing()) return;
   keys.add(e.code);
@@ -2653,7 +2783,7 @@ const canvas = renderer.domElement;
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('mousemove', (e) => {
   mouse.x = (e.clientX / innerWidth) * 2 - 1; mouse.y = -(e.clientY / innerHeight) * 2 + 1; mouse.has = true;
-  if (mouse.drag) { cam.yaw -= (e.clientX - mouse.lastX) * 0.006; mouse.lastX = e.clientX; }
+  if (mouse.drag) { cam.yaw -= (e.clientX - mouse.lastX) * 0.006 * settings.sens; mouse.lastX = e.clientX; }
 });
 canvas.addEventListener('mousedown', (e) => {
   audio();
@@ -2809,7 +2939,7 @@ if (IS_TOUCH) {
       const s = touches.get(t.identifier); if (!s) continue;
       const dx = t.clientX - s.x;
       if (Math.hypot(t.clientX - s.x0, t.clientY - s.y0) > 12) s.moved = true;
-      if (touches.size === 1 && s.moved) cam.yaw -= dx * 0.008;    // drag to turn the camera
+      if (touches.size === 1 && s.moved) cam.yaw -= dx * 0.008 * settings.sens;    // drag to turn the camera
       s.x = t.clientX; s.y = t.clientY;
     }
     if (touches.size === 2 && gesture) {
@@ -2997,6 +3127,7 @@ function animateWorld(dt) {
 }
 
 function updateCamera(dt) {
+  if (!settings.shake) cam.shake = 0;
   const d = cam.dist;
   const target = new THREE.Vector3(me.x, me.y + 1.2, me.z);
   const want = new THREE.Vector3(
@@ -3049,9 +3180,10 @@ function frame(now) {
   if (!worldBuilt || !myId) { renderer.render(scene, camera); return; }
 
   // --- local movement
-  if (keys.has('KeyQ')) cam.yaw += dt * 2.2;
-  if (keys.has('KeyE')) cam.yaw -= dt * 2.2;
+  if (keys.has('KeyQ')) cam.yaw += dt * 2.2 * settings.sens;
+  if (keys.has('KeyE')) cam.yaw -= dt * 2.2 * settings.sens;
   if (replay) replayFrame(dt);
+  if (tut) tutFrame();
   if (spectating) { spectatorFrame(dt); return; }
   const fx = -Math.sin(cam.yaw), fz = -Math.cos(cam.yaw), rx = Math.cos(cam.yaw), rz = -Math.sin(cam.yaw);
   let mf = 0, mr = 0;

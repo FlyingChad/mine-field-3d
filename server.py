@@ -190,6 +190,15 @@ VAMPIRE_HEAL = 4
 # layouts, mines, loot, traps and floor twists - are the same for every team that week, so runs can
 # be compared on one ladder (store.Descents, tagged with the week)
 WEEKLY_PREFIX = "weekly-"
+
+# the tutorial: room "tutorial-<anything>" is a private practice field (a small open square, a few
+# mines, no traps or buried loot). The client walks the player through the basics and asks for the
+# props it needs with `tut {what}`: a power-up to pick up and a training golem that never fights back.
+# Tutorial rooms stay off the lobby, aren't recorded and don't count towards profile stats.
+TUTORIAL_PREFIX = "tutorial-"
+TUTORIAL_SIZE = 14
+TUTORIAL_DENSITY = 0.11
+TUTORIAL_DUMMY_HP = 36           # three sword hits
 UNSTABLE_RADIUS = 1              # 3x3 patches
 
 # the dungeon vault: a side room sealed by a locked door (two door tiles across a corridor). A key is
@@ -416,8 +425,11 @@ def weekly_name(week=None):
 
 
 class Room:
-    def __init__(self, name, realm="meadow", layout="dungeon", mode="race", daily=None, weekly=None):
+    def __init__(self, name, realm="meadow", layout="dungeon", mode="race", daily=None, weekly=None, tutorial=False):
         self.name = name
+        self.tutorial = tutorial
+        if tutorial:
+            realm, layout, mode = "meadow", "field", "race"
         self.daily = daily            # a date string for the daily dungeon, else None
         self.weekly = weekly          # an ISO week ("2026-W48") for the weekly descent, else None
         if weekly:
@@ -449,7 +461,7 @@ class Room:
             # a new replay starts with the first broadcast that has a human to see it (a descent
             # run is one replay across all its floors)
             self.rec = None
-            self.rec_pending = True
+            self.rec_pending = not self.tutorial
         if self.mode == "descent":
             self.realm = DESCENT_REALMS[(self.depth - 1) % len(DESCENT_REALMS)]
         self.stairs = None                 # descent: the staircase tile once the floor is cleared
@@ -458,7 +470,8 @@ class Room:
         # the weekly descent seeds every floor from the week and the floor number
         self.rng = (random.Random("mf3d-" + self.daily) if self.daily
                     else random.Random(f"mf3d-{self.weekly}-{self.depth}") if self.weekly else random.Random())
-        self.floor = layouts.make(self.layout_kind, W, H, rng=self.rng, field_size=(FIELD_SIZE, FIELD_SIZE))
+        size = TUTORIAL_SIZE if self.tutorial else FIELD_SIZE
+        self.floor = layouts.make(self.layout_kind, W, H, rng=self.rng, field_size=(size, size))
         self.floor_tiles = [i for i in range(W * H) if self.floor[i]]
         self.vault: set[int] = set()       # floor tiles behind the locked door
         self.doors: list[int] = []         # the door tiles (walls while locked)
@@ -470,6 +483,8 @@ class Room:
         density = MINE_DENSITY
         if self.mode == "descent":
             density = min(DESCENT_MAX_DENSITY, MINE_DENSITY * (1 + DESCENT_MINES_PER_FLOOR * (self.depth - 1)))
+        if self.tutorial:
+            density = TUTORIAL_DENSITY
         self.n_mines = round(density * len(self.floor_tiles))
         self.mines = None            # set of tile indices, generated on first dig
         self.counts = None
@@ -486,6 +501,8 @@ class Room:
         self.bomb_seq = 0
         self.bosses: dict[str, Boss] = {}
         self.next_boss_at = time.time() + BOSS_FIRST_DELAY
+        self.tut_props: set[str] = set()   # tutorial props already handed out this round
+        self.tut_wanted: set[str] = set()  # ...and ones asked for before the first dig
         if not next_floor:   # lives carry over from floor to floor in a descent
             self.lives = COOP_LIVES_BASE + len(getattr(self, "players", {}) or {})
         self.failed = False
@@ -538,6 +555,39 @@ class Room:
                 await self.pick_relic(q, random.choice(q.relic_offer))
             elif q.relic_offer:
                 await self.send_to(q, {"t": "relics", "offer": [{"id": k, **RELICS[k]} for k in q.relic_offer]})
+
+    async def tutorial_prop(self, p, what):
+        """Tutorial only: put a power-up near the player ("item") or a harmless training golem ("dummy").
+        Each prop is handed out once per round."""
+        if not self.tutorial or what not in ("item", "dummy") or what in self.tut_props or self.state != "playing":
+            return
+        if self.mines is None:          # nothing dug yet: hand it out after the first dig
+            self.tut_wanted.add(what)
+            return
+        self.tut_wanted.discard(what)
+        x, y = p.tile()
+        near = [(t, max(abs(t[0] - x), abs(t[1] - y))) for t in self.bfs((x, y), max_depth=4) if t != (x, y)]
+        if what == "item":
+            spots = [t for t, d in near if self.revealed[idx(*t)] and idx(*t) not in self.items and idx(*t) not in self.booms]
+            if not spots:
+                return
+            self.tut_props.add(what)
+            tx, ty = min(spots, key=lambda t: (abs(max(abs(t[0] - x), abs(t[1] - y)) - 2), random.random()))
+            self.items[idx(tx, ty)] = "shockwave"
+            await self.broadcast({"t": "drop", "pid": None, "x": tx, "y": ty, "kind": "shockwave"})
+        elif what == "dummy":
+            spots = [t for t, d in near if d == 3] or [t for t, d in near]
+            if not spots:
+                return
+            self.tut_props.add(what)
+            bx, bz = tile_center(*random.choice(spots))
+            b = Boss("golem", bx, bz)
+            b.name = "Training Golem"
+            b.max_hp = b.hp = TUTORIAL_DUMMY_HP
+            b.speed = b.damage = b.aggro = 0    # it never moves, never notices you, never hits back
+            self.bosses[b.id] = b
+            await self.broadcast({"t": "bossSpawn", "id": b.id, "kind": b.kind, "name": b.name,
+                                  "x": round(bx, 2), "z": round(bz, 2), "elite": False})
 
     async def pick_relic(self, p, k):
         """Take one of the relics on offer (descent, while the stairs are open). Lasts the whole run."""
@@ -777,7 +827,7 @@ class Room:
 
     # ---------- profiles (stats that unlock hats) ----------
     async def stat(self, p, best=None, deepest=None, **inc):
-        if p is None or not p.profile:
+        if p is None or not p.profile or self.tutorial:
             return
         new = profiles.bump(p.profile, best=best, deepest=deepest, **inc)
         if new:
@@ -1072,6 +1122,8 @@ class Room:
             outside = [i for i in free if i not in self.vault and i not in self.traps and i not in self.buried]
             if outside:
                 self.buried[rng.choice(outside)] = "key"
+        if self.tutorial:   # nothing hidden to surprise a beginner: the props come when they're asked for
+            self.buried, self.traps = {}, {}
         if seeded:
             # ...then any mine in the first dig's 3x3 (the first dig is always safe) moves to a free
             # seeded spot, so only those few mines differ between teams
@@ -1188,6 +1240,8 @@ class Room:
         if self.flags.get(i) == p.id:
             return  # can't dig your own flag; remove it first
         await self.open_tiles(p, [(x, y)])
+        for what in list(self.tut_wanted):
+            await self.tutorial_prop(p, what)
 
     async def chord(self, p, x, y):
         i = idx(x, y)
@@ -1825,7 +1879,7 @@ def welcome_msg(room, who, spectator=False):
                 "throwRange": THROW_RANGE, "scatterRadius": SCATTER_RADIUS, "bootsSpeed": BOOTS_SPEED,
                 "freezeRange": FREEZE_RANGE, "blinkRange": BLINK_RANGE, "shockRadius": SHOCK_RADIUS,
                 "held": HELD, "maxHp": MAX_HP, "keyBit": KEY_BIT, "spikeCycle": SPIKE_CYCLE, "spikeUp": SPIKE_UP,
-                "quick": QUICK_CHAT, "resumeSeconds": RESUME_SECONDS},
+                "quick": QUICK_CHAT, "resumeSeconds": RESUME_SECONDS, "tutorial": room.tutorial},
         "spawn": [0, 0] if spectator else [who.x, who.z],
         "snapshot": room.snapshot(),
     }
@@ -1836,6 +1890,8 @@ def make_room(room_name, data):
         return Room(room_name, daily=today())
     if room_name == weekly_name():
         return Room(room_name, weekly=this_week())
+    if room_name.startswith(TUTORIAL_PREFIX):
+        return Room(room_name, tutorial=True)
     return Room(room_name, data.get("realm"), data.get("layout"), data.get("mode"))
 
 
@@ -1999,6 +2055,8 @@ async def ws_handler(request):
                 await room.buy(player, data.get("id") if isinstance(data.get("id"), str) else "")
             elif t == "relic":
                 await room.pick_relic(player, data.get("id") if isinstance(data.get("id"), str) else "")
+            elif t == "tut":
+                await room.tutorial_prop(player, data.get("what") if isinstance(data.get("what"), str) else "")
             elif t in ("use", "throw"):
                 try:
                     x, y = int(data.get("x", -1)), int(data.get("y", -1))
@@ -2027,6 +2085,8 @@ def lobby_summary():
     """Public list of open rooms for the join screen (no ids or anything private)."""
     out = []
     for r in rooms.values():
+        if r.tutorial:          # practice rooms are private
+            continue
         humans = [p for p in r.players.values() if not p.is_bot]
         bots = [p for p in r.players.values() if p.is_bot]
         total = len(r.floor_tiles) - (len(r.mines) if r.mines else r.n_mines)

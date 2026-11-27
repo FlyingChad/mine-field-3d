@@ -314,7 +314,9 @@ class Modifiers(unittest.IsolatedAsyncioTestCase):
         t.generate(*divmod(t.floor_tiles[0], S.W)[::-1])
         plain = self.room("rich")
         plain.generate(*divmod(plain.floor_tiles[0], S.W)[::-1])
-        self.assertGreater(len(t.buried) / len(t.floor_tiles), 1.6 * len(plain.buried) / len(plain.floor_tiles))
+        # regular power-ups only: the vault's chest, loot and key are a fixed extra on maps that have one
+        loose = lambda r: sum(1 for i, k in r.buried.items() if i not in r.vault and k != "key") / len(r.floor_tiles)
+        self.assertGreater(loose(t), 1.6 * loose(plain))
 
     async def test_unstable_ground(self):
         r = self.room("unstable")

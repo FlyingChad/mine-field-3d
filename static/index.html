@@ -20,7 +20,11 @@
 
 <div id="join" class="panel center wide">
   <h1>Mine Field <span>3D</span></h1>
-  <button type="button" id="installBtn" class="installBtn" hidden>Install as an app</button>
+  <div class="topBtns">
+    <button type="button" id="tutBtn" class="tutBtn">New here? Learn to play (3 min)</button>
+    <button type="button" id="setBtnJoin" class="ghostBtn" aria-label="Settings">⚙ Settings</button>
+    <button type="button" id="installBtn" class="installBtn" hidden>Install as an app</button>
+  </div>
   <p class="sub">Race your friends across a shared minefield. Dig safe ground for points, flag the mines, and try not to explode.</p>
   <div id="lobby" class="lobby">
     <div id="daily" class="daily">
@@ -113,7 +117,8 @@
     <div id="relicRow" class="relicRow" hidden></div>
     <div class="stat"><span class="icon mine"></span><b id="minesLeft">0</b> mines left</div>
     <div class="stat"><span class="icon safe"></span><b id="safeLeft">0</b> safe tiles left</div>
-    <button id="lookBtn" class="secondary small" type="button">Change character</button>
+    <div class="btnRow"><button id="lookBtn" class="secondary small" type="button">Change character</button>
+      <button id="setBtn" class="secondary small" type="button" aria-label="Settings" title="Settings">⚙</button></div>
   </div>
   <div id="board" class="panel"><div class="title">Scores</div><ol id="scores"></ol></div>
   <div id="mapPanel" class="panel"><canvas id="minimap" width="192" height="192"></canvas></div>
@@ -128,6 +133,12 @@
     <div><span class="lbl">Watching</span> <b id="specName"></b><div class="hint" id="specHint">← → or Tab to switch players</div></div>
     <button type="button" id="specNext" class="secondary small" aria-label="Next player">▶</button>
     <button type="button" id="specLeave" class="secondary small">Leave</button>
+  </div>
+  <div id="tut" class="panel tut" hidden>
+    <div class="tutHead"><span id="tutStep" class="lbl"></span><b id="tutTitle"></b></div>
+    <p id="tutText"></p>
+    <div class="tutProg"><i id="tutBar"></i></div>
+    <button type="button" id="tutSkip" class="secondary small">Leave the tutorial</button>
   </div>
   <div id="replayBar" class="panel replayBar" hidden>
     <button type="button" id="rpPlay" class="small" title="Pause (Space)">❚❚</button>
@@ -170,6 +181,23 @@
       <button type="button" id="tChat" class="tb sm"><b>💬</b><span>Chat</span></button>
     </div>
     <div id="touchHint" class="panel">Walk with the stick, then press <b>⛏ Dig</b> to dig the tile marked in yellow (hold to keep digging) · <b>⚑</b> flags it · or tap any tile next to you · drag to turn, pinch to zoom</div>
+  </div>
+</div>
+
+<div id="settings" class="settingsWrap" hidden>
+  <div class="panel center settings" role="dialog" aria-label="Settings">
+    <h2>Settings</h2>
+    <label class="row">Volume <input id="setVolume" type="range" min="0" max="100" step="1"></label>
+    <label class="row">Camera turn speed <input id="setSens" type="range" min="0.3" max="2.5" step="0.1"></label>
+    <label class="row check"><input id="setCb" type="checkbox"> Colour-blind friendly numbers <span id="cbPreview" class="cbPreview"></span></label>
+    <label class="row check"><input id="setShake" type="checkbox"> Screen shake</label>
+    <label class="row check"><input id="setHelp" type="checkbox"> Show the controls help at the bottom</label>
+    <label class="row">Graphics
+      <select id="setQuality"><option value="auto">Auto (lighter on phones)</option><option value="high">High</option><option value="low">Low (faster)</option></select></label>
+    <div id="setReload" class="setReload" hidden>Graphics change on reload. <button type="button" id="setReloadBtn" class="secondary small">Reload now</button>
+      <span class="hint">(you'll rejoin your game)</span></div>
+    <p class="hint">Settings are saved in this browser.</p>
+    <button type="button" id="setClose" class="primary">Done</button>
   </div>
 </div>
 
