@@ -205,6 +205,10 @@ Open the same address on your phone. It needs to be on the same network, or use 
 
 Phones use lighter graphics: lower resolution, softer shadows and less scenery. Landscape is the most comfortable way to hold the phone. Add `?touch=1` to the address to try the touch controls on a desktop.
 
+**Hiding the browser bar:**
+- **Full screen:** pressing **Join** or **Watch** on a phone switches the game to full screen, which hides the address bar. If you swipe out of it, tap the **⛶** button at the top to go back.
+- **Install as an app:** Chrome on Android can install the game, which then opens from its own home-screen icon, full screen. Use **Install as an app** on the join screen, or the browser menu's **Install app** / **Add to Home screen**. Chrome only allows this over **HTTPS** (for example through a tunnel or once the game is hosted). On a plain `http://192.168…` address the home-screen icon opens a normal browser tab, so use full screen there instead.
+
 ## Power-ups
 
 Some safe tiles have a power-up buried under them. Dig one up and it appears on the ground. Whoever walks onto it first gets it.

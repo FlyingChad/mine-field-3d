@@ -115,6 +115,7 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
   - View gestures: tap = aim at the tile (`touchAim`, for power-ups too) and dig it if it's in reach; long-press = flag; one-finger drag turns the camera; pinch zooms.
   - With touch, `updateHover()` reads `touchAim` instead of the mouse.
   - Phones render at pixel ratio ≤ 1.5 with a 1024 shadow map, and realms get `ctx.quality = 0.5`, which halves instanced props and weather.
+  - Full screen: `goFullscreen()` (Fullscreen API, needs a user gesture) runs on Join / Watch taps on touch devices, and the `#fsBtn` ⛶ button (shown on touch when not full screen; `syncFsBtn`) restores it. `static/manifest.json` (`display: fullscreen`, icons in `static/icons/`, drawn by a throwaway script) makes it installable over HTTPS; `beforeinstallprompt` shows `#installBtn` on the join screen. There's no service worker, on purpose (no stale cached code).
   - Headless Chrome won't go below about 500 px wide, so test portrait at 520×1000 and landscape at 844×390.
 - `static/game.js`: the whole client:
   - the Three.js scene and instanced tile meshes (`refreshBoard()` rebuilds them from `tiles`);

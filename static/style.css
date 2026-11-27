@@ -360,3 +360,13 @@ body.touch .replayBar { bottom: calc(10px + env(safe-area-inset-bottom)); }
   background: transparent; color: #c6d1de; border: 1px solid #2c3e55; }
 .replayCard button.watch:hover { border-color: #ffd23f; color: #fff; }
 #replaysHead { margin-top: 14px; }
+
+/* ---- full screen button (touch) and install button ---- */
+.fsBtn { position: fixed; left: 50%; transform: translateX(-50%); top: calc(10px + env(safe-area-inset-top)); z-index: 7;
+  width: 44px; height: 44px; margin: 0; padding: 0; border-radius: 12px; font-size: 22px; line-height: 1;
+  background: rgba(13, 22, 35, .72); color: #fff; border: 1px solid rgba(255,255,255,.18); }
+.fsBtn[hidden] { display: none; }
+body.spectating .fsBtn { top: calc(78px + env(safe-area-inset-top)); }   /* below the "Watching" bar */
+.installBtn { width: auto; margin: -4px auto 12px; padding: 6px 14px; font-size: 13px; border-radius: 9px;
+  background: transparent; color: #ffd23f; border: 1px solid #8a6a12; }
+.installBtn[hidden] { display: none; }

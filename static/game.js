@@ -68,6 +68,34 @@ const send = (m) => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
 const IS_TOUCH = new URLSearchParams(location.search).has('touch') || matchMedia('(pointer: coarse)').matches;
 if (IS_TOUCH) document.body.classList.add('touch');
 
+// Full screen on phones and tablets hides the browser's URL bar. Browsers only allow it on a tap, so
+// it's asked for when you press Join or Watch, and the ⛶ button brings it back after a swipe-out.
+// Installed as an app (manifest.json, "display": "fullscreen") the game starts without the bar anyway.
+const FS_OK = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+const isFullscreen = () => !!(document.fullscreenElement || document.webkitFullscreenElement)
+  || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+function goFullscreen() {
+  if (!IS_TOUCH || !FS_OK || isFullscreen()) return;
+  const el = document.documentElement;
+  try { (el.requestFullscreen || el.webkitRequestFullscreen).call(el, { navigationUI: 'hide' })?.catch?.(() => {}); } catch {}
+}
+const syncFsBtn = () => { $('fsBtn').hidden = !IS_TOUCH || !FS_OK || isFullscreen(); };
+$('fsBtn').addEventListener('click', (e) => { e.currentTarget.blur(); goFullscreen(); });
+document.addEventListener('fullscreenchange', syncFsBtn);
+document.addEventListener('webkitfullscreenchange', syncFsBtn);
+syncFsBtn();
+
+// "Install as an app": Chrome offers it (over HTTPS, or on localhost) once the page qualifies
+let installPrompt = null;
+addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; $('installBtn').hidden = false; });
+addEventListener('appinstalled', () => { installPrompt = null; $('installBtn').hidden = true; });
+$('installBtn').addEventListener('click', async () => {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  try { await installPrompt.userChoice; } catch {}
+  installPrompt = null; $('installBtn').hidden = true;
+});
+
 // ---------------------------------------------------------------- renderer / scene
 const renderer = new THREE.WebGLRenderer({ antialias: !IS_TOUCH, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio, IS_TOUCH ? 1.5 : 2));
@@ -2438,7 +2466,7 @@ function renderLobby() {
     const btn = mk('button', '', full ? 'Full' : 'Join'); btn.type = 'button'; btn.disabled = full;
     btn.addEventListener('click', () => { $('room').value = r.name; updateRoomNote(); $('joinForm').requestSubmit(); });
     const watch = mk('button', 'watch', 'Watch'); watch.type = 'button'; watch.title = 'Watch this room without playing';
-    watch.addEventListener('click', () => { audio(); $('joinError').hidden = true; connect($('name').value.trim() || 'Spectator', r.name, { spectate: true }); });
+    watch.addEventListener('click', () => { audio(); goFullscreen(); $('joinError').hidden = true; connect($('name').value.trim() || 'Spectator', r.name, { spectate: true }); });
     const btns = mk('div', 'btns'); btns.append(watch, btn);
     foot.append(mk('span', '', status), btns);
     card.append(top, chips, who, prog, foot);
@@ -2460,6 +2488,7 @@ $('room').addEventListener('input', updateRoomNote);
 $('joinForm').addEventListener('submit', (e) => {
   e.preventDefault();
   audio();
+  if (!picker.edit) goFullscreen();
   const name = $('name').value.trim() || 'Sweeper';
   const room = $('room').value.trim() || 'lobby';
   try { localStorage.setItem('mf3d', JSON.stringify({ name, room, char: picker.char, color: picker.color, realm: picker.realm, layout: picker.layout, mode: picker.mode, hat: picker.hat })); } catch {}
