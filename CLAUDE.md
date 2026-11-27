@@ -7,6 +7,7 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
 - Windows: `start.bat` (creates `.venv` and installs `aiohttp` on first run), or `.venv\Scripts\python server.py --port 8080`
 - Open http://localhost:8080. `?room=x&name=y&char=wizard&realm=moon&layout=dungeon&autojoin=1` skips the join screen, which is useful for testing.
 - Node is **not** installed on this machine. Python 3.11 is. There is no JS build step: the client is plain ES modules, and Three.js 0.160.0 is bundled at `static/vendor/three.module.js` (MIT, self-contained), mapped through an importmap in `static/index.html`.
+- Docker (`Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`, `update.sh`; guide in `DOCKER.md`): python:3.11-slim plus CPU torch (`WITH_AI` build arg). `data`, `models`, `runs` and `configs` are volumes under `docker-data/` (gitignored); the entrypoint copies the starter models in if missing. `MF3D_LAB=0` / `--no-lab` turns off the lab (it has no auth). Keep `.sh` files LF (`.gitattributes`). Docker isn't installed on this PC, so the image can't be built here.
 - Tests: `.venv\Scripts\python -m unittest discover -s tests` (stdlib unittest; pytest is not installed). Runs in a few seconds.
 
 ## Layout

@@ -1,0 +1,2 @@
+# shell scripts run inside Linux containers and servers: always LF
+*.sh text eol=lf

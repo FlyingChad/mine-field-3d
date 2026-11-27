@@ -7,6 +7,7 @@ import asyncio
 import datetime
 import json
 import math
+import os
 import random
 import secrets
 import time
@@ -2272,6 +2273,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--no-lab", action="store_true", help="don't serve the AI lab (also: MF3D_LAB=0)")
     args = ap.parse_args()
-    print(f"Mine Field 3D running on http://localhost:{args.port}  (AI lab: http://localhost:{args.port}/lab)")
-    web.run_app(make_app(), host=args.host, port=args.port, print=None)
+    lab = not args.no_lab and os.environ.get("MF3D_LAB", "1").lower() not in ("0", "off", "false", "no")
+    print(f"Mine Field 3D running on http://localhost:{args.port}" +
+          (f"  (AI lab: http://localhost:{args.port}/lab)" if lab else "  (AI lab off)"))
+    web.run_app(make_app(lab=lab), host=args.host, port=args.port, print=None)

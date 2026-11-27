@@ -1,0 +1,20 @@
+# Mine Field 3D. Start or update with ./update.sh (or `docker compose up -d --build`). See DOCKER.md.
+services:
+  minefield:
+    build:
+      context: .
+      args:
+        WITH_AI: "1"            # "0" = smaller image without bots or the AI lab
+    image: minefield3d:latest
+    container_name: minefield3d
+    restart: unless-stopped
+    ports:
+      - "8080:8080"             # change the left number to serve on another port
+    environment:
+      MF3D_LAB: "1"             # "0" turns off the AI lab at /lab (it has no login)
+    volumes:                    # everything worth keeping lives outside the container, so updates keep it
+      - ./docker-data/data:/app/data          # profiles, leaderboards, replays
+      - ./docker-data/models:/app/models      # bot models
+      - ./docker-data/runs:/app/runs          # lab run histories
+      - ./docker-data/configs:/app/configs    # saved lab configs
+    stop_grace_period: 15s

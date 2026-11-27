@@ -20,3 +20,6 @@ data/
 Thumbs.db
 .vscode/
 .idea/
+
+# Docker volumes (docker-compose.yml)
+docker-data/

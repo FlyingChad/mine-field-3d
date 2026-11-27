@@ -14,6 +14,8 @@ Or run `.venv\Scripts\python server.py --port 8080` yourself. The first time, `s
 
 Then open **http://localhost:8080**. Other people on your network can join at `http://<your-PC's-IP>:8080`. You may need to allow Python through Windows Firewall. To play over the internet, forward the port or use a tunnel such as ngrok or Cloudflare Tunnel.
 
+**On a home server (Docker, e.g. Proxmox):** see [DOCKER.md](DOCKER.md). `./update.sh` pulls the latest code and rebuilds, and player data and models are kept. `--no-lab` (or `MF3D_LAB=0`) turns off the AI lab, which has no login.
+
 ### Playing over the internet
 
 The server has some protection built in for when strangers can reach it:
