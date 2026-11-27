@@ -33,6 +33,8 @@
     </div>
     <div class="lobbyHead"><span class="lbl">Open rooms</span><span id="lobbyCount" class="hint"></span></div>
     <div id="roomList" class="roomList"></div>
+    <div id="replaysHead" class="lobbyHead" hidden><span class="lbl">Recent replays</span><span class="hint">rewatch a finished round or descent</span></div>
+    <div id="replayList" class="roomList" hidden></div>
   </div>
   <div class="joinGrid">
     <div class="previewCol">
@@ -119,6 +121,13 @@
     <button type="button" id="specNext" class="secondary small" aria-label="Next player">▶</button>
     <button type="button" id="specLeave" class="secondary small">Leave</button>
   </div>
+  <div id="replayBar" class="panel replayBar" hidden>
+    <button type="button" id="rpPlay" class="small" title="Pause (Space)">❚❚</button>
+    <div class="rpTrack"><div id="rpMarks" class="rpMarks"></div><input id="rpSeek" type="range" min="0" max="1" step="0.1" value="0" aria-label="Replay position"></div>
+    <span id="rpTime" class="rpTime">0:00 / 0:00</span>
+    <select id="rpSpeed" aria-label="Playback speed"><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select>
+    <button type="button" id="rpExit" class="secondary small">Exit</button>
+  </div>
   <div id="reconnect" class="panel reconnect" hidden>Connection lost. Reconnecting…</div>
   <div id="shop" class="panel shop" hidden>
     <div class="shopHead"><b>Stairs shop</b> <span class="hint">spend your points before you go down</span>
@@ -156,7 +165,9 @@
   <h2 id="resultsTitle">Field cleared!</h2>
   <p class="sub" id="resultsSub"></p>
   <ol id="resultsList"></ol>
-  <p class="sub">Next round in <b id="nextIn">0</b>s</p>
+  <div id="recap" class="recap"></div>
+  <div id="recapBtns" class="recapBtns" hidden><button type="button" id="watchReplay">Watch replay</button><button type="button" id="copyReplay" class="secondary">Copy link</button></div>
+  <p class="sub" id="nextLine">Next round in <b id="nextIn">0</b>s</p>
 </div>
 
 <script type="module" src="/static/game.js"></script>

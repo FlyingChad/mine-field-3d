@@ -15,6 +15,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 import layouts
+import replays
 import store
 
 ROOT = Path(__file__).parent
@@ -378,6 +379,10 @@ class Room:
             self.run_id = getattr(self, "run_id", 0) + 1   # resumes within a run keep their score
             self.depth = 1
             self.run_started = time.time()
+            # a new replay starts with the first broadcast that has a human to see it (a descent
+            # run is one replay across all its floors)
+            self.rec = None
+            self.rec_pending = True
         if self.mode == "descent":
             self.realm = DESCENT_REALMS[(self.depth - 1) % len(DESCENT_REALMS)]
         self.stairs = None                 # descent: the staircase tile once the floor is cleared
@@ -1005,8 +1010,22 @@ class Room:
         return [[m % W, m // W] for m in (self.mines or [])]
 
     # ---------- messaging ----------
+    def start_recording(self):
+        self.rec_pending = False
+        viewer = Spectator.__new__(Spectator)
+        viewer.id, viewer.x, viewer.z = "replay", 0.0, 0.0
+        self.rec = replays.Recorder(
+            welcome_msg(self, viewer, spectator=True),
+            {"t": "roster", "players": [p.roster() for p in self.players.values()]},
+            {"room": self.name, "mode": self.mode, "layout": self.layout_kind, "realm": self.realm,
+             "daily": self.daily, "started": time.time()})
+
     async def broadcast(self, msg):
         data = json.dumps(msg, separators=(",", ":"))
+        if self.rec_pending and any(not p.is_bot for p in self.players.values()):
+            self.start_recording()
+        if self.rec is not None:
+            self.rec.add(msg, data)
         for p in list(self.players.values()):
             try:
                 await p.ws.send_str(data)
@@ -1569,7 +1588,12 @@ class Room:
         if self.mode == "descent" and any(not q.is_bot for q in standings):
             descent_board.record([{"name": q.name, "color": q.color, "bot": q.is_bot} for q in standings],
                                  self.depth, sum(q.score for q in standings), round(time.time() - self.run_started))
-        await self.broadcast({
+        rec, self.rec, self.rec_pending = self.rec, None, False
+        if rec:
+            rec.last_scores = {q.id: q.score for q in standings}    # final scores, flag bonuses included
+        recap = rec.recap() if rec else None
+        replay_id = rec.id if rec and rec.now() >= replays.MIN_SECONDS else None
+        over = {
             "t": "over",
             "mode": self.mode, "failed": self.failed,
             "depth": self.depth if self.mode == "descent" else None,
@@ -1581,7 +1605,15 @@ class Room:
             "next": NEXT_ROUND_DELAY,
             "duration": duration,
             "daily": self.daily,
-        })
+            "recap": recap, "replay": replay_id,
+        }
+        if rec:
+            rec.add(over)       # the replay ends on the results screen
+        await self.broadcast(over)
+        if replay_id:
+            meta = {"depth": self.depth if self.mode == "descent" else None, "failed": self.failed,
+                    "players": [{"name": q.name, "color": q.color, "score": q.score, "bot": q.is_bot} for q in standings]}
+            asyncio.get_running_loop().run_in_executor(None, save_replay, rec, meta)
         for q in standings:
             if q.profile:   # the round's stats, so the hat picker is up to date
                 await self.send_to(q, {"t": "profile", **store.public(q.profile)})
@@ -1653,6 +1685,7 @@ def make_room(room_name, data):
 
 async def close_room(room):
     """Close a room: its round timer, its bots, and anyone still watching it."""
+    room.rec, room.rec_pending = None, False    # an unfinished round leaves no replay
     if room.round_task:
         room.round_task.cancel()
     if rooms.get(room.name) is room:
@@ -1878,9 +1911,30 @@ async def api_descents(_):
     return web.json_response(descent_board.board(), headers=NO_STORE)
 
 
+def save_replay(rec, meta):
+    try:
+        replay_store.save(rec, meta)
+    except Exception as e:      # a full disk must not take the game down
+        print("replay save failed:", repr(e))
+
+
+async def api_replays(_):
+    return web.json_response({"replays": replay_store.list()}, headers=NO_STORE)
+
+
+async def api_replay(request):
+    path = replay_store.path(request.match_info["rid"])
+    if path is None:
+        raise web.HTTPNotFound(text="That replay doesn't exist (only the newest ones are kept).")
+    body = await asyncio.get_running_loop().run_in_executor(None, path.read_bytes)
+    return web.Response(body=body, headers={"Content-Type": "application/json", "Content-Encoding": "gzip",
+                                            "Cache-Control": "public, max-age=86400"})
+
+
 profiles = store.Profiles(store.DATA / "profiles.json")
 daily_board = store.Daily(store.DATA / "daily.json")
 descent_board = store.Descents(store.DATA / "descents.json")
+replay_store = replays.Replays(store.DATA / "replays")
 
 
 # ---------------------------------------------------------------- bots (used by the lab)
@@ -1981,6 +2035,8 @@ def make_app(lab=True):
     app.router.add_get("/api/daily", api_daily)
     app.router.add_get("/api/profile", api_profile)
     app.router.add_get("/api/descents", api_descents)
+    app.router.add_get("/api/replays", api_replays)
+    app.router.add_get("/api/replay/{rid}", api_replay)
     app.router.add_static("/static", STATIC)
     app.cleanup_ctx.append(tick_loop)
     if lab:

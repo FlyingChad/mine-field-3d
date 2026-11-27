@@ -31,6 +31,19 @@ Players who enter the same **room** name play on the same board. You can share a
 
 **Watching:** press **Watch** on any open room, even a full one, to spectate it. The camera follows one player; switch with ← → or Tab, or the ◀ ▶ buttons. A link like `http://host:8080/?room=friday&spectate=1` opens straight into watching.
 
+## Replays and the run recap
+
+When a round ends (or a Descent run is over), the results screen adds a **recap**:
+- a chart of every player's score over the round, with the key moments marked along the bottom (hover for the scores at any point);
+- a table of who did what: tiles dug, mines hit, knockouts, rivals knocked out, boss damage and kills, pickups, spike hits;
+- the key moments: bosses beaten, the vault opened, the chest found, floors cleared, knockouts.
+
+Every round with a person in it that lasts at least 10 seconds is also saved as a **replay**. A Descent run is one replay across all its floors.
+- **Watch replay** on the results screen opens it in a new tab, and **Copy link** copies a link to share. Add `&t=90` to a link to start 90 seconds in.
+- The join screen lists **Recent replays** with a Watch button.
+- A replay plays like spectating: the camera follows one player (← → or Tab to switch). The bar at the bottom has play and pause (Space), a timeline you can drag, the key moments as dots you can click, and speeds from ½× to 8×.
+- The server keeps the newest 60 replays in `data/replays/`. A replay holds only what any spectator could see: never resume or profile tokens, or radar sweeps.
+
 ## Daily dungeon
 
 The top of the join screen shows **today's daily dungeon**. It has the same layout, mines, loot and realm for everyone all day; only the tiles right around your first dig can differ, because the first dig is always safe. It's always Race mode.
@@ -283,6 +296,7 @@ Left-click to dig · Right-click or F to flag · G to use a held power-up · R t
 
 - `server.py`: the authoritative game server (aiohttp HTTP + WebSocket). It handles rooms, mine generation, scoring and reach checks. Tune `W`, `H`, `MINE_DENSITY`, `REACH`, etc. at the top.
 - `store.py`: saved player profiles (stats and hat unlocks) and the daily leaderboard, as JSON in `data/` (or `$MF3D_DATA`).
+- `replays.py`: records rounds for replays and builds the run recap; saves replays in `data/replays/`.
 - `static/game.js`: the Three.js client (rendering, movement, effects, sound). Three.js 0.160 is bundled in `static/vendor/`.
 - `static/index.html`, `static/style.css`: the page and HUD.
 - `tests/`: the test suite (below).
@@ -293,7 +307,7 @@ Left-click to dig · Right-click or F to flag · G to use a held power-up · R t
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The suite covers the game rules, the vault, traps, the daily dungeon, profiles, the WebSocket protocol, and the AI simulator.
+The suite covers the game rules, the vault, traps, the daily dungeon, profiles, replays and the recap, the WebSocket protocol, and the AI simulator.
 
 - **Protocol tests:** these run against an in-process server (rate limits, resume, spectators, chat).
 - **AI simulator tests:** these run on the CPU, so they won't slow a training run, and they're skipped without PyTorch.

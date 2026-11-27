@@ -29,6 +29,8 @@ let serverOffset = 0;                    // server time (s) minus performance.no
 const serverNow = () => performance.now() / 1000 + serverOffset;
 let dailyDate = null;                    // set in the daily dungeon
 let spectating = false, specTarget = null;   // watching a room instead of playing
+let replay = null;                            // watching a recorded round (see the replays section)
+function quiet() { return !!(replay && replay.fast); }   // fast-forwarding a replay: no sound or effects
 const QUICK = { help: 'Help!', boss: 'Boss here!', nice: 'Nice!', follow: 'Follow me', gg: 'GG', oops: 'Oops' };
 let quickIds = Object.keys(QUICK);
 
@@ -308,6 +310,7 @@ function setLayout(layoutStr, kind) {
 }
 
 function refreshBoard() {
+  if (quiet()) { replay.board = true; return; }   // rebuilt once when the seek is done
   const counts = new Array(9).fill(0);
   for (let i = 0; i < W * H; i++) {
     const [wx, wz] = tileCenter(i % W, Math.floor(i / W));
@@ -688,6 +691,7 @@ function refreshShop() {   // cheap check every tick; rebuild only when somethin
 }
 
 function showBanner(big, small, secs = 3) {
+  if (quiet()) return;
   $('bannerBig').textContent = big; $('bannerSmall').textContent = small || '';
   const b = $('banner'); b.hidden = false;
   b.style.animation = 'none'; void b.offsetWidth; b.style.animation = '';
@@ -870,6 +874,7 @@ function animateAvatar(p, av, speed, dt, stunned) {
 const effects = [];
 
 function burst(pos, { count = 80, colors = [0xffb347], speed = [4, 12], up = 1, life = 1.2, size = 0.35, gravity = 18 }) {
+  if (quiet()) return;
   const geo = new THREE.BufferGeometry();
   const P = new Float32Array(count * 3), C = new Float32Array(count * 3), V = [];
   const col = new THREE.Color();
@@ -900,6 +905,7 @@ function burst(pos, { count = 80, colors = [0xffb347], speed = [4, 12], up = 1, 
 }
 
 function explosion(wx, wz) {
+  if (quiet()) return;
   const pos = new THREE.Vector3(wx, 0.6, wz);
   burst(pos, { count: 160, colors: [0xffd23f, 0xff7b29, 0xff3d1f, 0x555555, 0x333333], speed: [6, 16], life: 1.6, size: 0.45 });
   burst(pos, { count: 50, colors: [0x6cc04a, 0x7a5a3a], speed: [5, 11], life: 1.4, size: 0.3 });
@@ -921,6 +927,7 @@ function explosion(wx, wz) {
 }
 
 function floatText(text, color, wx, wy, wz) {
+  if (quiet()) return;
   const s = textSprite(text, { color, bg: null, scale: 0.9, font: 900 });
   s.position.set(wx, wy, wz); scene.add(s);
   let t = 0;
@@ -935,6 +942,7 @@ function floatText(text, color, wx, wy, wz) {
 
 // quick chat: a speech bubble over the player for a few seconds
 function sayBubble(pid, text) {
+  if (quiet()) return;
   const p = players.get(pid); if (!p) return;
   const av = p.av;
   if (av.say) { av.group.remove(av.say.sprite); av.say.sprite.material.map.dispose(); av.say.sprite.material.dispose(); }
@@ -946,6 +954,7 @@ function sayBubble(pid, text) {
 
 // a ping: a beam of light on a tile in the player's colour, and a mark on the minimap
 function addPing(x, y, color) {
+  if (quiet()) return;
   const [wx, wz] = tileCenter(x, y);
   const g = new THREE.Group();
   const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 14, 16, 1, true),
@@ -1020,6 +1029,7 @@ function removeBoss(id) {
 
 // a red warning disc that fills up during a boss's wind-up
 function telegraph(x, z, r, dur) {
+  if (quiet()) return;
   const R = r * T;
   const ring = new THREE.Mesh(new THREE.RingGeometry(R - 0.15, R, 48),
     new THREE.MeshBasicMaterial({ color: 0xff3b3b, transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }));
@@ -1081,6 +1091,7 @@ function audio() {
   return actx;
 }
 function tone(freq, dur, { type = 'sine', vol = 0.15, slide = 0, delay = 0 } = {}) {
+  if (quiet()) return;
   const a = audio(); if (!a) return;
   const t0 = a.currentTime + delay;
   const o = a.createOscillator(), g = a.createGain();
@@ -1090,6 +1101,7 @@ function tone(freq, dur, { type = 'sine', vol = 0.15, slide = 0, delay = 0 } = {
   o.connect(g).connect(a.destination); o.start(t0); o.stop(t0 + dur + 0.02);
 }
 function noise(dur, vol, cutoff) {
+  if (quiet()) return;
   const a = audio(); if (!a) return;
   const buf = a.createBuffer(1, a.sampleRate * dur, a.sampleRate);
   const d = buf.getChannelData(0);
@@ -1133,6 +1145,7 @@ const sfx = {
 
 // ---------------------------------------------------------------- HUD
 function feed(...parts) {
+  if (quiet()) return;
   const d = document.createElement('div');
   for (const p of parts) {
     if (typeof p === 'string') d.append(p);
@@ -1185,6 +1198,8 @@ function showResults(results, next, duration) {
     li.append(sc); ol.append(li);
   });
   $('resultsSub').textContent = duration ? `Cleared in ${Math.floor(duration / 60)}m ${duration % 60}s` : 'This round is over.';
+  $('nextLine').hidden = !!replay;
+  renderRecap(null, null);
   $('results').hidden = false;
 }
 
@@ -1267,7 +1282,7 @@ function cycleSpec(step) {
 }
 $('specPrev').addEventListener('click', () => cycleSpec(-1));
 $('specNext').addEventListener('click', () => cycleSpec(1));
-$('specLeave').addEventListener('click', () => { leaving = true; ws?.close(); });
+$('specLeave').addEventListener('click', () => { if (replay) { exitReplay(); return; } leaving = true; ws?.close(); });
 
 function applySnapshot(s) {
   tiles.fill(-2);
@@ -1862,6 +1877,7 @@ function handle(m) {
         $('resultsTitle').textContent = 'Daily dungeon cleared!';
         $('resultsSub').textContent += ' Your result is on today\'s leaderboard. The same map comes back next round, so you can try to beat it.';
       }
+      renderRecap(m.recap, m.replay);
       sfx.win();
       break;
     case 'round':
@@ -1886,6 +1902,264 @@ function handle(m) {
       feed('A new field has been laid. Go!');
       break;
   }
+}
+
+// ---------------------------------------------------------------- run recap
+// Shown under the results: scores over time (one line per player, in their colour), who did what,
+// and the key moments. The server tallies it from the round's broadcasts (replays.py).
+const fmtClock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const RECAP_COLS = [['tiles', 'Tiles'], ['mines', 'Mines hit'], ['kos', 'KOs'], ['pvpKos', 'Rivals KO’d'],
+  ['bossDmg', 'Boss dmg'], ['bossKills', 'Bosses'], ['items', 'Pickups'], ['spikes', 'Spiked']];
+const MOMENTS = { boom: ['#ff7b29', 'Mine'], ko: ['#ff5d5d', 'Knockout'], boss: ['#c77dff', 'Boss'], bossDown: ['#ffd23f', 'Boss down'],
+  key: ['#ffc233', 'Key'], chest: ['#ffd23f', 'Chest'], door: ['#ffc233', 'Vault'], stairs: ['#7ee0ff', 'Stairs'], floor: ['#7ee0ff', 'Floor'] };
+const MOMENT_RANK = { bossDown: 0, door: 1, chest: 2, floor: 3, stairs: 3, key: 4, ko: 5, boss: 6, boom: 7 };
+const mkEl = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+
+function renderRecap(rc, replayId) {
+  const box = $('recap');
+  box.replaceChildren();
+  const on = !!(rc && rc.players?.length);
+  $('results').classList.toggle('recapOn', on);
+  $('recapBtns').hidden = !on || (!replayId && !replay);
+  if (!on) return;
+  box.append(scoreChart(rc), statTable(rc), momentList(rc));
+  const id = replay ? replay.id : replayId;
+  const watch = $('watchReplay');
+  watch.textContent = replay ? 'Watch again' : 'Watch replay';
+  watch.onclick = () => { if (replay) { $('results').hidden = true; replaySeek(0); replay.playing = true; } else window.open(`/?replay=${id}`, '_blank'); };
+  const copy = $('copyReplay');
+  copy.textContent = 'Copy link';
+  copy.onclick = async () => {
+    const url = `${location.origin}/?replay=${id}`;
+    try { await navigator.clipboard.writeText(url); copy.textContent = 'Copied!'; } catch { copy.textContent = url; }
+  };
+}
+
+function scoreChart(rc) {
+  const wrap = mkEl('div', 'chart');
+  const Wd = 640, Hd = 200, L = 40, R = rc.players.length <= 4 ? 96 : 12, Tp = 10, B = 40;
+  const ts = rc.series.t, dur = Math.max(1, rc.duration, ts[ts.length - 1] || 0);
+  const all = rc.players.flatMap((p) => rc.series.scores[p.id] || []).filter((v) => v !== null && v !== undefined);
+  let lo = Math.min(0, ...all), hi = Math.max(10, ...all);
+  const step = niceStep((hi - lo) / 4); lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+  const X = (t) => L + (t / dur) * (Wd - L - R), Y = (v) => Tp + (1 - (v - lo) / (hi - lo)) * (Hd - Tp - B);
+  const svg = svgEl('svg', { viewBox: `0 0 ${Wd} ${Hd}`, class: 'recapSvg', role: 'img', 'aria-label': 'Score over time for each player' });
+  for (let v = lo; v <= hi + 1e-9; v += step) {               // recessive grid, one axis
+    svg.append(svgEl('line', { x1: L, x2: Wd - R, y1: Y(v), y2: Y(v), class: v === 0 ? 'zero' : 'grid' }));
+    const tx = svgEl('text', { x: L - 6, y: Y(v) + 4, class: 'axis', 'text-anchor': 'end' }); tx.textContent = Math.round(v); svg.append(tx);
+  }
+  const tStep = niceStep(dur / 5, [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800]);
+  for (let t = 0; t <= dur + 1e-9; t += tStep) {
+    const tx = svgEl('text', { x: X(t), y: Hd - B + 16, class: 'axis', 'text-anchor': 'middle' }); tx.textContent = fmtClock(t); svg.append(tx);
+  }
+  const ends = [];
+  for (const p of rc.players) {
+    const vals = rc.series.scores[p.id] || [];
+    const pts = []; let last = null;
+    vals.forEach((v, i) => { if (v !== null && v !== undefined) { pts.push(`${X(ts[i]).toFixed(1)},${Y(v).toFixed(1)}`); last = [X(ts[i]), Y(v)]; } });
+    if (pts.length) svg.append(svgEl('polyline', { points: pts.join(' '), fill: 'none', stroke: p.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+    if (last) ends.push({ p, x: last[0], y: last[1] });
+  }
+  if (rc.players.length <= 4) {                                  // direct labels at the line ends, spread apart
+    ends.sort((a, b) => a.y - b.y);
+    for (let i = 1; i < ends.length; i++) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 14);
+    for (const e of ends) {
+      svg.append(svgEl('circle', { cx: e.x + 8, cy: e.y, r: 4, fill: e.p.color }));
+      const tx = svgEl('text', { x: e.x + 16, y: e.y + 4, class: 'dl' }); tx.textContent = e.p.name.slice(0, 10); svg.append(tx);
+    }
+  }
+  // key moments along the bottom; click one in a replay to jump there
+  const my = Hd - 8;
+  svg.append(svgEl('line', { x1: L, x2: Wd - R, y1: my, y2: my, class: 'grid' }));
+  for (const [t, kind, text] of rc.moments) {
+    const [col] = MOMENTS[kind] || ['#c6d1de'];
+    const c = svgEl('circle', { cx: X(t), cy: my, r: 4.5, fill: col, class: 'moment' });
+    const ti = svgEl('title', {}); ti.textContent = `${fmtClock(t)} ${text}`; c.append(ti);
+    if (replay) c.addEventListener('click', () => { $('results').hidden = true; replaySeek(Math.max(0, t - 3)); replay.playing = true; });
+    svg.append(c);
+  }
+  // hover: crosshair + every player's score at that moment
+  const cross = svgEl('line', { y1: Tp, y2: Hd - B, class: 'cross', visibility: 'hidden' });
+  const hit = svgEl('rect', { x: L, y: Tp, width: Wd - L - R, height: Hd - Tp - B, fill: 'transparent' });
+  svg.append(cross, hit);
+  const tip = mkEl('div', 'tip'); tip.hidden = true;
+  hit.addEventListener('mousemove', (e) => {
+    const r = svg.getBoundingClientRect(), x = (e.clientX - r.left) * (Wd / r.width);
+    const t = ((x - L) / (Wd - L - R)) * dur;
+    let k = 0; for (let i = 0; i < ts.length; i++) if (Math.abs(ts[i] - t) < Math.abs(ts[k] - t)) k = i;
+    cross.setAttribute('x1', X(ts[k])); cross.setAttribute('x2', X(ts[k])); cross.setAttribute('visibility', 'visible');
+    const rows = rc.players.map((p) => [p, rc.series.scores[p.id]?.[k]]).filter(([, v]) => v !== null && v !== undefined).sort((a, b) => b[1] - a[1]);
+    tip.replaceChildren(mkEl('div', 'tt', fmtClock(ts[k])), ...rows.map(([p, v]) => {
+      const row = mkEl('div', 'tr'); const sw = mkEl('i'); sw.style.background = p.color;
+      row.append(sw, mkEl('span', '', p.name), mkEl('b', '', String(v))); return row;
+    }));
+    tip.hidden = false;
+    const left = (X(ts[k]) / Wd) * r.width;
+    tip.style.left = `${Math.min(r.width - 150, left + 12)}px`; tip.style.top = '8px';
+  });
+  hit.addEventListener('mouseleave', () => { tip.hidden = true; cross.setAttribute('visibility', 'hidden'); });
+  wrap.append(mkEl('div', 'recapH', 'Score over time'), svg, tip);
+  return wrap;
+}
+
+function niceStep(raw, steps) {
+  if (steps) return steps.find((s) => s >= raw) || steps[steps.length - 1];
+  const p = 10 ** Math.floor(Math.log10(Math.max(raw, 1e-9)));
+  return [1, 2, 5, 10].map((m) => m * p).find((s) => s >= raw);
+}
+
+function statTable(rc) {
+  const cols = RECAP_COLS.filter(([k], i) => i === 0 || rc.players.some((p) => p[k]));
+  const t = mkEl('table', 'recapTable');
+  const hr = mkEl('tr'); hr.append(mkEl('th', '', 'Player'), mkEl('th', 'num', 'Score'), ...cols.map(([, n]) => mkEl('th', 'num', n)));
+  t.append(mkEl('thead'), mkEl('tbody')); t.tHead.append(hr);
+  for (const p of rc.players) {
+    const tr = mkEl('tr'); const nm = mkEl('td', 'nm'); const sw = mkEl('i'); sw.style.background = p.color;
+    nm.append(sw, p.name); if (p.bot) nm.append(mkEl('span', 'bot', 'BOT'));
+    tr.append(nm, mkEl('td', 'num', String(p.score)), ...cols.map(([k]) => mkEl('td', 'num', String(p[k] || 0))));
+    t.tBodies[0].append(tr);
+  }
+  return t;
+}
+
+function momentList(rc) {
+  const top = rc.moments.map((m, i) => [m, i]).sort((a, b) => (MOMENT_RANK[a[0][1]] ?? 9) - (MOMENT_RANK[b[0][1]] ?? 9) || a[1] - b[1])
+    .slice(0, 8).sort((a, b) => a[0][0] - b[0][0]);
+  const ul = mkEl('ul', 'moments');
+  if (!top.length) { ul.append(mkEl('li', 'empty', 'A quiet round: no knockouts, bosses or treasure.')); return ul; }
+  for (const [[t, kind, text]] of top) {
+    const li = mkEl('li'); const dot = mkEl('i'); dot.style.background = (MOMENTS[kind] || ['#c6d1de'])[0];
+    li.append(mkEl('span', 'tm', fmtClock(t)), dot, mkEl('span', '', text));
+    if (replay) { li.classList.add('jump'); li.addEventListener('click', () => { $('results').hidden = true; replaySeek(Math.max(0, t - 3)); replay.playing = true; }); }
+    ul.append(li);
+  }
+  return ul;
+}
+
+// ---------------------------------------------------------------- replays
+// A replay is the round's broadcasts with their times (see replays.py). Playing one feeds them to
+// handle() as if they came from a live room we're spectating. Seeking backwards starts again from
+// the opening welcome and fast-forwards with sound, particles and chatter switched off (quiet()).
+
+async function openReplay(id, startAt = 0) {
+  $('joinError').hidden = true;
+  let data;
+  try {
+    const r = await fetch(`/api/replay/${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error(await r.text());
+    data = await r.json();
+  } catch (e) {
+    const err = $('joinError'); err.textContent = `Couldn't load that replay. ${e.message || ''}`; err.hidden = false;
+    return;
+  }
+  const ev = data.events || [];
+  if (!ev.length || ev[0][1].t !== 'welcome') return;
+  replay = { id, ev, i: 0, t: 0, speed: 1, playing: true, fast: false, board: false,
+    dur: ev[ev.length - 1][0], start: ev[0][1].serverTime || 0, meta: data.meta || {}, recap: data.recap };
+  document.body.classList.add('replaying');
+  replaySeek(startAt);
+  setupReplayBar();
+  const m = replay.meta;
+  feed({ text: 'Replay', color: '#7ee0ff' }, ` of ${m.room}: ${MODE_NAMES[m.mode] || m.mode}, ${fmtClock(replay.dur)} long. Space pauses, ← → switch players.`);
+}
+
+function replayStep(t) {
+  const R = replay;
+  while (R.i < R.ev.length && R.ev[R.i][0] <= t) handle(R.ev[R.i++][1]);
+  R.t = t;
+}
+
+function replaySeek(t) {
+  const R = replay;
+  t = Math.max(0, Math.min(R.dur, t));
+  if (t < R.t || R.i === 0) { R.i = 0; R.t = 0; }
+  R.fast = true; R.board = false;
+  try { replayStep(t); } finally { R.fast = false; }
+  if (R.board) refreshBoard();
+  for (let k = 0; k < 8 && effects.length; k++) for (let j = effects.length - 1; j >= 0; j--) if (!effects[j](4)) effects.splice(j, 1);
+  for (const p of players.values()) if (!Number.isNaN(p.x)) { p.x = p.tx; p.z = p.tz; }
+  for (const b of bosses.values()) if (!Number.isNaN(b.x)) { b.x = b.tx; b.z = b.tz; }
+  $('feed').replaceChildren(); $('banner').hidden = true;
+  if (R.t < R.dur) $('results').hidden = true;
+  updateReplayBar(true);
+}
+
+function replayToggle() {
+  const R = replay;
+  if (!R.playing && R.t >= R.dur) replaySeek(0);
+  R.playing = !R.playing;
+  updateReplayBar(true);
+}
+
+function replayFrame(dt) {
+  const R = replay;
+  if (R.playing) {
+    replayStep(Math.min(R.dur, R.t + dt * R.speed));
+    if (R.t >= R.dur) R.playing = false;
+  }
+  serverOffset = R.start + R.t - performance.now() / 1000;     // spike traps animate on the replay's clock
+  updateReplayBar(false);
+}
+
+function exitReplay() {
+  location.href = location.pathname;    // back to the join screen, without ?replay=
+}
+
+function setupReplayBar() {
+  const R = replay;
+  $('replayBar').hidden = false;
+  const seek = $('rpSeek');
+  seek.max = R.dur; seek.value = 0;
+  seek.oninput = () => { $('rpTime').textContent = `${fmtClock(+seek.value)} / ${fmtClock(R.dur)}`; R.dragging = true; };
+  seek.onchange = () => { R.dragging = false; replaySeek(+seek.value); };
+  $('rpPlay').onclick = replayToggle;
+  $('rpSpeed').onchange = (e) => { R.speed = +e.target.value; e.target.blur(); };
+  $('rpExit').onclick = exitReplay;
+  const marks = $('rpMarks'); marks.replaceChildren();
+  for (const [t, kind, text] of R.recap?.moments || []) {
+    const mk = mkEl('i'); mk.style.left = `${(t / Math.max(1, R.dur)) * 100}%`; mk.style.background = (MOMENTS[kind] || ['#c6d1de'])[0];
+    mk.title = `${fmtClock(t)} ${text}`;
+    mk.addEventListener('click', () => replaySeek(Math.max(0, t - 3)));
+    marks.append(mk);
+  }
+}
+
+let replayBarAt = 0;
+function updateReplayBar(force) {
+  const R = replay, now = performance.now();
+  if (!force && now - replayBarAt < 200) return;
+  replayBarAt = now;
+  $('rpPlay').textContent = R.playing ? '❚❚' : '▶';
+  $('rpPlay').title = R.playing ? 'Pause (Space)' : 'Play (Space)';
+  if (!R.dragging) { $('rpSeek').value = R.t; $('rpTime').textContent = `${fmtClock(R.t)} / ${fmtClock(R.dur)}`; }
+}
+
+function renderReplays() {
+  const list = $('replayList'), rows = lobby.replays || [];
+  $('replaysHead').hidden = list.hidden = !rows.length;
+  list.replaceChildren(...rows.slice(0, 8).map((r) => {
+    const card = mkEl('div', 'replayCard');
+    const top = mkEl('div', 'top');
+    const ago = Math.max(0, Date.now() / 1000 - (r.ended || 0));
+    top.append(mkEl('span', 'nm', r.room), mkEl('span', 'cnt',
+      `${fmtClock(r.duration || 0)} · ${ago < 3600 ? `${Math.max(1, Math.round(ago / 60))}m ago` : ago < 86400 ? `${Math.round(ago / 3600)}h ago` : `${Math.round(ago / 86400)}d ago`}`));
+    const chips = mkEl('div', 'chips');
+    chips.append(mkEl('span', r.mode, MODE_NAMES[r.mode] || r.mode), mkEl('span', '', REALM_BY_ID[r.realm]?.name || r.realm || ''));
+    if (r.daily) chips.prepend(mkEl('span', 'daily', 'Daily'));
+    if (r.depth) chips.append(mkEl('span', 'descent', `Floor ${r.depth}`));
+    const who = mkEl('div', 'who');
+    for (const p of (r.players || []).slice(0, 4)) {
+      const sp = mkEl('span'); const dot = mkEl('i'); dot.style.background = p.color;
+      sp.append(dot, `${p.name}${p.bot ? ' (bot)' : ''} ${p.score}`); who.append(sp);
+    }
+    const btn = mkEl('button', 'watch', 'Watch'); btn.type = 'button';
+    btn.addEventListener('click', () => { location.href = `/?replay=${r.id}`; });
+    const foot = mkEl('div', 'foot'); foot.append(who, btn);
+    card.append(top, chips, foot);
+    return card;
+  }));
 }
 
 // ---------------------------------------------------------------- input
@@ -2095,7 +2369,9 @@ async function refreshLobby() {
     lobby.dailyAt = performance.now();
     try { lobby.daily = await (await fetch('/api/daily', { cache: 'no-store' })).json(); } catch { lobby.daily = null; }
     try { lobby.descents = await (await fetch('/api/descents', { cache: 'no-store' })).json(); } catch { lobby.descents = null; }
+    try { lobby.replays = (await (await fetch('/api/replays', { cache: 'no-store' })).json()).replays || []; } catch { lobby.replays = []; }
     renderDaily();
+    renderReplays();
   }
   lobby.timer = setTimeout(refreshLobby, 3000);
 }
@@ -2218,7 +2494,8 @@ try {
   const okMode = (m) => ['race', 'pvp', 'coop', 'descent'].includes(m);
   if (okMode(saved.mode)) picker.mode = saved.mode;
   if (okMode(qs.get('mode'))) picker.mode = qs.get('mode');
-  if (qs.has('spectate') && qs.get('room')) setTimeout(() => connect($('name').value.trim() || 'Spectator', qs.get('room'), { spectate: true }), 0);
+  if (qs.get('replay')) setTimeout(() => openReplay(qs.get('replay'), +qs.get('t') || 0), 0);
+  else if (qs.has('spectate') && qs.get('room')) setTimeout(() => connect($('name').value.trim() || 'Spectator', qs.get('room'), { spectate: true }), 0);
   else if (qs.has('autojoin')) setTimeout(() => $('joinForm').requestSubmit(), 0);
 } catch {}
 openPicker(false);
@@ -2229,6 +2506,8 @@ addEventListener('keydown', (e) => {
   if (typing()) return;
   keys.add(e.code);
   if (spectating) {
+    if (replay && e.code === 'Space') { e.preventDefault(); replayToggle(); return; }
+    if (replay && e.code === 'Home') { replaySeek(0); return; }
     if (e.code === 'ArrowLeft') cycleSpec(-1);
     if (e.code === 'ArrowRight' || e.code === 'Tab') { e.preventDefault(); cycleSpec(1); }
     return;
@@ -2645,6 +2924,7 @@ function frame(now) {
   // --- local movement
   if (keys.has('KeyQ')) cam.yaw += dt * 2.2;
   if (keys.has('KeyE')) cam.yaw -= dt * 2.2;
+  if (replay) replayFrame(dt);
   if (spectating) { spectatorFrame(dt); return; }
   const fx = -Math.sin(cam.yaw), fz = -Math.cos(cam.yaw), rx = Math.cos(cam.yaw), rz = -Math.sin(cam.yaw);
   let mf = 0, mr = 0;

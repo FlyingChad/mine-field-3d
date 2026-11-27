@@ -65,6 +65,13 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
   - `broadcast` never removes players (the handler's cleanup does). Rooms close in `tick_loop` once `has_humans()` is false: no humans, nobody in `away`, and past `hold_until` (60 s grace for brand-new rooms, e.g. ones the lab put bots in).
   - `join {spectate: true}` adds a `Spectator` to `room.spectators`. Spectators get every broadcast, aren't on the roster, and can't act. The client runs `spectatorFrame` and follows `specTarget`.
 - **Quick chat and pings:** `emote {id}` (id in `QUICK_CHAT`; the client has the text in `QUICK`) and `ping {x, y}` are broadcast as-is, limited by `CHAT_COOLDOWN` per player. There's deliberately no free-text chat.
+- **Replays and the run recap** (`replays.py`, `Room.start_recording`, the hooks in `broadcast` and `end_round`; client: the "run recap" and "replays" sections of game.js):
+  - A `Recorder` covers one round, or one whole descent run (`new_round()` sets `rec_pending` only when not `next_floor`). It starts on the first `broadcast` with a human in the room, opening with a spectator `welcome_msg` (no token) and a `roster`. Then every broadcast goes through `rec.add(msg, data)`: kept serialised with its time, `players` ticks only every `TICK_EVERY`. Recording stops after `MAX_SECONDS` / `MAX_BYTES` (`truncated`), but the recap keeps counting.
+  - `send_to` messages (radar, profile, a player's own welcome) are never recorded, so replays hold only what a spectator sees. Keep it that way: never broadcast tokens.
+  - The recap (per-player stats, a score series sampled every `SAMPLE_SECONDS`, up to `MAX_MOMENTS` moments) is tallied in `Recorder._tally` from the broadcasts. **A new event worth a stat or a moment goes there.** `end_round` sets the final scores, adds `recap` and `replay` (id, or null under `MIN_SECONDS`) to `over`, records `over`, then saves in an executor (`save_replay` → `Replays.save`: gzipped `data/replays/<id>.json.gz` plus `index.json`, newest `MAX_REPLAYS`). `close_room` drops an unfinished recording.
+  - `GET /api/replays` (index) and `GET /api/replay/{id}` (12-hex id, served gzip as is).
+  - Client: `?replay=<id>[&t=secs]` → `openReplay`. It feeds the events to `handle()` as a spectator (`replay` state; `replayFrame` advances the clock in `frame()` and sets `serverOffset` so traps animate). `replaySeek` restarts from the welcome when going back and fast-forwards with `quiet()` true: `tone`, `noise`, `burst`, `explosion`, `floatText`, `sayBubble`, `addPing`, `telegraph`, `showBanner`, `feed` and `refreshBoard` skip work, then leftover effects are flushed. New effect helpers should check `quiet()` too.
+  - `renderRecap` (results overlay) draws the SVG score chart, stat table and moments. The join screen lists `/api/replays` (`renderReplays`).
 - **Lobby:** `GET /api/rooms` (`lobby_summary()`) lists open rooms with public info only: name, mode, layout, realm, state, player names, colours and scores, progress, bosses and lives.
   - The join screen polls it every 3 s while open (`refreshLobby` / `renderLobby` in game.js). Join buttons fill the room field and submit.
   - Typing an open room's name shows `#roomNote` and dims the new-room settings, since those only apply when creating a room.
@@ -222,7 +229,7 @@ Server → client:
 - `radar {mines:[[x,y]], dur}` (sent only to the player who picked it up)
 - `throw {id, pid, x, y, fuse, r}`
 - `scatter {id, pid, x, y, r, added, tiles:[[x,y,v]], hit, shielded, stun, minesLeft, safeLeft}` (tiles set to `-2` are covered again; rim tiles carry their new counts)
-- `over {results, mines, next, duration}`
+- `over {results, mines, next, duration, recap, replay}` (`recap {id, duration, players:[{id,name,color,bot,score,tiles,mines,kos,pvpKos,bossDmg,bossKills,items,spikes,used}], series {t, scores:{pid:[...]}}, moments:[[t, kind, text, pid]], truncated}`; `replay` is the replay id or null)
 - `round {snapshot, spawns:{pid:[x,z]}}`
 
 ## Testing
