@@ -239,7 +239,8 @@ def _train(cfg, cmd_q, evt_q):
     if cfg["seed_model"]:
         m = load_model(cfg["seed_model"])
         old = m["spec_obj"]
-        hinted = old.version >= 5 and bool(((m.get("meta") or {}).get("cfg") or {}).get("head_start"))
+        # the meta flag says the wiring is really in there (a ticked box alone doesn't: older code skipped it)
+        hinted = old.version >= 5 and bool((m.get("meta") or {}).get("head_start"))
         if 2 <= old.version < spec.version and (old.radius, old.hidden, old.activation) == (
                 spec.radius, spec.hidden, spec.activation):
             m["weights"] = upgrade(old, m["weights"], spec)     # warm-start a newer model from an older one
@@ -252,6 +253,7 @@ def _train(cfg, cmd_q, evt_q):
         pop[0] = w
     if cfg.get("head_start") and spec.version >= 5 and not hinted:
         head_start(spec, pop)
+        hinted = True
 
     _put(evt_q, {"t": "status", "state": "running", "device": dev_name, "params": spec.n_params,
                  "arch": spec.describe(), "cfg": cfg})
@@ -260,7 +262,7 @@ def _train(cfg, cmd_q, evt_q):
 
     def save(name, why):
         n = save_model(name, spec, best_vec, {"run": cfg["run_name"], "generation": gen, "fitness": best_fit,
-                                              "cfg": cfg, "why": why})
+                                              "cfg": cfg, "why": why, "head_start": hinted})
         _put(evt_q, {"t": "saved", "name": n, "why": why})
 
     while True:
