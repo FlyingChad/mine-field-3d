@@ -61,7 +61,7 @@ SCHEMA = [
         {"key": "hidden", "label": "Hidden layers", "type": "text", "default": "64", "help": "Comma-separated layer sizes, e.g. 64 or 128,64."},
         {"key": "activation", "label": "Activation", "type": "select", "options": ["tanh", "relu", "elu"], "default": "tanh"},
         {"key": "head_start", "label": "Head start (logic hint)", "type": "bool", "default": False,
-         "help": "Model type 5 only, needs hidden layers of 11+ units. Wires the logic hint straight into new networks: dig a neighbour the numbers prove safe, never one they prove mined, walk to the nearest safe tile. Evolution refines it from there. Not applied when starting from a model that is already type 5."},
+         "help": "Model type 5 only, needs hidden layers of 11+ units. Wires the logic hint straight into new networks: dig a neighbour the numbers prove safe, never one they prove mined, walk to the nearest safe tile. Evolution refines it from there. Not applied again when starting from a model that already had it."},
         {"key": "action_masking", "label": "Mask invalid actions", "type": "bool", "default": True, "help": "Never pick moves off the board or digs on revealed tiles."},
         {"key": "action_noise", "label": "Action noise", "type": "float", "default": 0.0, "min": 0, "max": 5, "step": 0.05, "live": True, "help": "Gumbel noise on action choice (exploration)."},
     ]},
@@ -235,11 +235,11 @@ def _train(cfg, cmd_q, evt_q):
     dev_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
 
     pop = spec.init(P, device)
-    hinted = False                                      # seeded from a v5 model: it has its own wiring
+    hinted = False                                      # seeded from a model that already had the head start
     if cfg["seed_model"]:
         m = load_model(cfg["seed_model"])
         old = m["spec_obj"]
-        hinted = old.version >= 5
+        hinted = old.version >= 5 and bool(((m.get("meta") or {}).get("cfg") or {}).get("head_start"))
         if 2 <= old.version < spec.version and (old.radius, old.hidden, old.activation) == (
                 spec.radius, spec.hidden, spec.activation):
             m["weights"] = upgrade(old, m["weights"], spec)     # warm-start a newer model from an older one
