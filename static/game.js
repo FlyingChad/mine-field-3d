@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { CHARACTERS, CHAR_BY_ID, buildCharacter } from './characters.js';
 import { REALMS, REALM_BY_ID } from './realms.js';
 import { BOSSES } from './bosses.js';
+import { HATS, HAT_HEIGHT, buildHat } from './hats.js';
 
 const $ = (id) => document.getElementById(id);
 // ---------------------------------------------------------------- state
@@ -20,6 +21,16 @@ let bootsUntil = 0, goldUntil = 0;       // local display of effect timers
 let koUntil = 0;                         // local respawn countdown while knocked out
 const bosses = new Map();                // boss id -> { kind, m (model), group, x, z, tx, tz, r, tr, hp, max, state, ... }
 let gameMode = 'race', teamLives = null; // race | pvp | coop; co-op's shared lives
+const doors = new Map();                 // tile idx -> door mesh (the locked vault door; walls until opened)
+const traps = new Map();                 // tile idx -> { group, spikes, phase } dug-up spike traps
+const pings = [];                        // { x, y, color, until, group } map pings
+let keyBit = 1 << 10, spikeCycle = 3, spikeUp = 1.1;
+let serverOffset = 0;                    // server time (s) minus performance.now() / 1000
+const serverNow = () => performance.now() / 1000 + serverOffset;
+let dailyDate = null;                    // set in the daily dungeon
+let spectating = false, specTarget = null;   // watching a room instead of playing
+const QUICK = { help: 'Help!', boss: 'Boss here!', nice: 'Nice!', follow: 'Follow me', gg: 'GG', oops: 'Oops' };
+let quickIds = Object.keys(QUICK);
 
 function renderModeRow() {
   const chip = $('modeChip');
@@ -250,7 +261,9 @@ function squareOutline(radius, color, opacity) {
 
 // tile values: -3 wall / not part of the layout, -2 hidden, -1 exploded, 0..8 revealed count
 let floor = new Uint8Array(0), layoutKind = 'field';
+let doorSet = new Set();                 // door tiles get a door model instead of a wall block
 const isWall = (x, y) => !inBoard(x, y) || !floor[y * W + x];
+const layoutString = () => Array.from(floor, (v) => (v ? '1' : '0')).join('');
 
 function setLayout(layoutStr, kind) {
   layoutKind = kind || 'field';
@@ -261,7 +274,7 @@ function setLayout(layoutStr, kind) {
   const c = new THREE.Color(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
   for (let i = 0; i < W * H; i++) {
     const x = i % W, y = Math.floor(i / W), [wx, wz] = tileCenter(x, y);
-    if (floor[i]) { baseMesh.setMatrixAt(nb++, M.makeTranslation(wx, -0.5, wz)); continue; }
+    if (floor[i] || doorSet.has(i)) { baseMesh.setMatrixAt(nb++, M.makeTranslation(wx, -0.5, wz)); continue; }
     if (layoutKind !== 'dungeon') continue;
     // walls bordering the floor stand tall; the rock behind them is lower so the map stays readable
     let edge = false;
@@ -395,11 +408,13 @@ const ITEM_INFO = {
   blink: { name: 'Blink', color: 0xa3e635, css: '#a3e635', hint: 'aim at a tile, press G' },
   apple: { name: 'Apple', color: 0xff4d4d, css: '#ff4d4d' },
   potion: { name: 'Health potion', color: 0xff6fb5, css: '#ff6fb5' },
+  key: { name: 'Vault key', color: 0xffc233, css: '#ffc233' },
+  chest: { name: 'Treasure chest', color: 0xffc233, css: '#ffc233' },
 };
 ITEM_INFO.scatter.hint = 'aim at a tile, press G';
 let HELD = ['', 'scatter', 'freeze', 'shockwave', 'blink'];   // replaced by cfg.held from the server
 let freezeRange = 10, blinkRange = 8, shockRadius = 3;
-const heldKind = (fx) => HELD[(fx || 0) >> 4] || '';
+const heldKind = (fx) => HELD[((fx || 0) >> 4) & 15] || '';
 
 function makeScatterBomb() {
   const g = new THREE.Group();
@@ -487,8 +502,119 @@ function itemModel(kind) {
       new THREE.MeshBasicMaterial({ color: 0x0b1522, side: THREE.DoubleSide }));
     const swirl = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.03, 6, 20, Math.PI * 1.4), glow);
     g.add(ring, inner, swirl);
+  } else if (kind === 'key') g.add(makeKey());
+  else if (kind === 'chest') {
+    const wood = new THREE.MeshStandardMaterial({ color: 0x8a5a2b, roughness: 0.7 });
+    const gold = new THREE.MeshStandardMaterial({ color: 0xffc233, metalness: 0.8, roughness: 0.3, emissive: 0x5a3a00, emissiveIntensity: 0.5 });
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.45, 0.55), wood); base.position.y = -0.15;
+    const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.275, 0.275, 0.8, 16, 1, false, 0, Math.PI), wood);
+    lid.rotation.z = Math.PI / 2; lid.position.y = 0.07;
+    for (const x of [-0.28, 0.28]) {
+      const band = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.47, 0.57), gold); band.position.set(x, -0.15, 0); g.add(band);
+    }
+    const lock = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.16, 0.06), gold); lock.position.set(0, 0.0, 0.29);
+    g.add(base, lid, lock);
   }
   return g;
+}
+
+function makeKey() {
+  const gold = new THREE.MeshStandardMaterial({ color: 0xffc233, metalness: 0.85, roughness: 0.25, emissive: 0x6a4500, emissiveIntensity: 0.6 });
+  const g = new THREE.Group();
+  const bow = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.055, 8, 20), gold); bow.position.y = 0.28;
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.55, 8), gold); shaft.position.y = -0.1;
+  const bit1 = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.07, 0.06), gold); bit1.position.set(0.09, -0.3, 0);
+  const bit2 = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.07, 0.06), gold); bit2.position.set(0.07, -0.17, 0);
+  g.add(bow, shaft, bit1, bit2);
+  g.traverse((o) => { o.castShadow = true; });
+  return g;
+}
+
+// ---------------------------------------------------------------- the vault door
+function makeDoor(horizontalWall) {
+  // a heavy wooden door with iron bands and a glowing keyhole, filling one wall tile
+  const g = new THREE.Group();
+  const wood = new THREE.MeshStandardMaterial({ color: 0x7a4a22, roughness: 0.8 });
+  const iron = new THREE.MeshStandardMaterial({ color: 0x3a3f48, metalness: 0.7, roughness: 0.4 });
+  const gold = new THREE.MeshStandardMaterial({ color: 0xffc233, emissive: 0xffa000, emissiveIntensity: 0.9 });
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(T, WALL_H, T * 0.55), wood); slab.position.y = WALL_H / 2 - 0.5;
+  g.add(slab);
+  for (const y of [0.15, 1.15]) {
+    const band = new THREE.Mesh(new THREE.BoxGeometry(T * 1.01, 0.14, T * 0.58), iron); band.position.y = y; g.add(band);
+  }
+  const hole = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, T * 0.6, 12), gold);
+  hole.rotation.x = Math.PI / 2; hole.position.y = 0.65; g.add(hole);
+  // a big gold padlock floats above the door so it reads from the overhead camera in every realm
+  const lock = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.75, 0.35), new THREE.MeshStandardMaterial({
+    color: 0xffc233, metalness: 0.7, roughness: 0.3, emissive: 0xffa000, emissiveIntensity: 0.6 }));
+  const shackle = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.08, 8, 20, Math.PI), new THREE.MeshStandardMaterial({
+    color: 0xdfe5ec, metalness: 0.9, roughness: 0.2 }));
+  shackle.position.y = 0.37;
+  lock.add(body, shackle);
+  lock.position.y = WALL_H + 0.9;
+  g.add(lock);
+  g.userData.lock = lock;
+  g.rotation.y = horizontalWall ? 0 : Math.PI / 2;
+  g.traverse((o) => { o.castShadow = o.receiveShadow = true; });
+  return g;
+}
+
+function setDoors(list) {
+  for (const m of doors.values()) { scene.remove(m); disposeTree(m); }
+  doors.clear();
+  for (const [x, y] of list || []) {
+    // the door spans a corridor: it faces along the corridor, so check which way the floor runs
+    const along = !isWall(x - 1, y) || !isWall(x + 1, y);
+    const m = makeDoor(!along);
+    m.userData.lock.visible = doors.size === 0;   // one padlock per two-tile door
+    const [wx, wz] = tileCenter(x, y);
+    m.position.set(wx, 0, wz);
+    scene.add(m);
+    doors.set(y * W + x, m);
+  }
+}
+
+// ---------------------------------------------------------------- spike traps
+function addTrap(x, y, phase) {
+  const i = y * W + x;
+  if (traps.has(i)) return;
+  const g = new THREE.Group();
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(T * 0.86, 0.06, T * 0.86),
+    new THREE.MeshStandardMaterial({ color: 0x4a505a, metalness: 0.6, roughness: 0.5 }));
+  plate.position.y = 0.13; g.add(plate);
+  const holes = new THREE.Mesh(new THREE.PlaneGeometry(T * 0.8, T * 0.8),
+    new THREE.MeshBasicMaterial({ color: 0x8a1d1d, transparent: true, opacity: 0.35, depthWrite: false }));
+  holes.rotation.x = -Math.PI / 2; holes.position.y = 0.165; g.add(holes);
+  const spikes = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color: 0xdfe5ec, metalness: 0.85, roughness: 0.2 });
+  const geo = new THREE.ConeGeometry(0.11, 0.7, 6);
+  for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) {
+    const s = new THREE.Mesh(geo, mat); s.position.set((a - 1) * 0.5, 0.35, (b - 1) * 0.5); s.castShadow = true; spikes.add(s);
+  }
+  g.add(spikes);
+  const [wx, wz] = tileCenter(x, y);
+  g.position.set(wx, 0, wz);
+  scene.add(g);
+  traps.set(i, { group: g, spikes, holes, phase });
+}
+
+function clearTraps() {
+  for (const t of traps.values()) { scene.remove(t.group); disposeTree(t.group); }
+  traps.clear();
+}
+
+function updateTraps() {
+  const now = serverNow();
+  for (const t of traps.values()) {
+    const c = (now + t.phase) % spikeCycle;
+    // up for spikeUp seconds; a rattle just before they shoot up
+    const up = c < spikeUp, warn = c > spikeCycle - 0.45;
+    const k = up ? Math.min(1, c / 0.08) * Math.min(1, (spikeUp - c) / 0.15) : warn ? 0.06 + Math.sin(c * 80) * 0.04 : 0;
+    t.spikes.position.y = -0.62 + k * 0.62 + 0.13;
+    t.spikes.visible = k > 0;
+    t.holes.material.opacity = up ? 0.7 : warn ? 0.55 : 0.3;
+  }
 }
 
 function addItem(x, y, kind) {
@@ -546,9 +672,17 @@ function blastArea(x, y, r) {
 }
 
 // ---------------------------------------------------------------- avatars
-function makeAvatar(color, name, charId) {
+function makeAvatar(color, name, charId, hatId = '') {
   const c = buildCharacter(charId, color);
   const g = c.root;
+  let hatTick = null;
+  if (hatId && HAT_HEIGHT[hatId] !== undefined) {
+    const hat = buildHat(hatId, color);
+    hat.position.y += c.top - 0.06;
+    c.upper.add(hat);
+    hatTick = hat.userData.tick || null;
+    c.top += HAT_HEIGHT[hatId];   // name tag, health bar and held item sit above the hat
+  }
   const stars = new THREE.Group();
   for (let k = 0; k < 3; k++) {
     const s = new THREE.Mesh(new THREE.OctahedronGeometry(0.12), new THREE.MeshBasicMaterial({ color: 0xffe14d }));
@@ -572,10 +706,12 @@ function makeAvatar(color, name, charId) {
   const hpTex = new THREE.CanvasTexture(hpCanvas); hpTex.colorSpace = THREE.SRGBColorSpace;
   const hpBar = new THREE.Sprite(new THREE.SpriteMaterial({ map: hpTex, transparent: true, depthWrite: false }));
   hpBar.scale.set(1.4, 0.22, 1); hpBar.position.y = c.top + 0.42;
-  g.add(stars, label, bubble, held, ice, aura, hpBar);
+  const keyIcon = makeKey(); keyIcon.scale.setScalar(0.7); keyIcon.position.set(0.75, c.top + 0.55, 0); keyIcon.visible = false;
+  g.add(stars, label, bubble, held, ice, aura, hpBar, keyIcon);
   scene.add(g);
-  const av = { group: g, upper: c.upper, feet: c.feet, tick: c.tick, stars, label, bubble, held, heldKind: '', ice, aura,
-    hpBar, hpCanvas, top: c.top };
+  const tick = hatTick ? (t, s) => { c.tick?.(t, s); hatTick(t); } : c.tick;
+  const av = { group: g, upper: c.upper, feet: c.feet, tick, stars, label, bubble, held, heldKind: '', ice, aura,
+    hpBar, hpCanvas, top: c.top, keyIcon, say: null };
   drawHpBar(av, maxHp);
   return av;
 }
@@ -618,6 +754,13 @@ function animateAvatar(p, av, speed, dt, stunned) {
   }
   av.held.visible = !!hk && !stunned;
   if (hk) av.held.rotation.y += dt * 2;
+  av.keyIcon.visible = !!(fx & keyBit) && !ko;
+  if (av.keyIcon.visible) { av.keyIcon.rotation.y += dt * 2.5; av.keyIcon.position.y = av.top + 0.55 + Math.sin(elapsed * 3) * 0.08; }
+  if (av.say) {   // quick-chat speech bubble
+    av.say.t -= dt;
+    av.say.sprite.material.opacity = Math.min(1, av.say.t * 2);
+    if (av.say.t <= 0) { av.group.remove(av.say.sprite); av.say.sprite.material.map.dispose(); av.say.sprite.material.dispose(); av.say = null; }
+  }
   if ((fx & 4) && speed > 0.3 && Math.random() < dt * 12) {
     const gp = av.group.position;
     burst(new THREE.Vector3(gp.x, gp.y + 0.3, gp.z), { count: 3, colors: [0xffd23f, 0xfff1a0], speed: [1, 2.5], life: 0.6, size: 0.2, gravity: 6 });
@@ -691,6 +834,42 @@ function floatText(text, color, wx, wy, wz) {
     s.position.y += dt * 1.4;
     s.material.opacity = Math.min(1, 2.5 * (1.4 - t));
     if (t > 1.4) { scene.remove(s); s.material.map.dispose(); s.material.dispose(); return false; }
+    return true;
+  });
+}
+
+// quick chat: a speech bubble over the player for a few seconds
+function sayBubble(pid, text) {
+  const p = players.get(pid); if (!p) return;
+  const av = p.av;
+  if (av.say) { av.group.remove(av.say.sprite); av.say.sprite.material.map.dispose(); av.say.sprite.material.dispose(); }
+  const s = textSprite(text, { color: '#14202e', bg: 'rgba(255,255,255,.92)', scale: 0.85, font: 800 });
+  s.position.y = av.top + 1.55;
+  av.group.add(s);
+  av.say = { sprite: s, t: 3.2 };
+}
+
+// a ping: a beam of light on a tile in the player's colour, and a mark on the minimap
+function addPing(x, y, color) {
+  const [wx, wz] = tileCenter(x, y);
+  const g = new THREE.Group();
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 14, 16, 1, true),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide }));
+  beam.position.y = 7;
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.7, 0.95, 32),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; ring.position.y = 0.7;
+  g.add(beam, ring); g.position.set(wx, 0, wz);
+  scene.add(g);
+  const ping = { x, y, color, until: performance.now() + 4500, group: g };
+  pings.push(ping);
+  let t = 0;
+  effects.push((dt) => {
+    t += dt;
+    ring.scale.setScalar(1 + (t * 1.5) % 1.2);
+    ring.material.opacity = 0.9 * (1 - ((t * 1.5) % 1.2) / 1.2);
+    beam.material.opacity = 0.35 * Math.min(1, (4.5 - t) / 0.8);
+    if (t > 4.5) { scene.remove(g); disposeTree(g); pings.splice(pings.indexOf(ping), 1); return false; }
     return true;
   });
 }
@@ -849,6 +1028,12 @@ const sfx = {
   shock: (v) => { tone(55, 0.8, { type: 'sine', vol: 0.5 * v, slide: 30 }); noise(0.6, 0.5 * v, 400); tone(220, 0.4, { type: 'square', vol: 0.05 * v, slide: -180 }); },
   blink: (v) => { tone(300, 0.18, { type: 'sine', vol: 0.12 * v, slide: 1500 }); tone(1800, 0.2, { type: 'sine', vol: 0.08 * v, slide: -1400, delay: 0.15 }); },
   shield: (v) => { tone(1200, 0.25, { type: 'sine', vol: 0.15 * v, slide: -600 }); tone(1800, 0.2, { type: 'sine', vol: 0.08 * v, delay: 0.05 }); },
+  ping: (v) => { tone(1320, 0.12, { type: 'sine', vol: 0.12 * v }); tone(1760, 0.18, { type: 'sine', vol: 0.1 * v, delay: 0.1 }); },
+  chat: (v) => tone(990, 0.07, { type: 'triangle', vol: 0.08 * v }),
+  spike: (v) => { noise(0.12, 0.35 * v, 4000); tone(260, 0.12, { type: 'square', vol: 0.08 * v, slide: -120 }); },
+  door: (v) => { noise(1.4, 0.4 * v, 300); tone(70, 1.2, { type: 'sawtooth', vol: 0.1 * v, slide: -20 });
+    [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, 0.3, { type: 'triangle', vol: 0.1 * v, delay: 0.6 + i * 0.09 })); },
+  chest: () => [784, 988, 1175, 1568].forEach((f, i) => tone(f, 0.22, { type: 'triangle', vol: 0.12, delay: i * 0.07 })),
 };
 
 // ---------------------------------------------------------------- HUD
@@ -909,25 +1094,84 @@ function showResults(results, next, duration) {
 }
 
 // ---------------------------------------------------------------- networking
-function connect(name, room) {
+// This tab's resume token lives in sessionStorage: if the connection drops (or the page reloads) you
+// get your place back, with the same score, health and items, for cfg.resumeSeconds.
+const SESSION_KEY = 'mf3d.session';
+const loadSession = () => { try { return JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null'); } catch { return null; } };
+const saveSession = (v) => { try { v ? sessionStorage.setItem(SESSION_KEY, JSON.stringify(v)) : sessionStorage.removeItem(SESSION_KEY); } catch {} };
+// a random id kept in localStorage: the server keeps this browser's stats (and hat unlocks) under it
+function profileToken() {
+  try {
+    let t = localStorage.getItem('mf3d.profile');
+    if (!/^[0-9a-f]{32}$/.test(t || '')) {
+      t = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem('mf3d.profile', t);
+    }
+    return t;
+  } catch { return null; }
+}
+let reconnecting = null, leaving = false, resumeSeconds = 45;
+
+function connect(name, room, { spectate = false } = {}) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => send({ t: 'join', name, room, char: picker.char, color: picker.color, realm: picker.realm, layout: picker.layout, mode: picker.mode });
-  ws.onmessage = (e) => handle(JSON.parse(e.data));
-  ws.onclose = () => {
-    $('hud').hidden = true; $('results').hidden = true;
+  const sock = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = sock;
+  const prev = loadSession();
+  const resume = !spectate && prev && prev.room === room.toLowerCase() ? prev.token : undefined;
+  sock.onopen = () => send({ t: 'join', name, room, char: picker.char, color: picker.color, realm: picker.realm, layout: picker.layout,
+    mode: picker.mode, hat: picker.hat, profile: profileToken(), spectate, resume });
+  sock.onmessage = (e) => handle(JSON.parse(e.data));
+  sock.onclose = () => {
+    if (ws !== sock) return;
     const wasIn = !!myId;
     myId = null;
     if (joinError) {   // the server refused the join (e.g. room full): keep its message
-      const msg = joinError; joinError = null;
-      openPicker(false);
+      const msg = joinError; joinError = null; reconnecting = null;
+      leaveGame();
       const err = $('joinError'); err.textContent = msg; err.hidden = false;
       return;
     }
-    openPicker(false);
-    const err = $('joinError'); err.textContent = wasIn ? 'Connection lost. Press the button to rejoin.' : 'Could not connect to the server.'; err.hidden = false;
+    if (leaving) { leaving = false; leaveGame(); return; }
+    // dropped mid-game: keep the world on screen and keep trying to get back in
+    if (wasIn && !spectating) reconnecting = { name, room, until: performance.now() + resumeSeconds * 1000 };
+    if (reconnecting && performance.now() < reconnecting.until) {
+      $('reconnect').hidden = false;
+      setTimeout(() => connect(reconnecting.name, reconnecting.room), 1500);
+      return;
+    }
+    const lost = wasIn || reconnecting;
+    reconnecting = null;
+    leaveGame();
+    const err = $('joinError'); err.textContent = lost ? 'Connection lost. Press the button to rejoin.' : 'Could not connect to the server.'; err.hidden = false;
   };
 }
+
+function leaveGame() {
+  $('hud').hidden = true; $('results').hidden = true; $('reconnect').hidden = true; $('quick').hidden = true;
+  setSpectating(false);
+  openPicker(false);
+}
+
+function setSpectating(on) {
+  spectating = on;
+  document.body.classList.toggle('spectating', on);
+  $('specBar').hidden = !on;
+  if (!on) specTarget = null;
+}
+
+// spectators follow one player around; switch with the arrow keys, Tab or the ◀ ▶ buttons
+function cycleSpec(step) {
+  const ids = [...players.keys()];
+  if (!ids.length) { specTarget = null; $('specName').textContent = 'nobody yet'; return; }
+  const k = ids.indexOf(specTarget);
+  specTarget = ids[((k < 0 ? 0 : k + step) % ids.length + ids.length) % ids.length];
+  const p = players.get(specTarget);
+  $('specName').textContent = p?.name ?? '';
+  $('specName').style.color = p?.color ?? '';
+}
+$('specPrev').addEventListener('click', () => cycleSpec(-1));
+$('specNext').addEventListener('click', () => cycleSpec(1));
+$('specLeave').addEventListener('click', () => { leaving = true; ws?.close(); });
 
 function applySnapshot(s) {
   tiles.fill(-2);
@@ -940,8 +1184,12 @@ function applySnapshot(s) {
   bombs.clear();
   for (const id of [...bosses.keys()]) removeBoss(id);
   clearRadar();
+  clearTraps();
   minesShown.count = 0;
+  doorSet = new Set((s.doors || []).map(([x, y]) => y * W + x));
   setLayout(s.layout, s.layoutKind);
+  setDoors(s.doors);
+  dailyDate = s.daily || null;
   if (s.mode) gameMode = s.mode;
   teamLives = s.lives ?? null;
   renderModeRow();
@@ -952,6 +1200,7 @@ function applySnapshot(s) {
   }
   for (const [x, y, pid] of s.flags) setFlag(x, y, pid);
   for (const [x, y, k] of s.items || []) addItem(x, y, k);
+  for (const [x, y, ph] of s.traps || []) addTrap(x, y, ph);
   refreshBoard();
   setCounters(s);
   roundState = s.state;
@@ -972,6 +1221,15 @@ function handle(m) {
       break;
     case 'welcome': {
       myId = m.id;
+      reconnecting = null; $('reconnect').hidden = true;
+      setSpectating(!!m.spectator);
+      if (m.token) saveSession({ room: m.room, token: m.token });
+      if (m.serverTime) serverOffset = m.serverTime - performance.now() / 1000;
+      keyBit = m.cfg.keyBit ?? keyBit; spikeCycle = m.cfg.spikeCycle ?? spikeCycle; spikeUp = m.cfg.spikeUp ?? spikeUp;
+      if (m.cfg.quick) quickIds = m.cfg.quick.filter((q) => QUICK[q]);
+      resumeSeconds = m.cfg.resumeSeconds ?? resumeSeconds;
+      renderQuick();
+      if (m.resumed) feed('Reconnected. You kept your place.');
       ({ w: W, h: H, tile: T, reach: REACH } = m.cfg);
       throwRange = m.cfg.throwRange ?? throwRange; scatterRadius = m.cfg.scatterRadius ?? scatterRadius;
       bootsSpeed = m.cfg.bootsSpeed ?? bootsSpeed;
@@ -991,6 +1249,59 @@ function handle(m) {
       $('roomName').textContent = m.room;
       $('join').hidden = true; $('hud').hidden = false;
       applySnapshot(m.snapshot);
+      if (dailyDate) feed({ text: 'Daily dungeon', color: '#ffd23f' }, ` for ${dailyDate}: everyone gets this same map today. Clear it for the leaderboard!`);
+      break;
+    }
+    case 'profile':
+      profile = m;
+      renderHats(); renderMyStats();
+      for (const h of m.new || []) {
+        const name = HATS.find((x) => x.id === h)?.name ?? h;
+        feed('🎉 Unlocked the ', { text: name, color: '#ffd23f' }, '! Wear it with Change character.');
+        sfx.chest();
+      }
+      break;
+    case 'emote': {
+      const text = QUICK[m.id]; if (!text) break;
+      sayBubble(m.pid, text);
+      feed(who(m.pid), `: ${text}`);
+      const pp = playerPos(m.pid); sfx.chat(pp ? distVol(pp[0], pp[2]) : 0.5);
+      break;
+    }
+    case 'ping': {
+      const p = players.get(m.pid);
+      addPing(m.x, m.y, p?.color ?? '#ffd23f');
+      const [wx, wz] = tileCenter(m.x, m.y);
+      sfx.ping(Math.max(0.35, distVol(wx, wz)));
+      break;
+    }
+    case 'door': {
+      // the vault is open: the door tiles become floor (covered, then revealed by the next message)
+      for (const [x, y] of m.tiles) { const i = y * W + x; floor[i] = 1; tiles[i] = -2; }
+      doorSet = new Set();
+      setDoors([]);
+      setLayout(layoutString(), layoutKind);
+      refreshBoard();
+      const [x0, y0] = m.tiles[0], [wx, wz] = tileCenter(x0, y0);
+      burst(new THREE.Vector3(wx, 1.2, wz), { count: 160, colors: [0xffc233, 0xffffff, 0x8a5a2b], speed: [4, 12], life: 1.4, size: 0.4 });
+      floatText(`VAULT OPEN +${m.reward}`, '#ffd23f', wx, 4, wz);
+      sfx.door(Math.max(0.4, distVol(wx, wz)));
+      cam.shake = Math.max(cam.shake, 0.6 * distVol(wx, wz));
+      feed(who(m.pid), ' unlocked the ', { text: 'vault', color: '#ffc233' }, '! Treasure inside.');
+      break;
+    }
+    case 'drop':
+      addItem(m.x, m.y, m.kind);
+      if (m.kind === 'key') feed(m.pid ? who(m.pid) : 'The vault key', m.pid ? ' dropped the ' : ' turned up again', m.pid ? { text: 'vault key', color: '#ffc233' } : '', '!');
+      break;
+    case 'spike': {
+      const pp = playerPos(m.pid);
+      if (pp) {
+        floatText(m.shielded ? 'SHIELDED' : `-${m.dmg} HP`, m.shielded ? '#7fc0ff' : '#ff8080', pp[0], pp[1] + 3.6, pp[2]);
+        burst(new THREE.Vector3(pp[0], 0.6, pp[2]), { count: 18, colors: [0xdfe5ec, 0xff5d5d], speed: [2, 5], life: 0.5, size: 0.25 });
+        sfx.spike(m.pid === myId ? 1 : distVol(pp[0], pp[2]));
+      }
+      if (m.pid === myId && !m.shielded) { me.stun = m.stun; me.vy = 6; }
       break;
     }
     case 'roster': {
@@ -999,14 +1310,14 @@ function handle(m) {
         ids.add(r.id);
         const ex = players.get(r.id);
         if (!ex) {
-          players.set(r.id, { name: r.name, color: r.color, char: r.char, bot: !!r.bot, score: 0, stun: 0, hp: maxHp, av: makeAvatar(r.color, r.name, r.char),
-            x: NaN, z: 0, y: 0.6, r: 0, tx: 0, tz: 0, tr: 0, phase: 0 });
+          players.set(r.id, { name: r.name, color: r.color, char: r.char, hat: r.hat || '', bot: !!r.bot, score: 0, stun: 0, hp: maxHp,
+            av: makeAvatar(r.color, r.name, r.char, r.hat), x: NaN, z: 0, y: 0.6, r: 0, tx: 0, tz: 0, tr: 0, phase: 0 });
           if (r.id !== myId && myId) feed(who(r.id), ' joined');
-        } else if (ex.char !== r.char || ex.color !== r.color || ex.name !== r.name) {
+        } else if (ex.char !== r.char || ex.color !== r.color || ex.name !== r.name || ex.hat !== (r.hat || '')) {
           // appearance changed: rebuild the avatar in place
           scene.remove(ex.av.group);
-          Object.assign(ex, { name: r.name, color: r.color, char: r.char });
-          ex.av = makeAvatar(r.color, r.name, r.char);
+          Object.assign(ex, { name: r.name, color: r.color, char: r.char, hat: r.hat || '' });
+          ex.av = makeAvatar(r.color, r.name, r.char, r.hat);
           drawHpBar(ex.av, ex.hp ?? maxHp);
           if (r.id === myId) { picker.color = r.color; }
         }
@@ -1017,6 +1328,7 @@ function handle(m) {
         const owner = players.get(f.pid);
         if (owner) f.mesh.userData.cloth.material.color.set(owner.color);
       }
+      if (spectating && !players.has(specTarget)) cycleSpec(0);
       renderScores();
       break;
     }
@@ -1115,6 +1427,8 @@ function handle(m) {
       refreshBoard();
       setCounters(m);
       for (const [x, y, k] of m.items || []) addItem(x, y, k);
+      for (const [x, y, ph] of m.traps || []) addTrap(x, y, ph);
+      if (m.traps?.length && m.pid === myId) feed('Careful: you dug up a ', { text: 'spike trap', color: '#dfe5ec' }, '. It stabs up every few seconds.');
       const pos = playerPos(m.pid);
       if (pos) {
         floatText(`+${m.gain}`, '#7dff8a', pos[0], pos[1] + 3.4, pos[2]);
@@ -1175,7 +1489,15 @@ function handle(m) {
       }
       if (m.pid === myId && m.kind === 'boots') bootsUntil = performance.now() + m.dur * 1000;
       if (m.pid === myId && m.kind === 'gold') goldUntil = performance.now() + m.dur * 1000;
-      feed(who(m.pid), ' grabbed ', { text: info.name, color: info.css });
+      if (m.points) {
+        const pp = playerPos(m.pid);
+        if (pp) floatText(`+${m.points} TREASURE`, '#ffd23f', pp[0], pp[1] + 3.8, pp[2]);
+        burst(new THREE.Vector3(wx, 1, wz), { count: 80, colors: [0xffc233, 0xfff1a0, 0xffffff], speed: [3, 9], life: 1.2, size: 0.3 });
+        sfx.chest();
+      }
+      if (m.kind === 'key') feed(who(m.pid), ' found the ', { text: 'vault key', color: info.css }, '! Carry it to the locked door.');
+      else if (m.kind === 'chest') feed(who(m.pid), ' opened the ', { text: 'treasure chest', color: info.css }, ` (+${m.points})`);
+      else feed(who(m.pid), ' grabbed ', { text: info.name, color: info.css });
       break;
     }
     case 'radar':
@@ -1217,6 +1539,7 @@ function handle(m) {
         if (flags.has(i)) setFlag(x, y, null);
         const c = craters.get(i); if (c) { scene.remove(c); craters.delete(i); }
         removeItem(i);
+        const tr = traps.get(i); if (tr) { scene.remove(tr.group); disposeTree(tr.group); traps.delete(i); }
       }
       if (radar) for (const o of [...radar.group.children]) if (blastArea(m.x, m.y, m.r).includes(o.userData.tile)) radar.group.remove(o);
       for (const [x, y, v] of m.tiles) tiles[y * W + x] = v;
@@ -1381,6 +1704,10 @@ function handle(m) {
         ? (m.failed ? 'Out of lives. The dungeon wins!' : `Dungeon cleared! Team score ${m.team}`)
         : m.mode === 'pvp' ? 'Battle over!' : 'Field cleared!';
       if (m.failed) $('resultsSub').textContent = 'Your team was knocked out too many times. A new dungeon awaits.';
+      if (m.daily) {
+        $('resultsTitle').textContent = 'Daily dungeon cleared!';
+        $('resultsSub').textContent += ' Your result is on today\'s leaderboard. The same map comes back next round, so you can try to beat it.';
+      }
       sfx.win();
       break;
     case 'round':
@@ -1400,7 +1727,8 @@ function handle(m) {
 // ---------------------------------------------------------------- character picker
 const COLORS = ['#ff5d5d', '#4fa3ff', '#ffd23f', '#4fd67a', '#c77dff', '#ff9f43',
   '#3ee6d6', '#ff6fb5', '#a3e635', '#f8fafc', '#94a3b8', '#fb7185']; // must match server.py
-const picker = { char: 'miner', color: COLORS[1], realm: 'meadow', layout: 'dungeon', mode: 'race', edit: false };
+const picker = { char: 'miner', color: COLORS[1], realm: 'meadow', layout: 'dungeon', mode: 'race', hat: '', edit: false };
+let profile = null;                      // { stats, unlocked, hats } for this browser, from the server
 const pv = { renderer: null, scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(32, 260 / 300, 0.1, 50),
   model: null, running: false, last: 0 };
 const thumb = { renderer: null, scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(30, 1, 0.1, 50), imgs: {} };
@@ -1471,6 +1799,65 @@ function renderThumbs() {
   }
 }
 
+// hats: rendered on the chosen character; locked ones show what unlocks them
+const hatThumbs = {};
+const hatCam = new THREE.PerspectiveCamera(30, 1, 0.1, 50);
+function renderHats() {
+  const box = $('hats'); if (!box) return;
+  const unlocked = new Set(profile?.unlocked || []);
+  if (profile && picker.hat && !unlocked.has(picker.hat)) picker.hat = '';
+  const info = Object.fromEntries((profile?.hats || []).map((h) => [h.id, h]));
+  const mk = (id, name, img, locked, title, prog) => {
+    const b = document.createElement('button'); b.type = 'button'; b.title = title; b.disabled = locked;
+    b.classList.toggle('sel', picker.hat === id);
+    if (img) { const im = document.createElement('img'); im.alt = name; im.src = img; b.append(im); }
+    else { const n = document.createElement('span'); n.className = 'none'; n.textContent = '∅'; b.append(n); }
+    const s = document.createElement('span'); s.textContent = name; b.append(s);
+    if (prog) { const p = document.createElement('span'); p.className = 'prog'; p.textContent = prog; b.append(p); }
+    b.addEventListener('click', () => { picker.hat = id; renderHats(); syncPicker(false); });
+    return b;
+  };
+  const list = [mk('', 'None', null, false, 'No hat')];
+  for (const h of HATS) {
+    const req = info[h.id], locked = !unlocked.has(h.id);
+    const have = req ? Math.min(profile.stats?.[req.stat] ?? 0, req.need) : 0;
+    list.push(mk(h.id, h.name, hatThumbs[`${h.id}|${picker.char}|${picker.color}`] || hatThumb(h.id), locked,
+      locked ? `Locked: ${req?.how ?? 'keep playing'}` : h.name, locked && req ? `${have}/${req.need}` : ''));
+  }
+  box.replaceChildren(...list);
+}
+function hatThumb(id) {
+  const key = `${id}|${picker.char}|${picker.color}`;
+  if (hatThumbs[key]) return hatThumbs[key];
+  const c = buildCharacter(picker.char, picker.color);
+  const hat = buildHat(id, picker.color); hat.position.y += c.top - 0.06; c.upper.add(hat);
+  c.root.rotation.y = 0.45;
+  hatCam.position.set(0, c.top + 0.4, 3.4); hatCam.lookAt(0, c.top - 0.15, 0);
+  thumb.scene.add(c.root);
+  thumb.renderer.render(thumb.scene, hatCam);
+  hatThumbs[key] = thumb.renderer.domElement.toDataURL();
+  thumb.scene.remove(c.root); disposeTree(c.root);
+  return hatThumbs[key];
+}
+function renderMyStats() {
+  const s = profile?.stats; const el = $('myStats'); if (!el) return;
+  if (!s || !s.rounds && !s.tiles) { el.textContent = 'Your stats are saved in this browser as you play, and unlock hats.'; return; }
+  el.replaceChildren();
+  for (const [label, v] of [['Rounds', s.rounds], ['Wins', s.wins], ['Co-op clears', s.coop_wins], ['Tiles', s.tiles],
+    ['Bosses slain', s.bosses], ['Best score', s.best]]) {
+    const b = document.createElement('b'); b.textContent = v;
+    el.append(`${label} `, b, ' · ');
+  }
+  el.lastChild.remove();
+}
+async function loadProfile() {
+  const t = profileToken(); if (!t) return;
+  try {
+    profile = await (await fetch(`/api/profile?token=${t}`, { cache: 'no-store' })).json();
+  } catch { return; }
+  renderHats(); renderMyStats();
+}
+
 function syncPicker(colorChanged) {
   for (const b of $('chars').children) b.classList.toggle('sel', b.dataset.id === picker.char);
   for (const b of $('realms').children) b.classList.toggle('sel', b.dataset.id === picker.realm);
@@ -1487,9 +1874,11 @@ function syncPicker(colorChanged) {
   const rot = pv.model ? pv.model.root.rotation.y : 0.4;
   if (pv.model) { pv.scene.remove(pv.model.root); disposeTree(pv.model.root); }
   pv.model = buildCharacter(def.id, picker.color);
+  if (picker.hat) { const hat = buildHat(picker.hat, picker.color); hat.position.y += pv.model.top - 0.06; pv.model.upper.add(hat); }
   pv.model.root.rotation.y = rot;
   pv.scene.add(pv.model.root);
   if (colorChanged) renderThumbs();
+  if (pv.hatKey !== `${picker.char}|${picker.color}`) { pv.hatKey = `${picker.char}|${picker.color}`; renderHats(); }
 }
 
 function previewLoop(now) {
@@ -1511,8 +1900,8 @@ function openPicker(edit) {
   $('joinBtn').textContent = edit ? 'Save' : 'Enter the field';
   if (edit) {
     const p = players.get(myId);
-    if (p) { picker.char = p.char; picker.color = p.color; $('name').value = p.name; }
-  }
+    if (p) { picker.char = p.char; picker.color = p.color; picker.hat = p.hat || ''; $('name').value = p.name; }
+  } else loadProfile();
   $('joinError').hidden = true;
   $('join').hidden = false;
   keys.clear();
@@ -1537,8 +1926,37 @@ async function refreshLobby() {
     lobby.rooms = (await r.json()).rooms || [];
   } catch { lobby.rooms = []; }
   renderLobby();
+  if (!lobby.dailyAt || performance.now() - lobby.dailyAt > 15000) {
+    lobby.dailyAt = performance.now();
+    try { lobby.daily = await (await fetch('/api/daily', { cache: 'no-store' })).json(); } catch { lobby.daily = null; }
+    renderDaily();
+  }
   lobby.timer = setTimeout(refreshLobby, 3000);
 }
+
+function renderDaily() {
+  const d = lobby.daily; $('daily').hidden = !d;
+  if (!d) return;
+  $('dailyDate').textContent = `${d.date} · ${REALM_BY_ID[d.realm]?.name ?? d.realm}`;
+  const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  const fill = (id, rows, val) => {
+    const ol = $(id);
+    if (!rows.length) { const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'No clears yet today. Be the first!'; ol.replaceChildren(li); return; }
+    ol.replaceChildren(...rows.slice(0, 5).map((r, i) => {
+      const li = document.createElement('li');
+      const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = r.color || '#94a3b8';
+      const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = `${i + 1}. ${r.name}`;
+      const sc = document.createElement('span'); sc.className = 'sc'; sc.textContent = val(r);
+      li.append(sw, nm, sc); return li;
+    }));
+  };
+  fill('dailyScores', d.scores || [], (r) => r.score);
+  fill('dailyTimes', d.times || [], (r) => fmt(r.secs));
+}
+$('dailyBtn').addEventListener('click', () => {
+  if (!lobby.daily) return;
+  $('room').value = lobby.daily.room; updateRoomNote(); $('joinForm').requestSubmit();
+});
 
 function renderLobby() {
   const list = $('roomList'), mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
@@ -1553,8 +1971,11 @@ function renderLobby() {
     const chips = mk('div', 'chips');
     chips.append(mk('span', r.mode, MODE_NAMES[r.mode] || r.mode), mk('span', '', LAYOUT_NAMES[r.layout] || r.layout),
       mk('span', '', REALM_BY_ID[r.realm]?.name || r.realm));
+    if (r.daily) chips.prepend(mk('span', 'daily', 'Daily'));
     if (r.bosses) chips.append(mk('span', 'boss', r.bosses > 1 ? `${r.bosses} bosses` : 'boss out'));
     if (r.lives !== null && r.lives !== undefined) chips.append(mk('span', 'coop', `♥ ${r.lives}`));
+    if (r.vault === 'locked') chips.append(mk('span', '', 'vault locked'));
+    if (r.spectators) chips.append(mk('span', '', `${r.spectators} watching`));
     const who = mk('div', 'who');
     for (const p of r.players) {
       const s = mk('span'); const dot = mk('i'); dot.style.background = p.color;
@@ -1565,7 +1986,10 @@ function renderLobby() {
     const status = r.state === 'over' ? 'Round over, next one starting' : r.progress ? `${Math.round(r.progress * 100)}% cleared · ${Math.floor(r.age / 60)}m in` : 'Round just started';
     const btn = mk('button', '', full ? 'Full' : 'Join'); btn.type = 'button'; btn.disabled = full;
     btn.addEventListener('click', () => { $('room').value = r.name; updateRoomNote(); $('joinForm').requestSubmit(); });
-    foot.append(mk('span', '', status), btn);
+    const watch = mk('button', 'watch', 'Watch'); watch.type = 'button'; watch.title = 'Watch this room without playing';
+    watch.addEventListener('click', () => { audio(); $('joinError').hidden = true; connect($('name').value.trim() || 'Spectator', r.name, { spectate: true }); });
+    const btns = mk('div', 'btns'); btns.append(watch, btn);
+    foot.append(mk('span', '', status), btns);
     card.append(top, chips, who, prog, foot);
     return card;
   }));
@@ -1587,9 +2011,9 @@ $('joinForm').addEventListener('submit', (e) => {
   audio();
   const name = $('name').value.trim() || 'Sweeper';
   const room = $('room').value.trim() || 'lobby';
-  try { localStorage.setItem('mf3d', JSON.stringify({ name, room, char: picker.char, color: picker.color, realm: picker.realm, layout: picker.layout, mode: picker.mode })); } catch {}
+  try { localStorage.setItem('mf3d', JSON.stringify({ name, room, char: picker.char, color: picker.color, realm: picker.realm, layout: picker.layout, mode: picker.mode, hat: picker.hat })); } catch {}
   if (picker.edit) {
-    send({ t: 'look', name, char: picker.char, color: picker.color });
+    send({ t: 'look', name, char: picker.char, color: picker.color, hat: picker.hat });
     closePicker();
     return;
   }
@@ -1605,6 +2029,7 @@ try {
   if (saved.name) $('name').value = saved.name;
   if (CHAR_BY_ID[saved.char]) picker.char = saved.char;
   if (COLORS.includes(saved.color)) picker.color = saved.color;
+  if (HATS.some((h) => h.id === saved.hat)) picker.hat = saved.hat;   // dropped by renderHats if it's locked
   const okRealm = (r) => r === 'random' || REALM_BY_ID[r];
   if (okRealm(saved.realm)) picker.realm = saved.realm;
   const qs = new URLSearchParams(location.search);
@@ -1618,7 +2043,8 @@ try {
   const okMode = (m) => ['race', 'pvp', 'coop'].includes(m);
   if (okMode(saved.mode)) picker.mode = saved.mode;
   if (okMode(qs.get('mode'))) picker.mode = qs.get('mode');
-  if (qs.has('autojoin')) setTimeout(() => $('joinForm').requestSubmit(), 0);
+  if (qs.has('spectate') && qs.get('room')) setTimeout(() => connect($('name').value.trim() || 'Spectator', qs.get('room'), { spectate: true }), 0);
+  else if (qs.has('autojoin')) setTimeout(() => $('joinForm').requestSubmit(), 0);
 } catch {}
 openPicker(false);
 
@@ -1627,7 +2053,15 @@ addEventListener('keydown', (e) => {
   if (!$('join').hidden) { if (e.code === 'Escape' && picker.edit) closePicker(); return; }
   if (typing()) return;
   keys.add(e.code);
+  if (spectating) {
+    if (e.code === 'ArrowLeft') cycleSpec(-1);
+    if (e.code === 'ArrowRight' || e.code === 'Tab') { e.preventDefault(); cycleSpec(1); }
+    return;
+  }
   if (e.code === 'Space') e.preventDefault();
+  const n = e.code.startsWith('Digit') ? +e.code.slice(5) : 0;
+  if (n >= 1 && n <= quickIds.length) sendQuick(quickIds[n - 1]);
+  if (e.code === 'KeyV') pingHere();
   if (e.code === 'KeyF') act('flag');
   if (e.code === 'KeyG') useItem();
   if (e.code === 'KeyR') attack();
@@ -1653,9 +2087,42 @@ canvas.addEventListener('wheel', (e) => {
   cam.dist = THREE.MathUtils.clamp(cam.dist * (1 + e.deltaY * 0.001), 7, 45);
 }, { passive: false });
 
+// ---------------------------------------------------------------- quick chat & pings
+function renderQuick() {
+  const box = $('quick');
+  const btns = quickIds.map((id, k) => {
+    const b = document.createElement('button'); b.type = 'button';
+    const kb = document.createElement('kbd'); kb.textContent = k + 1;
+    b.append(kb, QUICK[id]);
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); sendQuick(id); });
+    return b;
+  });
+  const ping = document.createElement('button'); ping.type = 'button'; ping.className = 'ping';
+  const kb = document.createElement('kbd'); kb.textContent = 'V'; ping.append(kb, '📍 Ping');
+  ping.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); pingHere(); });
+  box.replaceChildren(...btns, ping);
+}
+let lastChat = 0;
+function sendQuick(id) {
+  if (spectating || !myId || performance.now() - lastChat < 1000) return;
+  lastChat = performance.now();
+  send({ t: 'emote', id });
+  if (IS_TOUCH) $('quick').hidden = true;
+}
+function pingHere() {
+  if (spectating || !myId) return;
+  // ping the tile you're pointing at (touch: the tile you tapped, or the one marked for digging)
+  const t = IS_TOUCH ? (touchAim ? { x: touchAim[0], y: touchAim[1] } : digTarget()) : hover;
+  if (!t) return nag(IS_TOUCH ? 'Tap a tile first, then ping it.' : 'Point at a tile to ping it.');
+  if (performance.now() - lastChat < 1000) return;
+  lastChat = performance.now();
+  send({ t: 'ping', x: t.x, y: t.y });
+  if (IS_TOUCH) $('quick').hidden = true;
+}
+
 let lastTooFar = 0;
 function act(kind, target = hover) {
-  if (!$('join').hidden || !target || roundState !== 'playing' || me.stun > 0) return;
+  if (spectating || !$('join').hidden || !target || roundState !== 'playing' || me.stun > 0) return;
   if (!target.inReach) {
     if (performance.now() - lastTooFar > 1500) { lastTooFar = performance.now(); feed('Too far away. Walk next to that tile first.'); }
     return;
@@ -1721,6 +2188,7 @@ if (IS_TOUCH) {
   press('tAttack', () => attack());
   press('tUse', () => useItem());
   press('tJump', () => { jumpReq = true; });
+  press('tChat', () => { $('quick').hidden = !$('quick').hidden; });
   press('tFlag', () => { const t = digTarget(true); if (t) act('flag', t); else nag('Nothing to flag here. Walk next to a covered tile.'); });
   // Dig: digs the marked tile; hold it to keep digging as you walk
   let digTimer = 0;
@@ -1789,7 +2257,7 @@ if (IS_TOUCH) {
 
 let lastSwing = 0;
 function attack() {
-  if (!$('join').hidden || roundState !== 'playing' || me.stun > 0 || performance.now() - lastSwing < 450) return;
+  if (spectating || !$('join').hidden || roundState !== 'playing' || me.stun > 0 || performance.now() - lastSwing < 450) return;
   lastSwing = performance.now();
   swingFx(myId); sfx.whoosh();
   send({ t: 'attack' });
@@ -1804,7 +2272,7 @@ function nag(text) {
   if (performance.now() - lastTooFar > 1500) { lastTooFar = performance.now(); feed(text); }
 }
 function useItem() {
-  if (!$('join').hidden || roundState !== 'playing' || me.stun > 0) return;
+  if (spectating || !$('join').hidden || roundState !== 'playing' || me.stun > 0) return;
   const kind = heldKind(me.fx);
   if (!kind) return nag('You are not holding anything. Dig up power-ups and walk onto them!');
   if (kind === 'shockwave') return send({ t: 'use' });
@@ -1875,6 +2343,14 @@ function drawMinimap(now) {
     minimap.dirty = false;
   }
   g.drawImage(minimap.base, 0, 0);
+  g.fillStyle = '#ffc233';
+  for (const i of doors.keys()) g.fillRect((i % W) * S - 1, Math.floor(i / W) * S - 1, S + 2, S + 2);
+  g.fillStyle = '#8a1d1d';
+  for (const i of traps.keys()) g.fillRect((i % W) * S + S * 0.1, Math.floor(i / W) * S + S * 0.1, S * 0.8, S * 0.8);
+  for (const p of pings) {
+    const x = (p.x + 0.5) * S, y = (p.y + 0.5) * S, k = (now / 600) % 1;
+    g.strokeStyle = p.color; g.lineWidth = 2; g.beginPath(); g.arc(x, y, S * (1.5 + k * 3), 0, 7); g.stroke();
+  }
   for (const [i, it] of items) {
     g.fillStyle = ITEM_INFO[it.kind]?.css || '#fff';
     g.fillRect((i % W) * S + S * 0.2, Math.floor(i / W) * S + S * 0.2, S * 0.6, S * 0.6);
@@ -1900,6 +2376,80 @@ function lerpAngle(a, b, t) {
   return a + d * t;
 }
 
+// the parts of a frame shared by players and spectators
+function animateWorld(dt) {
+  const blink = Math.sin(elapsed * 6) > 0;
+  for (const c of craters.values()) c.userData.led.visible = blink;
+  for (const fn of worldTicks) fn(dt, elapsed, me);
+  updateBosses(dt);
+  updateTraps();
+  for (const d of doors.values()) {
+    const l = d.userData.lock;
+    l.rotation.y += dt * 1.2; l.position.y = WALL_H + 0.9 + Math.sin(elapsed * 2) * 0.15;
+  }
+  for (const it of items.values()) {
+    const u = it.mesh.userData;
+    if (u.pop < 1) { u.pop = Math.min(1, u.pop + dt * 3); it.mesh.scale.setScalar(u.pop); }
+    u.model.rotation.y += dt * 1.8;
+    u.model.position.y = 1.0 + Math.sin(elapsed * 2.5 + u.seed) * 0.15;
+  }
+  for (const [i, f] of flags) {
+    f.mesh.userData.cloth.rotation.y = Math.sin(elapsed * 3 + i) * 0.35;
+    if (f.mesh.userData.pop < 1) { f.mesh.userData.pop = Math.min(1, f.mesh.userData.pop + dt * 5); f.mesh.scale.setScalar(0.3 + 0.7 * f.mesh.userData.pop); }
+  }
+  if (radar) {
+    const left = (radar.until - performance.now()) / 1000;
+    if (left <= 0) clearRadar();
+    else radar.mat.opacity = (left < 1.5 ? left / 1.5 : 1) * (0.55 + Math.sin(elapsed * 6) * 0.2);
+  }
+  for (let i = effects.length - 1; i >= 0; i--) if (!effects[i](dt)) effects.splice(i, 1);
+}
+
+function updateCamera(dt) {
+  const d = cam.dist;
+  const target = new THREE.Vector3(me.x, me.y + 1.2, me.z);
+  const want = new THREE.Vector3(
+    me.x + Math.sin(cam.yaw) * Math.cos(cam.pitch) * d,
+    me.y + Math.sin(cam.pitch) * d,
+    me.z + Math.cos(cam.yaw) * Math.cos(cam.pitch) * d);
+  camera.position.lerp(want, 1 - Math.exp(-8 * dt));
+  if (cam.shake > 0) {
+    camera.position.x += (Math.random() - 0.5) * cam.shake;
+    camera.position.y += (Math.random() - 0.5) * cam.shake;
+    cam.shake = Math.max(0, cam.shake - dt * 2.5);
+  }
+  camera.lookAt(target);
+  sun.position.set(me.x + 30, 60, me.z + 18); sun.target.position.set(me.x, 0, me.z); sun.target.updateMatrixWorld();
+}
+
+function updateRemotes(dt) {
+  const k = 1 - Math.exp(-12 * dt);
+  for (const [id, p] of players) {
+    if (id === myId || Number.isNaN(p.x)) continue;
+    const ox = p.x, oz = p.z;
+    p.x += (p.tx - p.x) * k; p.z += (p.tz - p.z) * k;
+    p.r = lerpAngle(p.r, p.tr, k);
+    const g = groundAt(p.x, p.z); p.y += (g - p.y) * Math.min(1, dt * 20);
+    const sp = Math.hypot(p.x - ox, p.z - oz) / Math.max(dt, 1e-4);
+    p.av.group.position.set(p.x, p.y, p.z);
+    p.av.group.rotation.y = p.stun > 0 && !(p.fx & 8) && p.hp > 0 ? p.av.group.rotation.y + dt * 10 : p.r;
+    animateAvatar(p, p.av, sp, dt, p.stun > 0);
+  }
+}
+
+// spectators: the camera follows the watched player; nothing is sent to the server
+function spectatorFrame(dt) {
+  updateRemotes(dt);
+  const p = players.get(specTarget);
+  if (p && !Number.isNaN(p.x)) { me.x = p.x; me.z = p.z; me.y = p.y; }
+  animateWorld(dt);
+  updateCamera(dt);
+  highlight.visible = reachZone.visible = digMark.visible = false;
+  drawMinimap(performance.now());
+  if (roundState === 'over') $('nextIn').textContent = Math.max(0, Math.ceil((overEndsAt - performance.now()) / 1000));
+  renderer.render(scene, camera);
+}
+
 let sendTimer = 0, last = performance.now(), elapsed = 0;
 function frame(now) {
   requestAnimationFrame(frame);
@@ -1909,6 +2459,7 @@ function frame(now) {
   // --- local movement
   if (keys.has('KeyQ')) cam.yaw += dt * 2.2;
   if (keys.has('KeyE')) cam.yaw -= dt * 2.2;
+  if (spectating) { spectatorFrame(dt); return; }
   const fx = -Math.sin(cam.yaw), fz = -Math.cos(cam.yaw), rx = Math.cos(cam.yaw), rz = -Math.sin(cam.yaw);
   let mf = 0, mr = 0;
   if (keys.has('KeyW') || keys.has('ArrowUp')) mf += 1;
@@ -1953,58 +2504,9 @@ function frame(now) {
   sendTimer += dt;
   if (sendTimer > 1 / 15) { sendTimer = 0; send({ t: 'move', x: +me.x.toFixed(2), z: +me.z.toFixed(2), r: +me.r.toFixed(2) }); }
 
-  // --- remote players
-  const k = 1 - Math.exp(-12 * dt);
-  for (const [id, p] of players) {
-    if (id === myId || Number.isNaN(p.x)) continue;
-    const ox = p.x, oz = p.z;
-    p.x += (p.tx - p.x) * k; p.z += (p.tz - p.z) * k;
-    p.r = lerpAngle(p.r, p.tr, k);
-    const g = groundAt(p.x, p.z); p.y += (g - p.y) * Math.min(1, dt * 20);
-    const sp = Math.hypot(p.x - ox, p.z - oz) / Math.max(dt, 1e-4);
-    p.av.group.position.set(p.x, p.y, p.z);
-    p.av.group.rotation.y = p.stun > 0 && !(p.fx & 8) && p.hp > 0 ? p.av.group.rotation.y + dt * 10 : p.r;
-    animateAvatar(p, p.av, sp, dt, p.stun > 0);
-  }
-
-  // --- world animation
-  for (const [i, f] of flags) {
-    f.mesh.userData.cloth.rotation.y = Math.sin(elapsed * 3 + i) * 0.35;
-    if (f.mesh.userData.pop < 1) { f.mesh.userData.pop = Math.min(1, f.mesh.userData.pop + dt * 5); f.mesh.scale.setScalar(0.3 + 0.7 * f.mesh.userData.pop); }
-  }
-  const blink = Math.sin(elapsed * 6) > 0;
-  for (const c of craters.values()) c.userData.led.visible = blink;
-  for (const fn of worldTicks) fn(dt, elapsed, me);
-  updateBosses(dt);
-  for (const it of items.values()) {
-    const u = it.mesh.userData;
-    if (u.pop < 1) { u.pop = Math.min(1, u.pop + dt * 3); it.mesh.scale.setScalar(u.pop); }
-    u.model.rotation.y += dt * 1.8;
-    u.model.position.y = 1.0 + Math.sin(elapsed * 2.5 + u.seed) * 0.15;
-  }
-  if (radar) {
-    const left = (radar.until - performance.now()) / 1000;
-    if (left <= 0) clearRadar();
-    else radar.mat.opacity = (left < 1.5 ? left / 1.5 : 1) * (0.55 + Math.sin(elapsed * 6) * 0.2);
-  }
-  for (let i = effects.length - 1; i >= 0; i--) if (!effects[i](dt)) effects.splice(i, 1);
-
-  // --- camera
-  const d = cam.dist;
-  const target = new THREE.Vector3(me.x, me.y + 1.2, me.z);
-  const want = new THREE.Vector3(
-    me.x + Math.sin(cam.yaw) * Math.cos(cam.pitch) * d,
-    me.y + Math.sin(cam.pitch) * d,
-    me.z + Math.cos(cam.yaw) * Math.cos(cam.pitch) * d);
-  camera.position.lerp(want, 1 - Math.exp(-8 * dt));
-  if (cam.shake > 0) {
-    camera.position.x += (Math.random() - 0.5) * cam.shake;
-    camera.position.y += (Math.random() - 0.5) * cam.shake;
-    cam.shake = Math.max(0, cam.shake - dt * 2.5);
-  }
-  camera.lookAt(target);
-  sun.position.set(me.x + 30, 60, me.z + 18); sun.target.position.set(me.x, 0, me.z); sun.target.updateMatrixWorld();
-
+  updateRemotes(dt);
+  animateWorld(dt);
+  updateCamera(dt);
   updateHover();
   const [ptx, pty] = tileOf(me.x, me.z);
   reachZone.visible = inBoard(ptx, pty) && roundState === 'playing';
@@ -2066,7 +2568,8 @@ function frame(now) {
   $('invBoots').hidden = !(me.fx & 2); $('bootsLeft').textContent = secs(bootsUntil);
   $('invGold').hidden = !(me.fx & 4); $('goldLeft').textContent = secs(goldUntil);
   $('invRadar').hidden = !radar; $('radarLeft').textContent = radar ? secs(radar.until) : 0;
-  $('inventory').hidden = !(me.fx & 0xf7) && !radar;
+  $('invKey').hidden = !(me.fx & keyBit);
+  $('inventory').hidden = !(me.fx & (0xf7 | keyBit)) && !radar;
   $('stun').hidden = !(me.stun > 0);
   const koLeft = Math.max(0, Math.ceil((koUntil - performance.now()) / 1000));
   $('stun').textContent = me.hp === 0 ? `KNOCKED OUT · back in ${koLeft}` : me.fx & 8 ? 'FROZEN' : 'STUNNED';

@@ -15,6 +15,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 import layouts
+import store
 
 ROOT = Path(__file__).parent
 STATIC = ROOT / "static"
@@ -105,6 +106,41 @@ KO_REWARD = 20
 COOP_LIVES_BASE = 3           # team lives = this + 1 per player at round start (KOs cost one)
 COOP_BOSS_HP_PER_PLAYER = 0.5 # boss HP x (1 + this * (players - 1))
 
+# the dungeon vault: a side room sealed by a locked door (two door tiles across a corridor). A key is
+# buried somewhere else in the dungeon; whoever carries it to the door opens it for everyone and earns
+# VAULT_OPEN_REWARD. Inside wait a treasure chest (CHEST_POINTS) and extra loot. Door tiles are walls
+# until opened, so bosses, bots and flood fill all treat them as walls. Game-layer only (not ai/env.py).
+VAULT_MIN, VAULT_MAX = 24, 170   # floor tiles a vault may have
+VAULT_LOOT = 4                   # extra power-ups buried in the vault
+VAULT_OPEN_REWARD = 15
+CHEST_POINTS = 30
+KEY_BIT = 1 << 10                # fx bit: this player carries the key
+
+# spike traps: buried under safe tiles like power-ups. Once dug up they cycle up and down and hurt
+# anyone standing on them while they're up (shields absorb). Game-layer only (not ai/env.py).
+TRAP_DENSITY = 10 / 1024         # traps per floor tile
+SPIKE_CYCLE = 3.0                # seconds per up/down cycle
+SPIKE_UP = 1.1                   # seconds of each cycle the spikes are up
+SPIKE_DAMAGE = 15
+SPIKE_STUN = 0.4
+SPIKE_GRACE = 1.2                # seconds before the same player can be spiked again
+
+# the daily dungeon: room "daily-YYYY-MM-DD" (today, server time) has the same layout, mines, loot and
+# realm for everyone that day, and its results go on a leaderboard (store.Daily)
+DAILY_PREFIX = "daily-"
+
+# quick chat (the client holds the text for each id) and map pings
+QUICK_CHAT = ["help", "boss", "nice", "follow", "gg", "oops"]
+CHAT_COOLDOWN = 1.0
+
+# connection safety, for playing over the internet
+MAX_MSG_BYTES = 4096             # bigger WebSocket messages close the connection
+RATE_PER_SEC = 40                # messages per second per connection (moves are ~15/s)
+RATE_BURST = 80
+RATE_KICK = 400                  # messages dropped by the rate limit before the connection is closed
+RESUME_SECONDS = 45              # a dropped player can reconnect this long and keep their place
+MAX_SPECTATORS = 24
+
 COLORS = ["#ff5d5d", "#4fa3ff", "#ffd23f", "#4fd67a", "#c77dff", "#ff9f43",
           "#3ee6d6", "#ff6fb5", "#a3e635", "#f8fafc", "#94a3b8", "#fb7185"]
 # must match REALMS in static/realms.js; a room's realm is chosen by whoever creates it
@@ -132,15 +168,38 @@ def tile_center(x, y):
     return (x - W / 2 + 0.5) * TILE, (y - H / 2 + 0.5) * TILE
 
 
+class RateLimit:
+    """Token bucket: `rate` messages per second on average, bursts up to `burst`."""
+
+    def __init__(self, rate=RATE_PER_SEC, burst=RATE_BURST):
+        self.rate, self.burst, self.tokens, self.t = rate, burst, float(burst), time.monotonic()
+        self.dropped = 0
+
+    def allow(self):
+        now = time.monotonic()
+        self.tokens = min(self.burst, self.tokens + (now - self.t) * self.rate)
+        self.t = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        self.dropped += 1
+        return False
+
+
 class Player:
     is_bot = False
 
-    def __init__(self, ws, name, color, char="miner"):
+    def __init__(self, ws, name, color, char="miner", hat=""):
         self.id = secrets.token_hex(4)
+        self.token = secrets.token_urlsafe(18)   # lets this player reconnect (resume) after a drop
         self.ws = ws
         self.name = name
         self.color = color
         self.char = char
+        self.hat = hat
+        self.profile = None       # store.Profiles entry (humans with a profile token only)
+        self.round_id = 0
+        self.last_chat = 0.0
         self.score = 0
         self.x = random.uniform(-W * TILE / 2 + 2, W * TILE / 2 - 2)
         self.z = random.uniform(-H * TILE / 2 + 2, H * TILE / 2 - 2)
@@ -158,19 +217,30 @@ class Player:
         self.gold_until = 0.0
         self.frozen_until = 0.0
         self.throw_at = 0.0       # bots: when to try using the held item
+        self.key = False          # carrying the vault key
+        self.spike_until = 0.0    # spike traps can't hit again before this
 
     def fx(self, now):
-        """Status bits for the tick message: 1 shield, 2 boots, 4 gold rush, 8 frozen;
-        fx >> 4 is the index of the held item in HELD (0 = nothing)."""
+        """Status bits for the tick message: 1 shield, 2 boots, 4 gold rush, 8 frozen, KEY_BIT key;
+        (fx >> 4) & 15 is the index of the held item in HELD (0 = nothing)."""
         return ((1 if self.shield else 0) | (2 if now < self.boots_until else 0)
                 | (4 if now < self.gold_until else 0) | (8 if now < self.frozen_until else 0)
-                | (HELD.index(self.held) << 4 if self.held else 0))
+                | (HELD.index(self.held) << 4 if self.held else 0) | (KEY_BIT if self.key else 0))
 
     def tile(self):
         return (int((self.x / TILE) + W / 2), int((self.z / TILE) + H / 2))
 
     def roster(self):
-        return {"id": self.id, "name": self.name, "color": self.color, "char": self.char}
+        return {"id": self.id, "name": self.name, "color": self.color, "char": self.char, "hat": self.hat}
+
+
+class Spectator:
+    """Watches a room: receives every broadcast, can't act, isn't on the roster."""
+    is_bot = False
+
+    def __init__(self, ws, name):
+        self.id = "s" + secrets.token_hex(4)
+        self.ws, self.name = ws, name
 
 
 class NullWS:
@@ -222,22 +292,48 @@ class BotPlayer(Player):
         return {**super().roster(), "bot": True, "model": self.brain.name, "difficulty": self.difficulty}
 
 
+def today():
+    return time.strftime("%Y-%m-%d")
+
+
+def daily_name(date=None):
+    return DAILY_PREFIX + (date or today())
+
+
+def daily_realm(date):
+    return random.Random("realm-" + date).choice(REALM_IDS)
+
+
 class Room:
-    def __init__(self, name, realm="meadow", layout="dungeon", mode="race"):
+    def __init__(self, name, realm="meadow", layout="dungeon", mode="race", daily=None):
         self.name = name
+        self.daily = daily            # a date string for the daily dungeon, else None
+        if daily:                     # everyone gets the same race through the same dungeon today
+            realm, layout, mode = daily_realm(daily), "dungeon", "race"
         self.realm = realm if realm in REALM_IDS else random.choice(REALM_IDS)
         self.layout_kind = layout if layout in layouts.LAYOUTS else "dungeon"
         self.mode = mode if mode in MODES else "race"
         self.players: dict[str, Player] = {}
+        self.spectators: dict[str, Spectator] = {}
+        self.away: dict[str, tuple] = {}   # resume token -> (player, expires): dropped players who may reconnect
+        self.hold_until = time.time() + 60 # a new room (e.g. one the lab put bots in) waits for its first human
         self.round_task = None
         self.kos: list[str] = []
         self.new_round()
 
     # ---------- round lifecycle ----------
     def new_round(self):
-        # a fresh dungeon every round (the field is always the same square)
-        self.floor = layouts.make(self.layout_kind, W, H, field_size=(FIELD_SIZE, FIELD_SIZE))
+        # the daily dungeon replays one seeded layout all day; other dungeons are new every round
+        self.rng = random.Random("mf3d-" + self.daily) if self.daily else random.Random()
+        self.floor = layouts.make(self.layout_kind, W, H, rng=self.rng, field_size=(FIELD_SIZE, FIELD_SIZE))
         self.floor_tiles = [i for i in range(W * H) if self.floor[i]]
+        self.vault: set[int] = set()       # floor tiles behind the locked door
+        self.doors: list[int] = []         # the door tiles (walls while locked)
+        self.vault_open = True
+        if self.layout_kind == "dungeon":
+            self.setup_vault()
+        self.spawn_tiles = [i for i in self.floor_tiles if i not in self.vault]
+        self.traps: dict[int, float] = {}  # tile index -> spike phase offset (seconds)
         self.n_mines = round(MINE_DENSITY * len(self.floor_tiles))
         self.mines = None            # set of tile indices, generated on first dig
         self.counts = None
@@ -256,6 +352,145 @@ class Room:
         self.next_boss_at = time.time() + BOSS_FIRST_DELAY
         self.lives = COOP_LIVES_BASE + len(getattr(self, "players", {}) or {})
         self.failed = False
+
+    # ---------- the vault ----------
+    def setup_vault(self):
+        """Seal off a side room: find a straight cross-section of a 2-wide corridor whose removal cuts
+        a VAULT_MIN..VAULT_MAX tile region off from the rest of the dungeon (8-way, the way flood fill
+        spreads), and turn those two tiles into a locked door."""
+        cands = []
+        for i in self.floor_tiles:
+            x, y = i % W, i // W
+            if self.is_floor(x, y + 1) and not self.is_floor(x, y - 1) and not self.is_floor(x, y + 2):
+                cands.append((i, idx(x, y + 1)))        # across a horizontal corridor
+            if self.is_floor(x + 1, y) and not self.is_floor(x - 1, y) and not self.is_floor(x + 2, y):
+                cands.append((i, idx(x + 1, y)))        # across a vertical corridor
+        self.rng.shuffle(cands)
+        best = None
+        for cut in cands[:120]:
+            side = self._small_side(set(cut))
+            if side and (best is None or abs(len(side) - 70) < abs(len(best[1]) - 70)):
+                best = (cut, side)
+        if not best:
+            return
+        self.doors, self.vault = list(best[0]), best[1]
+        for d in self.doors:
+            self.floor[d] = 0
+        self.floor_tiles = [i for i in self.floor_tiles if i not in best[0]]
+        self.vault_open = False
+
+    def _small_side(self, cut):
+        """The region on one side of `cut`, if it is vault-sized and the cut really separates it."""
+        seeds = {j for c in cut for nx, ny in neighbors(c % W, c // W)
+                 if self.floor[j := idx(nx, ny)] and j not in cut}
+        for s in sorted(seeds):
+            seen, stack = {s}, [s]
+            while stack and len(seen) <= VAULT_MAX:
+                i = stack.pop()
+                for nx, ny in neighbors(i % W, i // W):
+                    j = idx(nx, ny)
+                    if self.floor[j] and j not in cut and j not in seen:
+                        seen.add(j)
+                        stack.append(j)
+            if VAULT_MIN <= len(seen) <= VAULT_MAX and not stack and not seeds <= seen:
+                return seen
+        return None
+
+    def locked_out(self, p, i):
+        """True if tile i is inside the locked vault and p is outside it."""
+        if self.vault_open or i not in self.vault:
+            return False
+        px, py = p.tile()
+        return not (0 <= px < W and 0 <= py < H) or idx(px, py) not in self.vault
+
+    async def check_doors(self):
+        """Open the vault when the key carrier reaches the door; re-bury a lost key."""
+        if self.vault_open or self.state != "playing" or self.mines is None:
+            return
+        holder = next((p for p in self.players.values() if p.key), None)
+        if holder:
+            hx, hy = holder.tile()
+            if not holder.ko_until and any(max(abs(d % W - hx), abs(d // W - hy)) <= 1 for d in self.doors):
+                await self.open_vault(holder)
+        elif "key" not in self.buried.values() and "key" not in self.items.values():
+            await self.bury_key()
+
+    async def bury_key(self):
+        spots = [i for i in self.spawn_tiles if i not in self.mines and not self.revealed[i]
+                 and i not in self.buried and i not in self.traps and i not in self.items]
+        if spots:
+            self.buried[self.rng.choice(spots)] = "key"
+            return
+        spots = [i for i in self.spawn_tiles if i not in self.mines and i not in self.items and i not in self.booms]
+        if spots:   # everything outside the vault is dug up: leave the key lying in the open
+            i = random.choice(spots)
+            self.items[i] = "key"
+            await self.broadcast({"t": "drop", "pid": None, "x": i % W, "y": i // W, "kind": "key"})
+
+    async def drop_key(self, q):
+        """q (knocked out or gone) drops the key where they stand, or on the nearest free floor tile."""
+        if not q.key:
+            return
+        q.key = False
+        x, y = q.tile()
+        spots = [(x, y)] if self.is_floor(x, y) else []
+        spots += [t for t in self.bfs((x, y), max_depth=3)] if self.is_floor(x, y) else []
+        spot = next((t for t in spots if idx(*t) not in self.items), None)
+        if spot is None:
+            await self.bury_key()
+            return
+        self.items[idx(*spot)] = "key"
+        await self.broadcast({"t": "drop", "pid": q.id, "x": spot[0], "y": spot[1], "kind": "key"})
+
+    async def open_vault(self, p):
+        self.vault_open = True
+        p.key = False
+        for d in self.doors:
+            self.floor[d] = 1
+        self.floor_tiles = sorted(self.floor_tiles + self.doors)
+        self.spawn_tiles = self.floor_tiles
+        self.safe_left += len(self.doors)       # door tiles are never mines
+        p.score += VAULT_OPEN_REWARD
+        await self.broadcast({"t": "door", "pid": p.id, "tiles": [[d % W, d // W] for d in self.doors],
+                              "reward": VAULT_OPEN_REWARD})
+        await self.open_tiles(p, [(d % W, d // W) for d in self.doors])
+
+    # ---------- spike traps ----------
+    def spikes_up(self, i, now):
+        return (now + self.traps[i]) % SPIKE_CYCLE < SPIKE_UP
+
+    async def spikes(self, now):
+        if self.state != "playing" or not self.traps:
+            return
+        for p in list(self.players.values()):
+            if p.ko_until or now < p.spike_until:
+                continue
+            x, y = p.tile()
+            i = y * W + x
+            if not (0 <= x < W and 0 <= y < H) or i not in self.traps or not self.revealed[i] or not self.spikes_up(i, now):
+                continue
+            p.spike_until = now + SPIKE_GRACE
+            shielded = self._absorb(p)
+            if not shielded:
+                p.stun_until = max(p.stun_until, now + SPIKE_STUN)
+                self.hurt(p, SPIKE_DAMAGE, now)
+            await self.broadcast({"t": "spike", "pid": p.id, "x": x, "y": y, "shielded": shielded,
+                                  "dmg": 0 if shielded else SPIKE_DAMAGE, "stun": 0 if shielded else SPIKE_STUN})
+            await self.flush_kos()
+
+    # ---------- profiles (stats that unlock hats) ----------
+    async def stat(self, p, best=None, **inc):
+        if p is None or not p.profile:
+            return
+        new = profiles.bump(p.profile, best=best, **inc)
+        if new:
+            await self.send_to(p, {"t": "profile", **store.public(p.profile), "new": new})
+
+    async def send_to(self, p, msg):
+        try:
+            await p.ws.send_str(json.dumps(msg, separators=(",", ":")))
+        except Exception:
+            pass
 
     @property
     def coop(self):
@@ -417,6 +652,7 @@ class Room:
             rewards[killer] = rewards.get(killer, 0) + BOSS_KILL_REWARD
         for pid, pts in rewards.items():
             self.players[pid].score += pts
+        await self.stat(self.players.get(killer), bosses=1)
         # loot: a potion plus two random power-ups on floor tiles around the boss
         bx, by_ = b.tile()
         spots = [(x, y) for x, y in self.bfs((bx, by_), max_depth=2)
@@ -466,7 +702,7 @@ class Room:
         """A random floor tile centre, preferring ones away from other players."""
         best = None
         for _ in range(12):
-            i = random.choice(self.floor_tiles)
+            i = random.choice(self.spawn_tiles)   # never inside the locked vault
             x, z = tile_center(i % W, i // W)
             d = min((math.hypot(x - q.x, z - q.z) for q in avoid), default=99)
             if best is None or d > best[0]:
@@ -482,15 +718,39 @@ class Room:
             p.tx, p.tz = p.x, p.z
 
     def generate(self, sx, sy):
+        rng = self.rng
         forbidden = {idx(sx, sy)} | {idx(nx, ny) for nx, ny in neighbors(sx, sy)}
-        candidates = [i for i in self.floor_tiles if i not in forbidden]
-        self.mines = set(random.sample(candidates, min(self.n_mines, len(candidates))))
+        if self.daily:
+            # the same mines for everyone today: lay them from the day's seed, then move any that fall
+            # in the first dig's 3x3 (the first dig is always safe) to other seeded spots
+            mines = set(rng.sample(self.floor_tiles, min(self.n_mines, len(self.floor_tiles))))
+            spare = [i for i in self.floor_tiles if i not in mines and i not in forbidden]
+            for m in sorted(mines & forbidden):
+                mines.discard(m)
+                mines.add(spare.pop(rng.randrange(len(spare))))
+            self.mines = mines
+        else:
+            candidates = [i for i in self.floor_tiles if i not in forbidden]
+            self.mines = set(rng.sample(candidates, min(self.n_mines, len(candidates))))
         self.recount()
-        safe = [i for i in candidates if i not in self.mines]
+        safe = [i for i in self.floor_tiles if i not in self.mines and i not in forbidden]
         n_items = min(len(safe), round(ITEM_DENSITY * len(self.floor_tiles)))
         pool = {k: w for k, w in ITEM_WEIGHTS.items() if not (self.coop and k == "scatter")}
-        kinds = random.choices(list(pool), weights=list(pool.values()), k=n_items)
-        self.buried = dict(zip(random.sample(safe, n_items), kinds))
+        kinds = rng.choices(list(pool), weights=list(pool.values()), k=n_items)
+        self.buried = dict(zip(rng.sample(safe, n_items), kinds))
+        free = [i for i in safe if i not in self.buried]
+        n_traps = min(len(free), round(TRAP_DENSITY * len(self.floor_tiles)))
+        self.traps = {i: round(rng.uniform(0, SPIKE_CYCLE), 2) for i in rng.sample(free, n_traps)}
+        if not self.vault_open:
+            # the treasure: a chest and extra loot inside the vault, and the key somewhere outside it
+            inside = [i for i in free if i in self.vault and i not in self.traps]
+            rng.shuffle(inside)
+            loot = ["chest"] + rng.choices([k for k in pool if k not in FOOD], k=VAULT_LOOT)
+            for i, k in zip(inside, loot):
+                self.buried[i] = k
+            outside = [i for i in free if i not in self.vault and i not in self.traps and i not in self.buried]
+            if outside:
+                self.buried[rng.choice(outside)] = "key"
 
     def recount(self):
         self.counts = [0] * (W * H)
@@ -517,6 +777,9 @@ class Room:
             "tiles": tiles,
             "flags": [[i % W, i // W, pid] for i, pid in self.flags.items()],
             "items": [[i % W, i // W, k] for i, k in self.items.items()],
+            "traps": [[i % W, i // W, ph] for i, ph in self.traps.items() if self.revealed[i]],
+            "doors": [] if self.vault_open else [[d % W, d // W] for d in self.doors],
+            "daily": self.daily,
             "minesLeft": self.mines_left(),
             "safeLeft": self.safe_left,
             "next": max(0, (self.round_ends_at or 0) - time.time()),
@@ -529,14 +792,16 @@ class Room:
     # ---------- messaging ----------
     async def broadcast(self, msg):
         data = json.dumps(msg, separators=(",", ":"))
-        dead = []
         for p in list(self.players.values()):
             try:
                 await p.ws.send_str(data)
             except Exception:
-                dead.append(p)
-        for p in dead:
-            self.players.pop(p.id, None)
+                pass    # a dead socket: its handler's cleanup moves the player to `away` for a resume
+        for s in list(self.spectators.values()):
+            try:
+                await s.ws.send_str(data)
+            except Exception:
+                self.spectators.pop(s.id, None)
 
     async def send_roster(self):
         await self.broadcast({"t": "roster", "players": [p.roster() for p in self.players.values()]})
@@ -548,7 +813,7 @@ class Room:
             return False
         if now - p.last_action < ACTION_COOLDOWN:
             return False
-        if not self.is_floor(x, y):
+        if not self.is_floor(x, y) or self.locked_out(p, idx(x, y)):
             return False
         # distance (in tiles) from the player's actual position to the target tile's centre;
         # a neighbouring tile's centre is at most REACH + 0.5 away from anywhere on the player's tile
@@ -592,7 +857,7 @@ class Room:
                 await self.explode(p, x, y)
                 return
 
-        opened, penalties, exposed = [], {}, []
+        opened, penalties, exposed, traps = [], {}, [], []
         queue = deque(starts)
         while queue:
             x, y = queue.popleft()
@@ -606,6 +871,8 @@ class Room:
             if kind:
                 self.items[i] = kind
                 exposed.append([x, y, kind])
+            if i in self.traps:
+                traps.append([x, y, self.traps[i]])
             owner = self.flags.pop(i, None)
             if owner:
                 penalties[owner] = penalties.get(owner, 0) + FLAG_WRONG
@@ -622,9 +889,10 @@ class Room:
                 self.players[pid].score += amt
         await self.broadcast({
             "t": "reveal", "pid": p.id, "tiles": opened,
-            "gain": gain, "penalties": penalties, "items": exposed,
+            "gain": gain, "penalties": penalties, "items": exposed, "traps": traps,
             "minesLeft": self.mines_left(), "safeLeft": self.safe_left,
         })
+        await self.stat(p, tiles=len(opened))
         if self.safe_left == 0:
             await self.end_round()
 
@@ -647,6 +915,8 @@ class Room:
             "t": "boom", "pid": p.id, "x": x, "y": y, "penalty": penalty, "shielded": shielded,
             "stun": stun, "damage": damage, "flagOwner": owner, "minesLeft": self.mines_left(),
         })
+        if not shielded:
+            await self.stat(p, mines=1)
         await self.flush_kos()
 
     # ---------- health ----------
@@ -677,6 +947,11 @@ class Room:
             pid, by, reward = self.kos.pop(0)
             await self.broadcast({"t": "ko", "pid": pid, "penalty": KO_PENALTY, "respawn": RESPAWN_SECONDS,
                                   "by": by, "reward": reward, "lives": self.lives if self.coop else None})
+            q = self.players.get(pid)
+            if q and q.key:
+                await self.drop_key(q)
+            if by:
+                await self.stat(self.players.get(by), kos=1)
         if self.coop and self.lives <= 0 and self.state == "playing":
             self.failed = True
             await self.end_round()
@@ -706,6 +981,15 @@ class Room:
                 continue
             del self.items[i]
             dur = 0
+            if kind == "key":
+                p.key = True
+                await self.broadcast({"t": "pickup", "pid": p.id, "x": x, "y": y, "kind": kind, "dur": 0})
+                continue
+            if kind == "chest":
+                p.score += CHEST_POINTS
+                await self.broadcast({"t": "pickup", "pid": p.id, "x": x, "y": y, "kind": kind, "dur": 0,
+                                      "points": CHEST_POINTS})
+                continue
             if kind in FOOD:
                 heal = min(FOOD[kind], MAX_HP - p.hp)
                 p.hp += heal
@@ -746,7 +1030,7 @@ class Room:
             await self.throw(p, x, y)
         elif p.held == "freeze" and dist <= FREEZE_RANGE:
             await self.freeze(p, cx, cz)
-        elif p.held == "blink" and dist <= BLINK_RANGE and self.is_floor(x, y):
+        elif p.held == "blink" and dist <= BLINK_RANGE and self.is_floor(x, y) and not self.locked_out(p, idx(x, y)):
             await self.blink(p, x, y)
 
     def _absorb(self, q):
@@ -861,6 +1145,7 @@ class Room:
             self.flags.pop(i, None)
             self.items.pop(i, None)
             self.buried.pop(i, None)
+            self.traps.pop(i, None)
         added = random.sample(area, min(SCATTER_MINES, len(area) - 1))
         self.mines.update(added)
         self.recount()
@@ -892,6 +1177,7 @@ class Room:
             "minesLeft": self.mines_left(), "safeLeft": self.safe_left,
         })
         await self.flush_kos()
+        await self.check_doors()    # a key caught in the blast is buried again somewhere else
         for b in list(self.bosses.values()):
             if max(abs(b.x - cx), abs(b.z - cz)) <= (r + 0.5) * TILE:
                 await self.damage_boss(b, BOSS_POWER_DAMAGE["scatter"], pid, stagger=1.2)
@@ -957,6 +1243,15 @@ class Room:
                         cx = None
                     if cx is not None:
                         continue
+            # heuristic (not learned): carry the vault key to the door
+            if p.key and not self.vault_open:
+                fronts = [t for d in self.doors for t in self.nb(d % W, d // W) if idx(*t) not in self.vault]
+                if fronts:
+                    goal = min(fronts, key=lambda t: max(abs(t[0] - x), abs(t[1] - y)))
+                    path = self.bfs((x, y), goal)
+                    if path:
+                        p.tx, p.tz = tile_center(*path[0])
+                        continue
             mates = [q for q in self.players.values() if q is not p and not q.ko_until]
             extra = None
             if v2:   # what a v2 model also sees: its health, the mode, teammates and the nearest boss
@@ -976,6 +1271,8 @@ class Room:
             if not self.is_floor(tx, ty):
                 continue
             if kind == "move":
+                if idx(tx, ty) in self.traps and self.revealed[idx(tx, ty)]:
+                    continue    # heuristic: bots keep off spike traps they can see
                 p.tx, p.tz = tile_center(tx, ty)
             elif kind == "dig":
                 await self.dig(p, tx, ty)
@@ -1025,6 +1322,19 @@ class Room:
             self.players[pid].score += b
         self.round_ends_at = time.time() + NEXT_ROUND_DELAY
         standings = sorted(self.players.values(), key=lambda q: -q.score)
+        duration = round(time.time() - self.started_at)
+        # stats for profiles (humans only) and the daily leaderboard
+        top = standings[0] if standings else None
+        for q in standings:
+            if q.is_bot:
+                continue
+            # a win: first place outright, against at least one other player (bots count)
+            won = not self.coop and len(standings) >= 2 and q is top and q.score > standings[1].score
+            if self.daily and not self.failed:
+                daily_board.record(self.daily, q.name, q.score, duration, q.char, q.color, len(standings))
+            await self.stat(q, best=q.score, rounds=1, flags=bonuses.get(q.id, 0) // FLAG_CORRECT,
+                            wins=int(won), coop_wins=int(self.coop and not self.failed),
+                            daily=int(bool(self.daily) and not self.failed))
         await self.broadcast({
             "t": "over",
             "mode": self.mode, "failed": self.failed,
@@ -1033,8 +1343,12 @@ class Room:
                          "flagBonus": bonuses.get(q.id, 0)} for q in standings],
             "mines": self.all_mines(),
             "next": NEXT_ROUND_DELAY,
-            "duration": round(time.time() - self.started_at),
+            "duration": duration,
+            "daily": self.daily,
         })
+        for q in standings:
+            if q.profile:   # the round's stats, so the hat picker is up to date
+                await self.send_to(q, {"t": "profile", **store.public(q.profile)})
         self.round_task = asyncio.create_task(self.restart_later())
 
     async def restart_later(self):
@@ -1046,6 +1360,7 @@ class Room:
             q.stun_until = 0
             q.hp, q.ko_until = MAX_HP, 0.0
             q.reset_items()
+            q.round_id = self.round_id
             self.place(q)   # the new layout has different floor, so everyone gets a fresh spawn
             spawns[q.id] = [round(q.x, 2), round(q.z, 2)]
         await self.broadcast({"t": "round", "snapshot": self.snapshot(), "spawns": spawns})
@@ -1073,13 +1388,85 @@ def pick_color(room, wanted, me=None):
     return next((c for c in COLORS if c not in used), random.choice(COLORS))
 
 
+def pick_hat(prof, hat):
+    return hat if isinstance(hat, str) and hat in store.unlocked(prof) else ""
+
+
+def welcome_msg(room, who, spectator=False):
+    return {
+        "t": "welcome", "id": who.id, "room": room.name, "spectator": spectator,
+        "token": None if spectator else who.token, "serverTime": time.time(),
+        "cfg": {"w": W, "h": H, "mines": room.n_mines, "tile": TILE, "reach": REACH, "realm": room.realm,
+                "mode": room.mode, "daily": room.daily,
+                "throwRange": THROW_RANGE, "scatterRadius": SCATTER_RADIUS, "bootsSpeed": BOOTS_SPEED,
+                "freezeRange": FREEZE_RANGE, "blinkRange": BLINK_RANGE, "shockRadius": SHOCK_RADIUS,
+                "held": HELD, "maxHp": MAX_HP, "keyBit": KEY_BIT, "spikeCycle": SPIKE_CYCLE, "spikeUp": SPIKE_UP,
+                "quick": QUICK_CHAT, "resumeSeconds": RESUME_SECONDS},
+        "spawn": [0, 0] if spectator else [who.x, who.z],
+        "snapshot": room.snapshot(),
+    }
+
+
+def make_room(room_name, data):
+    if room_name == daily_name():
+        return Room(room_name, daily=today())
+    return Room(room_name, data.get("realm"), data.get("layout"), data.get("mode"))
+
+
+async def close_room(room):
+    """Close a room: its round timer, its bots, and anyone still watching it."""
+    if room.round_task:
+        room.round_task.cancel()
+    if rooms.get(room.name) is room:
+        rooms.pop(room.name, None)
+    for s in list(room.spectators.values()):
+        await room.send_to(s, {"t": "error", "message": "That room has closed: everyone left."})
+        try:
+            await s.ws.close()
+        except Exception:
+            pass
+    room.spectators.clear()
+
+
+def has_humans(room):
+    """Should the room stay open? Yes while a human is in it, one may still reconnect, or it's brand new."""
+    return any(not p.is_bot for p in room.players.values()) or bool(room.away) or time.time() < room.hold_until
+
+
+async def resume(room, token, ws):
+    """Give a reconnecting player their place back: same id, score, health and items.
+    Works whether the old connection is already gone (`away`) or not yet noticed as dead."""
+    entry = room.away.pop(token, None)
+    p = entry[0] if entry else next((q for q in room.players.values() if not q.is_bot and q.token == token), None)
+    if p is None:
+        return None
+    old, p.ws = p.ws, ws
+    if old is not ws and entry is None:
+        asyncio.create_task(old.close())     # the stale connection: its cleanup sees it was replaced
+    if p.color in {q.color for q in room.players.values() if q is not p}:
+        p.color = pick_color(room, None)
+    if p.round_id != room.round_id:          # a new round started while they were away
+        p.score, p.hp, p.ko_until, p.stun_until = 0, MAX_HP, 0.0, 0.0
+        p.reset_items()
+        p.round_id = room.round_id
+        room.place(p)
+    room.players[p.id] = p
+    return p
+
+
 async def ws_handler(request):
-    ws = web.WebSocketResponse(heartbeat=20)
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_BYTES)
     await ws.prepare(request)
-    room = player = None
+    room = player = watcher = None
+    bucket = RateLimit()
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
+                continue
+            if not bucket.allow():
+                if bucket.dropped > RATE_KICK:   # flooding: disconnect
+                    await ws.close(code=1008, message=b"too many messages")
+                    break
                 continue
             try:
                 data = json.loads(msg.data)
@@ -1087,38 +1474,75 @@ async def ws_handler(request):
             except Exception:
                 continue
 
-            if t == "join" and player is None:
+            if t == "join" and player is None and watcher is None:
                 room_name = clean(data.get("room"), 24, "lobby").lower()
                 existing = rooms.get(room_name)
-                if existing and len(existing.players) >= MAX_PLAYERS:
-                    await ws.send_str(json.dumps({"t": "error", "message": f"Room “{room_name}” is full ({MAX_PLAYERS} players). Pick another one."}))
+                if data.get("spectate"):
+                    if not existing:
+                        await ws.send_str(json.dumps({"t": "error", "message": f"There's no open room called “{room_name}” to watch."}))
+                        continue
+                    if len(existing.spectators) >= MAX_SPECTATORS:
+                        await ws.send_str(json.dumps({"t": "error", "message": f"Room “{room_name}” already has {MAX_SPECTATORS} spectators."}))
+                        continue
+                    room, watcher = existing, Spectator(ws, clean(data.get("name"), 16, "Spectator"))
+                    room.spectators[watcher.id] = watcher
+                    await ws.send_str(json.dumps(welcome_msg(room, watcher, spectator=True)))
+                    await room.send_to(watcher, {"t": "roster", "players": [p.roster() for p in room.players.values()]})
                     continue
-                room = existing or rooms.setdefault(
-                    room_name, Room(room_name, data.get("realm"), data.get("layout"), data.get("mode")))
+                if existing and isinstance(data.get("resume"), str):
+                    player = await resume(existing, data["resume"], ws)
+                    if player:
+                        room = existing
+                        await ws.send_str(json.dumps({**welcome_msg(room, player), "resumed": True}))
+                        if player.profile:
+                            await room.send_to(player, {"t": "profile", **store.public(player.profile)})
+                        await room.send_roster()
+                        continue
+                if existing and len(existing.players) >= MAX_PLAYERS:
+                    await ws.send_str(json.dumps({"t": "error", "full": True, "message": f"Room “{room_name}” is full ({MAX_PLAYERS} players). You can watch it instead."}))
+                    continue
+                room = existing or rooms.setdefault(room_name, make_room(room_name, data))
                 color = pick_color(room, data.get("color"))
-                player = Player(ws, clean(data.get("name"), 16, "Sweeper"), color, pick_char(data.get("char")))
+                name = clean(data.get("name"), 16, "Sweeper")
+                prof = profiles.get(data.get("profile"), name)
+                player = Player(ws, name, color, pick_char(data.get("char")), pick_hat(prof, data.get("hat")))
+                player.profile, player.round_id = prof, room.round_id
                 room.place(player)
                 room.players[player.id] = player
                 if room.coop and room.state == "playing":
                     room.lives += 1          # every teammate brings a life to the shared pool
-                await ws.send_str(json.dumps({
-                    "t": "welcome", "id": player.id, "room": room.name,
-                    "cfg": {"w": W, "h": H, "mines": room.n_mines, "tile": TILE, "reach": REACH, "realm": room.realm,
-                            "mode": room.mode,
-                            "throwRange": THROW_RANGE, "scatterRadius": SCATTER_RADIUS, "bootsSpeed": BOOTS_SPEED,
-                            "freezeRange": FREEZE_RANGE, "blinkRange": BLINK_RANGE, "shockRadius": SHOCK_RADIUS,
-                            "held": HELD, "maxHp": MAX_HP},
-                    "spawn": [player.x, player.z],
-                    "snapshot": room.snapshot(),
-                }))
+                await ws.send_str(json.dumps(welcome_msg(room, player)))
+                if prof:
+                    await room.send_to(player, {"t": "profile", **store.public(prof)})
                 await room.send_roster()
             elif player is None:
-                continue
-            elif t == "look":  # change name / character / colour mid-game
+                continue                     # spectators (and not-yet-joined sockets) can't act
+            elif t == "look":  # change name / character / colour / hat mid-game
                 player.name = clean(data.get("name"), 16, player.name)
                 player.char = pick_char(data.get("char"))
                 player.color = pick_color(room, data.get("color"), me=player)
+                player.hat = pick_hat(player.profile, data.get("hat"))
+                if player.profile:
+                    player.profile["name"] = player.name
                 await room.send_roster()
+            elif t in ("emote", "ping"):
+                now = time.time()
+                if now - player.last_chat < CHAT_COOLDOWN:
+                    continue
+                if t == "emote":
+                    if data.get("id") not in QUICK_CHAT:
+                        continue
+                    out = {"t": "emote", "pid": player.id, "id": data["id"]}
+                else:
+                    try:
+                        x, y = int(data["x"]), int(data["y"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not (0 <= x < W and 0 <= y < H):
+                        continue
+                    out = {"t": "ping", "pid": player.id, "x": x, "y": y}
+                player.last_chat = now
+                await room.broadcast(out)
             elif t == "move":
                 if time.time() < getattr(player, "move_lock", 0):
                     continue
@@ -1148,14 +1572,16 @@ async def ws_handler(request):
                     continue
                 await room.use(player, x, y)
     finally:
-        if room and player:
+        if room and watcher:
+            room.spectators.pop(watcher.id, None)
+        # skip if this connection was replaced by a resume (the player now lives on the new one)
+        if room and player and player.ws is ws and room.players.get(player.id) is player:
             room.players.pop(player.id, None)
-            if any(not p.is_bot for p in room.players.values()):
-                await room.send_roster()
-            else:  # last human left: close the room (its bots go with it)
-                if room.round_task:
-                    room.round_task.cancel()
-                rooms.pop(room.name, None)
+            await room.drop_key(player)
+            # keep their place for a while in case they reconnect; the room closes (with its bots) once
+            # no humans are left and nobody can still come back (see tick_loop)
+            room.away[player.token] = (player, time.time() + RESUME_SECONDS)
+            await room.send_roster()
     return ws
 
 
@@ -1179,13 +1605,33 @@ def lobby_summary():
             "progress": round(done / total, 3) if total else 0,
             "bosses": len(r.bosses), "lives": r.lives if r.coop else None,
             "age": round(time.time() - r.started_at),
+            "spectators": len(r.spectators), "away": len(r.away), "daily": bool(r.daily),
+            "vault": None if not r.doors else ("open" if r.vault_open else "locked"),
         })
     out.sort(key=lambda d: (-d["humans"], d["name"]))
     return out
 
 
+NO_STORE = {"Cache-Control": "no-store"}
+
+
 async def api_rooms(_):
-    return web.json_response({"rooms": lobby_summary()}, headers={"Cache-Control": "no-store"})
+    return web.json_response({"rooms": lobby_summary()}, headers=NO_STORE)
+
+
+async def api_daily(_):
+    d = today()
+    return web.json_response({"date": d, "room": daily_name(d), "realm": daily_realm(d), **daily_board.board(d)},
+                             headers=NO_STORE)
+
+
+async def api_profile(request):
+    """A profile's stats and hat unlocks, for its owner's join screen (the token is the key)."""
+    return web.json_response(store.public(profiles.peek(request.query.get("token"))), headers=NO_STORE)
+
+
+profiles = store.Profiles(store.DATA / "profiles.json")
+daily_board = store.Daily(store.DATA / "daily.json")
 
 
 # ---------------------------------------------------------------- bots (used by the lab)
@@ -1230,12 +1676,22 @@ async def remove_bot(room_name, bot_id):
 
 async def tick_loop(app):
     async def loop():
-        last = time.time()
+        last = saved = time.time()
         while True:
             await asyncio.sleep(1 / TICK_HZ)
             now = time.time()
             dt, last = now - last, now
+            if now - saved > 10:
+                saved = now
+                profiles.save()
+                daily_board.save()
             for room in list(rooms.values()):
+                for token, (_, until) in list(room.away.items()):
+                    if now >= until:
+                        del room.away[token]
+                if not has_humans(room):   # last human gone for good: close it (its bots go with it)
+                    await close_room(room)
+                    continue
                 if not room.players:
                     continue
                 try:
@@ -1244,6 +1700,8 @@ async def tick_loop(app):
                     print("bot error:", repr(e))
                 await room.update_bosses(now, dt)
                 await room.pickups(now)
+                await room.check_doors()
+                await room.spikes(now)
                 await room.respawns(now)
                 await room.broadcast({"t": "players", "p": [
                     [p.id, round(p.x, 2), round(p.z, 2), round(p.rot, 2), p.score,
@@ -1253,24 +1711,29 @@ async def tick_loop(app):
     task = asyncio.create_task(loop())
     yield
     task.cancel()
+    profiles.save()
+    daily_board.save()
 
 
 async def index(_):
     return web.FileResponse(STATIC / "index.html")
 
 
-def make_app():
+def make_app(lab=True):
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/api/rooms", api_rooms)
+    app.router.add_get("/api/daily", api_daily)
+    app.router.add_get("/api/profile", api_profile)
     app.router.add_static("/static", STATIC)
     app.cleanup_ctx.append(tick_loop)
-    try:
-        from ai.lab import Lab
-        Lab(STATIC, rooms_summary, add_bot, remove_bot, sorted(CHARACTER_IDS)).setup(app)
-    except ImportError as e:
-        print(f"AI lab disabled ({e}). Install it with: .venv\\Scripts\\pip install -r requirements-ai.txt")
+    if lab:
+        try:
+            from ai.lab import Lab
+            Lab(STATIC, rooms_summary, add_bot, remove_bot, sorted(CHARACTER_IDS)).setup(app)
+        except ImportError as e:
+            print(f"AI lab disabled ({e}). Install it with: .venv\\Scripts\\pip install -r requirements-ai.txt")
     return app
 
 

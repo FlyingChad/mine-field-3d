@@ -206,6 +206,53 @@ body.touch .center { padding: 18px; }
 }
 @keyframes pulse { to { opacity: .45; transform: translate(-50%, -50%) scale(1.06); } }
 
+/* daily dungeon card on the join screen */
+.daily { display: grid; gap: 8px; padding: 12px 14px; margin-bottom: 14px; border-radius: 12px;
+  background: linear-gradient(135deg, rgba(255,194,51,.13), rgba(199,125,255,.10)); border: 1px solid rgba(255,210,63,.35); }
+.daily .dHead { display: flex; align-items: center; gap: 12px; }
+.daily .dHead > div { flex: 1; }
+.daily .lbl { margin: 0; color: #ffd23f; }
+.daily .dSub { font-size: 12px; color: #c6d1de; margin-top: 2px; }
+.daily button { font-size: 13px; font-weight: 800; padding: 8px 14px; border-radius: 9px; border: 0; background: #ffd23f; color: #1a1400; white-space: nowrap; }
+.daily .dBoards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.daily .dT { font-size: 11px; color: #a9b6c7; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
+.daily ol { font-size: 12px; gap: 2px; }
+.daily ol li .sw { width: 9px; height: 9px; border-radius: 3px; }
+.daily ol li .sc { color: #fff; }
+.daily ol li.empty { color: #8fa0b4; }
+.roomCard .chips .daily { background: #8a6a12; color: #fff3c4; }
+.roomCard .btns { display: flex; gap: 6px; }
+.roomCard button.watch { background: transparent; color: #c6d1de; border: 1px solid #2c3e55; }
+.roomCard button.watch:hover { border-color: #ffd23f; color: #fff; }
+
+/* hats */
+.hats { display: flex; flex-wrap: wrap; gap: 6px; }
+.hats button { display: grid; justify-items: center; gap: 2px; width: 64px; padding: 4px 2px; border: 2px solid transparent; border-radius: 10px;
+  background: #0b1522; color: #c6d1de; font-size: 10px; }
+.hats button img { width: 40px; height: 40px; }
+.hats button .none { width: 40px; height: 40px; display: grid; place-items: center; font-size: 20px; color: #6f8197; }
+.hats button.sel { border-color: #ffd23f; color: #fff; }
+.hats button:disabled { cursor: not-allowed; opacity: .45; }
+.hats button:disabled img { filter: grayscale(1) brightness(.5); }
+.hats button .prog { font-size: 9px; color: #8fa0b4; }
+.myStats { font-size: 12px; color: #a9b6c7; }
+.myStats b { color: #fff; }
+
+/* quick chat, spectating, reconnecting */
+.quick { left: 50%; bottom: 74px; transform: translateX(-50%); display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; padding: 8px; }
+.quick button { font-size: 13px; padding: 6px 10px; border-radius: 8px; border: 1px solid #2c3e55; background: #0b1522; color: #fff; }
+.quick button kbd { font: 700 10px system-ui; color: #ffd23f; margin-right: 4px; }
+.quick button.ping { border-color: #ffd23f; }
+.specBar { left: 50%; top: 16px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 8px 12px; }
+.specBar .lbl { margin: 0; }
+.specBar b { font-size: 16px; }
+.specBar button.small { margin: 0; }
+body.spectating #stats .hp, body.spectating #inventory, body.spectating #lookBtn, body.spectating #touch,
+body.spectating #help, body.spectating #stun { display: none !important; }
+.reconnect { left: 50%; top: 40%; transform: translate(-50%, -50%); font-size: 16px; font-weight: 700; color: #ffd23f; }
+#tChat { right: 176px; bottom: 70px; }
+@media (max-width: 720px) { .daily .dBoards { grid-template-columns: 1fr; } .daily .dHead { flex-wrap: wrap; } }
+
 #results ol { margin: 0 0 16px; text-align: left; font-size: 16px; }
 #results ol li { padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,.04); }
 #results ol li .sw { width: 12px; height: 12px; border-radius: 4px; flex: none; }

@@ -6,7 +6,8 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
 
 - Windows: `start.bat` (creates `.venv` and installs `aiohttp` on first run), or `.venv\Scripts\python server.py --port 8080`
 - Open http://localhost:8080. `?room=x&name=y&char=wizard&realm=moon&layout=dungeon&autojoin=1` skips the join screen, which is useful for testing.
-- Node is **not** installed on this machine. Python 3.11 is. There is no JS build step: the client is plain ES modules, and Three.js 0.160.0 comes from the jsDelivr CDN through an importmap in `static/index.html`.
+- Node is **not** installed on this machine. Python 3.11 is. There is no JS build step: the client is plain ES modules, and Three.js 0.160.0 is bundled at `static/vendor/three.module.js` (MIT, self-contained), mapped through an importmap in `static/index.html`.
+- Tests: `.venv\Scripts\python -m unittest discover -s tests` (stdlib unittest; pytest is not installed). Runs in a few seconds.
 
 ## Layout
 
@@ -34,10 +35,41 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
   - `damage_boss` → `boss_down`: rewards, loot (items may sit on unrevealed tiles) and a respawn timer.
   - Bosses ride in the 15 Hz `players` message as `b` rows. Bot heuristics: swing at bosses in range, and treat bosses as targets in `bot_use`.
   - Not in `ai/env.py`.
+- **The vault** (`VAULT_*`, `CHEST_POINTS`, `KEY_BIT`; dungeon layouts only):
+  - `Room.setup_vault()` runs in `new_round()`. It finds a straight 2-tile cross-section of a corridor whose removal cuts off a `VAULT_MIN..VAULT_MAX` region (8-way, the way flood fill spreads; `_small_side`). Those two tiles become `room.doors`, which are **walls** (`floor = 0`) while locked; the region is `room.vault`.
+  - Because doors are walls, bosses, bots (`floor`), flood fill and movement all treat them as walls with no special cases. `room.spawn_tiles` excludes the locked vault. Use it, not `floor_tiles`, for spawns.
+  - `locked_out(p, i)` stops digging, flagging or blinking into the vault from outside (`can_act`, `use`).
+  - `generate()` buries a `chest` plus `VAULT_LOOT` items inside, and one `key` outside. `key` and `chest` are item kinds that are not in `ITEM_WEIGHTS`.
+  - Key pickup sets `p.key` (fx `KEY_BIT`). `check_doors()` runs every tick: the carrier within 1 tile of a door → `open_vault()`. That makes the doors floor, adds them to `floor_tiles` and `safe_left`, broadcasts `door`, then reveals them with `open_tiles` (flood into the vault).
+  - A KO or disconnect calls `drop_key()`. A lost key (scatter) is re-buried by `check_doors()` → `bury_key()`, so the round can always finish.
+  - Bot heuristic: a bot carrying the key BFS-walks to the door.
+  - Not in `ai/env.py`.
+- **Spike traps** (`TRAP_*`, `SPIKE_*`): `room.traps` maps tile → phase offset, placed in `generate()` on safe tiles without items.
+  - They're announced when revealed (`reveal.traps`, `snapshot.traps`), and spikes are up when `(now + phase) % SPIKE_CYCLE < SPIKE_UP`.
+  - `Room.spikes(now)` runs every tick: `hurt()` + stun, with a shield absorbing it and `SPIKE_GRACE` per player. Scatter removes traps in its area.
+  - The client animates them from server time (`serverTime` in `welcome` → `serverNow()`).
+  - Bots won't step onto revealed traps. Not in `ai/env.py`.
+- **Daily dungeon:** room name `daily_name()` = `daily-YYYY-MM-DD` (server's local date) → `make_room` creates `Room(daily=date)`.
+  - Forced race / dungeon / `daily_realm(date)`. `self.rng` is `random.Random("mf3d-" + date)` and is re-seeded every round, so layout, vault, mines, items and traps match for everyone. Mines that fall in the first dig's 3×3 are moved with the same rng.
+  - Use `self.rng` (not `random`) for anything that should match in the daily.
+  - `end_round` records humans in `store.Daily` when not failed. `GET /api/daily` serves the board (best score and fastest clear per name).
+- **Profiles and hats** (`store.py`): the browser sends `profile` (32-hex token kept in localStorage; never broadcast) on join.
+  - `profiles.get()` creates the entry, and `Room.stat(p, **inc)` bumps it, from `open_tiles` (tiles), `explode` (mines), `boss_down` (bosses), `flush_kos` (PvP kos) and `end_round` (rounds, wins, flags, coop_wins, daily, best).
+  - Unlocks are sent as `profile {stats, unlocked, hats, new?}` to that player only.
+  - `store.HATS` (server, decides unlocks) and `static/hats.js` `HATS` (models) must match. `pick_hat` refuses locked hats, and the hat is in roster entries.
+  - Files: `data/profiles.json` and `data/daily.json` (or `$MF3D_DATA`), saved atomically every 10 s and on shutdown; `data/` is gitignored.
+- **Connection safety / resume / spectators** (`ws_handler`):
+  - Every connection has a `RateLimit` token bucket (`RATE_*`); `RATE_KICK` dropped messages closes it with code 1008. `max_msg_size=MAX_MSG_BYTES` closes oversized messages with 1009.
+  - Each `Player` has a `token` (sent only in its `welcome`). On disconnect the player moves to `room.away[token]` for `RESUME_SECONDS`, and `join {resume: token}` → `resume()` restores the same object (id, score, HP, items), resetting it if a new round started meanwhile (`p.round_id`).
+  - A resume while the old socket is still open replaces it, and the old handler's cleanup is skipped because `player.ws is not ws`.
+  - `broadcast` never removes players (the handler's cleanup does). Rooms close in `tick_loop` once `has_humans()` is false: no humans, nobody in `away`, and past `hold_until` (60 s grace for brand-new rooms, e.g. ones the lab put bots in).
+  - `join {spectate: true}` adds a `Spectator` to `room.spectators`. Spectators get every broadcast, aren't on the roster, and can't act. The client runs `spectatorFrame` and follows `specTarget`.
+- **Quick chat and pings:** `emote {id}` (id in `QUICK_CHAT`; the client has the text in `QUICK`) and `ping {x, y}` are broadcast as-is, limited by `CHAT_COOLDOWN` per player. There's deliberately no free-text chat.
 - **Lobby:** `GET /api/rooms` (`lobby_summary()`) lists open rooms with public info only: name, mode, layout, realm, state, player names, colours and scores, progress, bosses and lives.
   - The join screen polls it every 3 s while open (`refreshLobby` / `renderLobby` in game.js). Join buttons fill the room field and submit.
   - Typing an open room's name shows `#roomNote` and dims the new-room settings, since those only apply when creating a room.
-  - Rooms close when their last human leaves. Joining a room with `MAX_PLAYERS` players gets `error {message}`; the client closes the socket and shows the message.
+  - Rooms close `RESUME_SECONDS` after their last human leaves (see resume above). Joining a room with `MAX_PLAYERS` players gets `error {message, full}`; the client closes the socket and shows the message (rooms can still be watched).
+  - Lobby entries also carry `spectators`, `away`, `daily` and `vault` (null / "locked" / "open"). The join screen also shows the daily card (`renderDaily`, polls `/api/daily` every 15 s) and a Watch button per room.
 - **Game modes** (`Room.mode`, `MODES`; chosen by the room's creator like realm and layout):
   - `race` is the original game.
   - `pvp`: `Room.attack` also hits players (`PVP_MELEE_*`), and `hurt(..., by=)` credits `KO_REWARD` to whoever caused the knockout.
@@ -89,7 +121,9 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
     - on the client, `ITEM_INFO`, `itemModel()` and a message handler in game.js, plus an fx bit if other players need to see its effect.
   - Power-ups are **not** simulated in `ai/env.py`. Bots pick them up by walking over them and use them through the heuristics in `Room.bot_use`.
 - `static/characters.js`: 18 procedurally built characters, including dragon, mech, alien, viking, skeleton and bee. Each one is a `build(color)` that returns `{root, upper, feet, top, tick?}`. The player's colour is the character's accent.
-- `static/index.html`, `static/style.css`: the join/picker panel, HUD and results overlay.
+- `static/hats.js`: unlockable hats (`buildHat(id, color)`, `HAT_HEIGHT`). A hat sits on the character's `upper` at `top`, and `makeAvatar` raises the name tag, health bar and held item by `HAT_HEIGHT`.
+- `store.py`: `Profiles` and `Daily` JSON stores (see Profiles and the daily dungeon above).
+- `static/index.html`, `static/style.css`: the join/picker panel (daily card, lobby, hats, stats), HUD (quick-chat bar, spectator bar, reconnect banner) and results overlay.
 
 ## AI opponents (neuroevolution) — `ai/`
 
@@ -138,12 +172,14 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
 ## WebSocket protocol (JSON, field `t` is the type)
 
 Roster entries for bots also carry `bot: true, model, difficulty`.
-Client → server: `join {name, room, char, color, realm, layout, mode}`, `move {x, z, r}` (about 15 Hz), `dig {x, y}`, `flag {x, y}`, `attack`, `use {x, y}` (held item; `throw` is an old alias), `look {name, char, color}`.
+Client → server: `join {name, room, char, color, realm, layout, mode, hat, profile, resume?, spectate?}`, `move {x, z, r}` (about 15 Hz), `dig {x, y}`, `flag {x, y}`, `attack`, `use {x, y}` (held item; `throw` is an old alias), `look {name, char, color, hat}`, `emote {id}`, `ping {x, y}`.
 Server → client:
-- `error {message}` (join refused, e.g. room full)
-- `welcome {id, room, cfg:{…, realm, throwRange, scatterRadius, bootsSpeed, freezeRange, blinkRange, shockRadius, held, maxHp}, spawn, snapshot}` (the snapshot includes `layout` (W*H string of 0/1), `layoutKind` and `items:[[x,y,kind]]`)
-- `roster {players:[{id,name,color,char}]}`
-- `players {p:[[id,x,z,rot,score,stunLeft,fx,hp]]}` (15 Hz tick; `fx` bits: 1 shield, 2 boots, 4 gold rush, 8 frozen; `fx >> 4` is the index of the held item in `cfg.held`)
+- `error {message, full?}` (join refused, e.g. room full, or nothing to watch)
+- `welcome {id, room, spectator, token, resumed?, serverTime, cfg:{…, realm, mode, daily, throwRange, scatterRadius, bootsSpeed, freezeRange, blinkRange, shockRadius, held, maxHp, keyBit, spikeCycle, spikeUp, quick, resumeSeconds}, spawn, snapshot}` (the snapshot includes `layout` (W*H string of 0/1), `layoutKind`, `items:[[x,y,kind]]`, `traps:[[x,y,phase]]`, `doors:[[x,y]]` (empty once open) and `daily`)
+- `roster {players:[{id,name,color,char,hat}]}`
+- `profile {stats, unlocked, hats, new?}` (only to its owner)
+- `emote {pid, id}`, `ping {pid, x, y}`, `door {pid, tiles, reward}` (followed by a `reveal`), `drop {pid|null, x, y, kind}` (the key), `spike {pid, x, y, shielded, dmg, stun}`
+- `players {p:[[id,x,z,rot,score,stunLeft,fx,hp]]}` (15 Hz tick; `fx` bits: 1 shield, 2 boots, 4 gold rush, 8 frozen, `KEY_BIT` (1024) carrying the key; `(fx >> 4) & 15` is the index of the held item in `cfg.held`)
 - the `players` message also has `b:[[id,kind,x,z,rot,hp,maxHp,state]]` (state 0 wander, 1 chase, 2 wind-up, 3 frozen, 4 stunned)
 - `bossSpawn {id, kind, name, x, z}`, `bossAtk {id, x, z, r, t0}` (wind-up telegraph), `bossSmash {id, x, z, r, hit, shielded, damage, stun}`, `bossHit {id, by, dmg, hp, x, z}`, `bossDown {id, name, killer, x, z, loot:[[x,y,kind]], rewards:{pid:pts}}`, `swing {pid}`
 - `ko {pid, penalty, respawn, by, reward, lives}` (`by`/`reward` in PvP, `lives` in co-op), `respawn {pid, x, z, hp}`, `hitPlayer {pid, target, shielded, dmg, x, z}` (PvP melee)
@@ -161,7 +197,12 @@ Server → client:
 
 ## Testing
 
-There is no test suite in the repo yet. What has worked so far:
+`tests/` holds the suite, run with `.venv\Scripts\python -m unittest discover -s tests`. It uses stdlib unittest.
+- `helpers.py` points `MF3D_DATA` at a temp folder before importing `server`. It also provides `FakeWS`, `player()`, `at()`, `field_room()` (a whole-grid field, so fixed coordinates are valid) and `vault_room()`.
+- `test_rules.py` covers the core rules. `test_features.py` covers the vault, traps, daily, profiles and the protocol, using an in-process `aiohttp.test_utils.TestServer` with `make_app(lab=False)`.
+- `test_env.py` covers `ai/env.py` on the CPU, plus an in-game bot. It's skipped without torch.
+- When reading from a socket in tests, remember the 15 Hz `players` tick never stops: wait for a specific message type, or collect for a fixed time window.
+- Add tests there for new rules. Other techniques:
 - Drive `server.Room` directly from a Python script with a fake websocket (an object with an async `send_str`) to test rules, reach and the round lifecycle.
 - Use `aiohttp` client scripts as bots for end-to-end protocol checks.
 - For visual checks, use headless Chrome: `chrome.exe --headless=new --use-angle=swiftshader --enable-unsafe-swiftshader --screenshot=out.png --virtual-time-budget=6000 "http://localhost:8080/?name=T&autojoin=1"`. Add `--enable-logging=stderr` and grep for `Uncaught` to catch JS errors.

@@ -12,6 +12,8 @@ runs/*
 !runs/demo.json
 !runs/allmodes.json
 configs/
+# player profiles and the daily leaderboard (store.py)
+data/
 
 # OS / editor
 .DS_Store

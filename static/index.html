@@ -9,7 +9,7 @@
 <title>Mine Field 3D</title>
 <link rel="stylesheet" href="/static/style.css">
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+{ "imports": { "three": "/static/vendor/three.module.js" } }
 </script>
 </head>
 <body>
@@ -19,6 +19,17 @@
   <h1>Mine Field <span>3D</span></h1>
   <p class="sub">Race your friends across a shared minefield. Dig safe ground for points, flag the mines, and try not to explode.</p>
   <div id="lobby" class="lobby">
+    <div id="daily" class="daily">
+      <div class="dHead">
+        <div><span class="lbl">Daily dungeon</span> <span id="dailyDate" class="hint"></span>
+          <div class="dSub">Today's map, mines and loot are the same for everyone. Race it, then try to top the board.</div></div>
+        <button type="button" id="dailyBtn">Play today's dungeon</button>
+      </div>
+      <div class="dBoards">
+        <div><div class="dT">Top scores</div><ol id="dailyScores"></ol></div>
+        <div><div class="dT">Fastest clears</div><ol id="dailyTimes"></ol></div>
+      </div>
+    </div>
     <div class="lobbyHead"><span class="lbl">Open rooms</span><span id="lobbyCount" class="hint"></span></div>
     <div id="roomList" class="roomList"></div>
   </div>
@@ -50,6 +61,9 @@
       <div id="chars" class="chars"></div>
       <div class="lbl">Colour</div>
       <div id="colors" class="colors"></div>
+      <div class="lbl">Hat <span class="hint">(play to unlock more)</span></div>
+      <div id="hats" class="hats"></div>
+      <div id="myStats" class="myStats"></div>
       <button type="submit" id="joinBtn" class="primary">Enter the field</button>
       <button type="button" id="cancelBtn" class="secondary" hidden>Cancel</button>
     </form>
@@ -63,6 +77,9 @@
       Eat <span style="--c:#ff4d4d">Apples</span> (+25) and <span style="--c:#ff6fb5">Health potions</span> (+60) to heal.</div>
     <div class="items"><b>Bosses</b> roam dungeons: an <span style="--c:#a3e635">Ogre</span>, a fast <span style="--c:#c77dff">Wraith</span> or a tough <span style="--c:#ff9f43">Golem</span>.
       Step out of the red circle when one winds up. Hit back with <b>R</b> (Attack) and power-ups. The killer gets +40, every helper gets points, and it drops loot.</div>
+    <div class="items">Dungeons hide a <span style="--c:#ffc233">Vault</span> behind a locked door. Dig up the <span style="--c:#ffc233">Key</span>
+      and carry it to the door to open it (+15) and claim the <span style="--c:#ffc233">Treasure chest</span> inside (+30).
+      Watch out for <span style="--c:#c0c8d4">Spike traps</span>: once dug up they stab up and down (15 damage).</div>
     <div class="items">Dig up power-ups and walk over them to grab them. Use a held one with <b>G</b>:
       <span style="--c:#c77dff">Scatter bomb</span> (re-buries a 5×5 area with new mines),
       <span style="--c:#3ee6d6">Freeze ray</span> (freezes a rival for 4 s),
@@ -89,13 +106,23 @@
   <div id="mapPanel" class="panel"><canvas id="minimap" width="192" height="192"></canvas></div>
   <div id="help" class="panel">
     <b>WASD</b> move · <b>Shift</b> sprint · <b>Space</b> jump · <b>Q/E</b> or <b>middle-drag</b> rotate · <b>Wheel</b> zoom<br>
-    <b>Left-click</b> dig · <b>Right-click</b>/<b>F</b> flag · click a satisfied number to clear around it · <b>G</b> use held power-up · <b>R</b> attack
+    <b>Left-click</b> dig · <b>Right-click</b>/<b>F</b> flag · click a satisfied number to clear around it · <b>G</b> use held power-up · <b>R</b> attack<br>
+    <b>1</b>–<b>6</b> quick chat · <b>V</b> ping the tile under the cursor
   </div>
+  <div id="quick" class="panel quick" hidden></div>
+  <div id="specBar" class="panel specBar" hidden>
+    <button type="button" id="specPrev" class="secondary small" aria-label="Previous player">◀</button>
+    <div><span class="lbl">Watching</span> <b id="specName"></b><div class="hint" id="specHint">← → or Tab to switch players</div></div>
+    <button type="button" id="specNext" class="secondary small" aria-label="Next player">▶</button>
+    <button type="button" id="specLeave" class="secondary small">Leave</button>
+  </div>
+  <div id="reconnect" class="panel reconnect" hidden>Connection lost. Reconnecting…</div>
   <div id="inventory" class="panel" hidden>
     <div id="invHeld" class="inv" hidden><span id="invHeldDot" class="dot" style="--c:#c77dff"></span><b id="invHeldName">Scatter bomb</b> · <span id="invHeldHint"></span></div>
     <div id="invGold" class="inv" hidden><span class="dot" style="--c:#ffd23f"></span><b>Gold rush ×2</b> <span id="goldLeft"></span>s</div>
     <div id="invShield" class="inv" hidden><span class="dot" style="--c:#4fa3ff"></span><b>Shield</b> up</div>
     <div id="invBoots" class="inv" hidden><span class="dot" style="--c:#ff9f43"></span><b>Boots</b> <span id="bootsLeft"></span>s</div>
+    <div id="invKey" class="inv" hidden><span class="dot" style="--c:#ffc233"></span><b>Vault key</b> · walk to the locked door (gold on the map)</div>
     <div id="invRadar" class="inv" hidden><span class="dot" style="--c:#4fd67a"></span><b>Radar</b> <span id="radarLeft"></span>s</div>
   </div>
   <div id="feed"></div>
@@ -109,6 +136,7 @@
       <button type="button" id="tAttack" class="tb atk"><b>⚔</b><span>Attack</span></button>
       <button type="button" id="tUse" class="tb sm"><b>★</b><span>Use</span></button>
       <button type="button" id="tJump" class="tb sm"><b>⤒</b><span>Jump</span></button>
+      <button type="button" id="tChat" class="tb sm"><b>💬</b><span>Chat</span></button>
     </div>
     <div id="touchHint" class="panel">Walk with the stick, then press <b>⛏ Dig</b> to dig the tile marked in yellow (hold to keep digging) · <b>⚑</b> flags it · or tap any tile next to you · drag to turn, pinch to zoom</div>
   </div>

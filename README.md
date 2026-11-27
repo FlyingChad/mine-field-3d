@@ -14,9 +14,30 @@ Or run `.venv\Scripts\python server.py --port 8080` yourself. The first time, `s
 
 Then open **http://localhost:8080**. Other people on your network can join at `http://<your-PC's-IP>:8080`. You may need to allow Python through Windows Firewall. To play over the internet, forward the port or use a tunnel such as ngrok or Cloudflare Tunnel.
 
-The join screen has an **Open rooms** list showing every game in progress: its mode, map and realm, who's playing, how far the round has got, and whether a boss is out. Press **Join** to jump in with the character you've picked. To start your own room, type a new name and choose its mode, map and realm. It appears in everyone's list straight away. Rooms hold up to 12 players and close when the last person leaves.
+### Playing over the internet
+
+The server has some protection built in for when strangers can reach it:
+
+- **Message limits:** each connection may send 40 messages per second on average. Floods are dropped, and a connection that keeps flooding is disconnected. Messages over 4 KB close the connection.
+- **Trimmed text:** names and room names are cut to 16 and 24 characters. Chat is quick-chat only (fixed phrases), so there's no free text to moderate.
+- **Reconnecting:** if your connection drops (a phone switching networks, a page reload), the game reconnects on its own. You keep your place, score, health and items for 45 seconds.
+- **No CDN needed:** Three.js is bundled in `static/vendor/`, so the game also works without internet access.
+
+There are no accounts or passwords. Anyone with the address can join, so only share it with people you'd invite.
+
+The join screen has an **Open rooms** list showing every game in progress: its mode, map and realm, who's playing, how far the round has got, and whether a boss is out. Press **Join** to jump in with the character you've picked. To start your own room, type a new name and choose its mode, map and realm. It appears in everyone's list straight away. Rooms hold up to 12 players and close 45 seconds after the last person leaves, which leaves time for anyone who dropped to reconnect.
 
 Players who enter the same **room** name play on the same board. You can share a direct link like `http://host:8080/?room=friday`. Add `&name=Bob&autojoin=1` to skip the join screen.
+
+**Watching:** press **Watch** on any open room, even a full one, to spectate it. The camera follows one player; switch with ← → or Tab, or the ◀ ▶ buttons. A link like `http://host:8080/?room=friday&spectate=1` opens straight into watching.
+
+## Daily dungeon
+
+The top of the join screen shows **today's daily dungeon**. It has the same layout, mines, loot and realm for everyone all day; only the tiles right around your first dig can differ, because the first dig is always safe. It's always Race mode.
+
+- **The board:** clear it to get on today's leaderboard of top scores and fastest clears, one entry per name.
+- **Retries:** the same map comes back every round, so you can try to beat your time.
+- **Saving:** leaderboards are kept for 14 days in `data/daily.json`.
 
 ## Rules
 
@@ -79,6 +100,40 @@ Dungeons are home to boss monsters. One boss roams at a time, or two when four o
 - **Fighting back:** press **R** (or the ⚔ button on mobile) to swing for 12. Scatter bombs (60), shockwaves (40) and the freeze ray (20, and it freezes the boss) all hurt bosses, and blasts briefly stagger them.
 - **Rewards:** the player who lands the killing blow gets **+40**. Everyone who helped gets +1 point per 10 damage dealt. The boss drops a health potion and two power-ups.
 - **Respawning:** a new boss appears 40 s later.
+
+## The vault and spike traps
+
+**The vault:** most dungeons have a vault, a side room sealed by a locked door with a gold padlock floating over it. The door is also marked in gold on the minimap.
+
+- **The key:** it's buried under a safe tile somewhere else in the dungeon. Dig it up and walk onto it. It floats beside you while you carry it.
+- **Opening:** walk up to the door with the key. It opens for everyone and you get **+15**.
+- **Inside:** a **treasure chest** worth **+30** and extra power-ups.
+- **Losing it:** if you're knocked out (or disconnect) carrying the key, you drop it. A scatter bomb that blows the key up buries it again somewhere else.
+- **No shortcuts:** you can't dig into the vault from outside or blink into it.
+
+**Spike traps** are buried under some safe tiles. Once dug up they stay visible as red grates and stab up every few seconds; they rattle just before. Standing on one while the spikes are up deals **15 damage** and a short stun, and a shield absorbs it.
+
+## Talking to your team
+
+- **Quick chat:** **1**–**6** send a phrase that pops up over your head: Help!, Boss here!, Nice!, Follow me, GG, Oops.
+- **Pings:** **V** pings the tile under your cursor with a beam of light in your colour, also shown on the minimap.
+- **On a phone:** the 💬 button opens both. Ping uses the tile you tapped, or the one marked for digging.
+
+## Stats and hats
+
+Your browser keeps a private profile id, and the server saves your stats under it: rounds, wins, tiles revealed, correct flags, bosses slain, co-op clears and daily dungeons. Stats unlock **hats**, which you choose on the join screen or with **Change character**:
+
+| Hat | Unlock |
+|---|---|
+| Party hat | Play 3 rounds |
+| Beanie | Reveal 500 tiles |
+| Flower | Finish a daily dungeon |
+| Horns | Land the killing blow on a boss |
+| Top hat | Flag 100 mines correctly |
+| Crown | Win 3 rounds against other players (bots count) |
+| Halo | Clear 2 co-op dungeons |
+
+Locked hats show your progress. Profiles live in `data/profiles.json`. Clearing your browser's site data gives you a fresh profile.
 
 ## Playing on a phone or tablet
 
@@ -173,13 +228,27 @@ Models are saved in `models/`, configs in `configs/` and run histories in `runs/
 ## Controls
 
 WASD / arrows to move · Shift to sprint · Space to jump · Q/E or middle-drag to rotate the camera · mouse wheel to zoom
-Left-click to dig · Right-click or F to flag · G to use a held power-up · R to attack
+Left-click to dig · Right-click or F to flag · G to use a held power-up · R to attack · 1–6 quick chat · V ping
 
 ## Files
 
-- `server.py`: the authoritative game server (aiohttp HTTP + WebSocket). It handles rooms, mine generation, scoring and reach checks. Tune `W`, `H`, `MINES`, `REACH`, etc. at the top.
-- `static/game.js`: the Three.js client (rendering, movement, effects, sound). It loads Three.js from the jsDelivr CDN, so browsers need internet access.
+- `server.py`: the authoritative game server (aiohttp HTTP + WebSocket). It handles rooms, mine generation, scoring and reach checks. Tune `W`, `H`, `MINE_DENSITY`, `REACH`, etc. at the top.
+- `store.py`: saved player profiles (stats and hat unlocks) and the daily leaderboard, as JSON in `data/` (or `$MF3D_DATA`).
+- `static/game.js`: the Three.js client (rendering, movement, effects, sound). Three.js 0.160 is bundled in `static/vendor/`.
 - `static/index.html`, `static/style.css`: the page and HUD.
+- `tests/`: the test suite (below).
+
+## Tests
+
+```
+.venv\Scripts\python -m unittest discover -s tests
+```
+
+The suite covers the game rules, the vault, traps, the daily dungeon, profiles, the WebSocket protocol, and the AI simulator.
+
+- **Protocol tests:** these run against an in-process server (rate limits, resume, spectators, chat).
+- **AI simulator tests:** these run on the CPU, so they won't slow a training run, and they're skipped without PyTorch.
+- **Speed:** the whole suite takes a few seconds.
 
 ## License
 
