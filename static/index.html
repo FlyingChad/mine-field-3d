@@ -33,6 +33,8 @@
         <div><div class="dT">Top scores</div><ol id="dailyScores"></ol></div>
         <div><div class="dT">Fastest clears</div><ol id="dailyTimes"></ol></div>
         <div><div class="dT">Deepest descents</div><ol id="descents"></ol></div>
+        <div><div class="dT" id="weeklyLbl">This week's descent</div><ol id="weekly"></ol>
+          <button type="button" id="weeklyBtn" class="weeklyBtn" hidden>Play the weekly descent</button></div>
       </div>
     </div>
     <div class="lobbyHead"><span class="lbl">Open rooms</span><span id="lobbyCount" class="hint"></span></div>
@@ -108,6 +110,7 @@
     <div class="hp" title="Health"><i id="hpFill"></i><span id="hpText">100 / 100</span></div>
     <div id="modeRow" class="modeRow"><span id="modeChip" class="chip"></span><span id="teamInfo"></span></div>
     <div id="modRow" class="modRow" hidden><span id="modChip" class="chip mod"></span><span id="modDesc"></span></div>
+    <div id="relicRow" class="relicRow" hidden></div>
     <div class="stat"><span class="icon mine"></span><b id="minesLeft">0</b> mines left</div>
     <div class="stat"><span class="icon safe"></span><b id="safeLeft">0</b> safe tiles left</div>
     <button id="lookBtn" class="secondary small" type="button">Change character</button>
@@ -134,6 +137,10 @@
     <button type="button" id="rpExit" class="secondary small">Exit</button>
   </div>
   <div id="reconnect" class="panel reconnect" hidden>Connection lost. Reconnecting…</div>
+  <div id="relics" class="panel relics" hidden>
+    <div class="shopHead"><b>Choose a relic</b> <span class="hint">free · lasts the whole run · pick one before you go down</span></div>
+    <div id="relicItems" class="shopItems"></div>
+  </div>
   <div id="shop" class="panel shop" hidden>
     <div class="shopHead"><b>Stairs shop</b> <span class="hint">spend your points before you go down</span>
       <span id="shopPts" class="pts"></span></div>

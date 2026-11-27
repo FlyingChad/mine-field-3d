@@ -102,18 +102,34 @@ class Descents(JsonFile):
     """Records of descent runs: how deep each team got. Keeps the best MAX_ROWS runs ever."""
     MAX_ROWS = 300
 
-    def record(self, team, depth, score, secs, date=None):
+    WEEK_ROWS = 100
+
+    def record(self, team, depth, score, secs, date=None, week=None):
+        """week: the weekly descent's ISO week; those runs also go on that week's ladder."""
+        row = {"team": team[:12], "depth": depth, "score": score, "secs": secs,
+               "date": date or time.strftime("%Y-%m-%d"), "at": int(time.time())}
+        key = lambda r: (-r["depth"], -r["score"], r["secs"])
         rows = self.data.setdefault("runs", [])
-        rows.append({"team": team[:12], "depth": depth, "score": score, "secs": secs,
-                     "date": date or time.strftime("%Y-%m-%d"), "at": int(time.time())})
-        rows.sort(key=lambda r: (-r["depth"], -r["score"], r["secs"]))
+        rows.append(row)
+        rows.sort(key=key)
         del rows[self.MAX_ROWS:]
+        if week:
+            weeks = self.data.setdefault("weeks", {})
+            wk = weeks.setdefault(week, [])
+            wk.append(row)
+            wk.sort(key=key)
+            del wk[self.WEEK_ROWS:]
+            for old in sorted(weeks)[:-8]:     # keep two months of ladders
+                del weeks[old]
         self.dirty = True
 
-    def board(self, n=10, date=None):
+    def board(self, n=10, date=None, week=None):
         rows = self.data.get("runs", [])
         today = [r for r in rows if r["date"] == (date or time.strftime("%Y-%m-%d"))]
-        return {"all": rows[:n], "today": today[:n]}
+        out = {"all": rows[:n], "today": today[:n]}
+        if week:
+            out["weekly"] = self.data.get("weeks", {}).get(week, [])[:n]
+        return out
 
 
 class Daily(JsonFile):

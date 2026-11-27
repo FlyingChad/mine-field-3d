@@ -4,6 +4,7 @@ Run:  .venv\\Scripts\\python server.py   (then open http://localhost:8080)
 Players on your network can join via http://<your-ip>:8080
 """
 import asyncio
+import datetime
 import json
 import math
 import random
@@ -145,9 +146,50 @@ MODIFIERS = {
     "swarm":    {"name": "Swarm",           "desc": "One more boss, but every boss is weaker."},
     "trove":    {"name": "Treasure trove",  "desc": "Twice as many power-ups buried."},
     "volatile": {"name": "Volatile",        "desc": f"Mines hit much harder ({VOLATILE_DAMAGE} damage)."},
+    "cursed":   {"name": "Cursed ground",   "desc": "Flags won't stay planted on this floor."},
+    "flooded":  {"name": "Flooded",         "desc": "Knee-deep water slows everyone down, monsters too.", "slow": 0.7},
 }
 SWARM_HP = 0.6
+FLOOD_SLOW = 0.7                 # flooded floors: everyone (and every boss) moves at this speed
 UNSTABLE_EVERY = 10.0            # seconds between cave-ins
+
+# elite bosses: every ELITE_EVERY floors of a descent, one boss is an elite. It's bigger and tougher,
+# and besides its smash it winds up a wide quake that hits everyone within ELITE_QUAKE_RADIUS tiles.
+ELITE_EVERY = 5
+ELITE_HP = 2.5                   # x the boss's (already scaled) HP
+ELITE_DAMAGE = 10                # extra smash damage
+ELITE_NAMES = {"ogre": "Ogre Warlord", "wraith": "Wraith Queen", "golem": "Golem Colossus"}
+ELITE_QUAKE_RANGE = 4.0          # tiles: starts a quake when its target is this close (but not in smash reach)
+ELITE_QUAKE_RADIUS = 3.5
+ELITE_QUAKE_WINDUP = 1.4
+ELITE_QUAKE_DAMAGE = 25
+ELITE_QUAKE_STUN = 1.0
+ELITE_QUAKE_COOLDOWN = 7.0
+ELITE_REWARD = 2                 # x the boss rewards, and extra loot
+
+# relics: when a descent floor is cleared, each player is offered RELIC_OFFERS relics they don't have
+# and may take one, free. Relics last the whole run.
+RELICS = {
+    "iron":       {"name": "Iron Skin",       "desc": "Take 25% less damage."},
+    "greed":      {"name": "Prospector",      "desc": "+50% points for every tile you dig."},
+    "brute":      {"name": "Brute",           "desc": "Your sword hits bosses 50% harder."},
+    "vampire":    {"name": "Bloodthirst",     "desc": "Heal 4 HP every time your sword hits a boss."},
+    "sapper":     {"name": "Sapper's Luck",   "desc": "Mines deal half damage to you."},
+    "boots":      {"name": "Iron Boots",      "desc": "Spike traps can't hurt you."},
+    "scavenger":  {"name": "Scavenger",       "desc": "Start every floor holding a power-up."},
+    "phoenix":    {"name": "Phoenix Feather", "desc": "Once per floor, a knockout leaves you on 1 HP instead."},
+    "cartographer": {"name": "Cartographer",  "desc": "A radar sweep where you land on every floor."},
+}
+RELIC_OFFERS = 3
+IRON_SKIN = 0.75
+GREED_MULT = 1.5
+BRUTE_MULT = 1.5
+VAMPIRE_HEAL = 4
+
+# the weekly descent: room "weekly-YYYY-Www" (ISO week, server time) is a descent whose floors -
+# layouts, mines, loot, traps and floor twists - are the same for every team that week, so runs can
+# be compared on one ladder (store.Descents, tagged with the week)
+WEEKLY_PREFIX = "weekly-"
 UNSTABLE_RADIUS = 1              # 3x3 patches
 
 # the dungeon vault: a side room sealed by a locked door (two door tiles across a corridor). A key is
@@ -253,6 +295,9 @@ class Player:
         self.hp = self.max_hp = MAX_HP   # max_hp grows with the Vitality perk (descent)
         self.perks: set[str] = set()       # descent: perks bought for the next floor
         self.bought: set[str] = set()      # descent: shop offers bought on this floor
+        self.relics: set[str] = set()      # descent: relics taken this run
+        self.relic_offer: list[str] = []   # descent: relics on offer while the stairs are open
+        self.phoenix_used = False          # descent: the Phoenix Feather saved you on this floor
         self.ko_until = 0.0       # > 0 while knocked out
         self.reset_items()
 
@@ -315,6 +360,15 @@ class Boss:
         self.next_path = 0.0
         self.windup_until = self.cooldown_until = self.frozen_until = self.stun_until = 0.0
         self.dmg_by: dict[str, int] = {}
+        self.elite = False
+        self.attack = "smash"             # the wind-up in progress: "smash" or (elites) "quake"
+        self.quake_ready = 0.0
+
+    def make_elite(self):
+        self.elite = True
+        self.name = ELITE_NAMES.get(self.kind, "Elite " + self.name)
+        self.max_hp = self.hp = round(self.max_hp * ELITE_HP)
+        self.damage += ELITE_DAMAGE
 
     def tile(self):
         return (int((self.x / TILE) + W / 2), int((self.z / TILE) + H / 2))
@@ -322,7 +376,7 @@ class Boss:
     def row(self, now):
         st = "frozen" if now < self.frozen_until else "stunned" if now < self.stun_until else self.state
         return [self.id, self.kind, round(self.x, 2), round(self.z, 2), round(self.rot, 2), self.hp, self.max_hp,
-                self.STATES[st]]
+                self.STATES[st], int(self.elite)]
 
 
 class BotPlayer(Player):
@@ -352,10 +406,22 @@ def daily_realm(date):
     return random.Random("realm-" + date).choice(REALM_IDS)
 
 
+def this_week():
+    y, w, _ = datetime.date.today().isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def weekly_name(week=None):
+    return WEEKLY_PREFIX + (week or this_week())
+
+
 class Room:
-    def __init__(self, name, realm="meadow", layout="dungeon", mode="race", daily=None):
+    def __init__(self, name, realm="meadow", layout="dungeon", mode="race", daily=None, weekly=None):
         self.name = name
         self.daily = daily            # a date string for the daily dungeon, else None
+        self.weekly = weekly          # an ISO week ("2026-W48") for the weekly descent, else None
+        if weekly:
+            mode = "descent"
         if daily:                     # everyone gets the same race through the same dungeon today
             realm, layout, mode = daily_realm(daily), "dungeon", "race"
         self.realm = realm if realm in REALM_IDS else random.choice(REALM_IDS)
@@ -367,6 +433,7 @@ class Room:
         self.hold_until = time.time() + 60 # a new room (e.g. one the lab put bots in) waits for its first human
         self.round_task = None
         self.kos: list[str] = []
+        self.saves: list[str] = []         # Phoenix Feather saves waiting to be announced
         self.depth = 1                     # descent: the floor the team is on
         if self.mode == "descent":
             self.layout_kind = "dungeon"
@@ -388,7 +455,9 @@ class Room:
         self.stairs = None                 # descent: the staircase tile once the floor is cleared
         self.stairs_auto = self.descend_at = 0.0
         # the daily dungeon replays one seeded layout all day; other dungeons are new every round
-        self.rng = random.Random("mf3d-" + self.daily) if self.daily else random.Random()
+        # the weekly descent seeds every floor from the week and the floor number
+        self.rng = (random.Random("mf3d-" + self.daily) if self.daily
+                    else random.Random(f"mf3d-{self.weekly}-{self.depth}") if self.weekly else random.Random())
         self.floor = layouts.make(self.layout_kind, W, H, rng=self.rng, field_size=(FIELD_SIZE, FIELD_SIZE))
         self.floor_tiles = [i for i in range(W * H) if self.floor[i]]
         self.vault: set[int] = set()       # floor tiles behind the locked door
@@ -422,8 +491,9 @@ class Room:
         self.failed = False
         # descent: this floor's twist (none on floor 1, never the same twice running) and the shop
         prev = getattr(self, "modifier", None) if next_floor else None
-        self.modifier = (random.choice([m for m in MODIFIERS if m != prev])
+        self.modifier = (self.rng.choice([m for m in MODIFIERS if m != prev])
                          if self.mode == "descent" and self.depth >= 2 else None)
+        self.elite_due = self.mode == "descent" and self.depth % ELITE_EVERY == 0   # this floor brings an elite
         self.next_crumble = 0.0
         self.shop: list[str] = []          # offer ids, set when the stairs open
         self.life_bought = False
@@ -454,12 +524,28 @@ class Room:
         self.lives += DESCENT_LIFE_PER_FLOOR
         self.bosses.clear()                 # the floor's monsters flee
         self.next_boss_at = float("inf")
-        self.shop = random.sample(list(SHOP), SHOP_OFFERS)
+        self.shop = self.rng.sample(list(SHOP), SHOP_OFFERS)
         for q in self.players.values():
             q.bought.clear()
         await self.broadcast({"t": "stairs", "x": sx, "y": sy, "depth": self.depth, "bonus": bonus,
                               "flags": flagged, "lives": self.lives, "auto": STAIRS_AUTO, "by": p.id,
                               "shop": [{"id": k, **SHOP[k], "cost": self.price(k)} for k in self.shop]})
+        # relics: everyone gets a private choice of ones they don't have yet (bots pick at once)
+        for q in list(self.players.values()):
+            left = [k for k in RELICS if k not in q.relics]
+            q.relic_offer = random.sample(left, min(RELIC_OFFERS, len(left)))
+            if q.is_bot and q.relic_offer:
+                await self.pick_relic(q, random.choice(q.relic_offer))
+            elif q.relic_offer:
+                await self.send_to(q, {"t": "relics", "offer": [{"id": k, **RELICS[k]} for k in q.relic_offer]})
+
+    async def pick_relic(self, p, k):
+        """Take one of the relics on offer (descent, while the stairs are open). Lasts the whole run."""
+        if self.stairs is None or self.descend_at or k not in p.relic_offer:
+            return
+        p.relic_offer = []
+        p.relics.add(k)
+        await self.broadcast({"t": "relic", "pid": p.id, "id": k, "name": RELICS[k]["name"]})
 
     async def perk_tick(self):
         """Radar perks fire as soon as the new floor has mines to show."""
@@ -552,7 +638,10 @@ class Room:
                 q.shield = True
             if "boots" in q.perks:
                 q.boots_until = now + PERK_BOOTS
-            q.radar_pending = "radar" in q.perks    # sent once the floor's mines exist (first dig)
+            q.radar_pending = "radar" in q.perks or "cartographer" in q.relics   # sent after the first dig
+            q.relic_offer, q.phoenix_used = [], False
+            if "scavenger" in q.relics and not q.held:
+                q.held = random.choice([h for h in HELD if h and h != "scatter"])
         for q in self.players.values():
             await self.stat(q, deepest=self.depth)
         await self.broadcast({"t": "round", "snapshot": self.snapshot(), "spawns": spawns, "depth": self.depth})
@@ -671,7 +760,7 @@ class Room:
         if self.state != "playing" or not self.traps:
             return
         for p in list(self.players.values()):
-            if p.ko_until or now < p.spike_until:
+            if p.ko_until or now < p.spike_until or "boots" in p.relics:
                 continue
             x, y = p.tile()
             i = y * W + x
@@ -765,14 +854,20 @@ class Room:
             kind = random.choice(list(BOSS_KINDS))
             x, z = self.spawn_point(list(self.players.values()))
             b = Boss(kind, x, z)
+            if self.mode == "descent" and self.modifier == "flooded":
+                b.speed *= FLOOD_SLOW
             if self.coop:   # a bigger team faces a tougher boss
                 b.max_hp = b.hp = round(b.max_hp * (1 + COOP_BOSS_HP_PER_PLAYER * max(0, len(self.players) - 1)))
             if self.mode == "descent":   # and so does a deeper floor
                 b.max_hp = b.hp = round(b.max_hp * (1 + DESCENT_BOSS_HP_PER_FLOOR * (self.depth - 1))
                                         * (SWARM_HP if self.modifier == "swarm" else 1))
+            if self.elite_due:               # every ELITE_EVERY floors: an elite leads the pack
+                self.elite_due = False
+                b.make_elite()
             self.bosses[b.id] = b
             self.next_boss_at = now + 6.0     # stagger a second spawn
-            await self.broadcast({"t": "bossSpawn", "id": b.id, "kind": kind, "name": b.name, "x": round(x, 2), "z": round(z, 2)})
+            await self.broadcast({"t": "bossSpawn", "id": b.id, "kind": kind, "name": b.name, "x": round(x, 2), "z": round(z, 2),
+                                  "elite": b.elite})
         for b in list(self.bosses.values()):
             if now < b.frozen_until or now < b.stun_until:
                 continue
@@ -793,10 +888,16 @@ class Room:
                 d, q = best
                 b.target, b.state = q.id, "chase"
                 if d <= BOSS_REACH * TILE and now >= b.cooldown_until:
-                    b.state, b.windup_until, b.path = "windup", now + BOSS_WINDUP, []
+                    b.state, b.windup_until, b.path, b.attack = "windup", now + BOSS_WINDUP, [], "smash"
                     b.rot = math.atan2(q.x - b.x, q.z - b.z)
                     await self.broadcast({"t": "bossAtk", "id": b.id, "x": round(b.x, 2), "z": round(b.z, 2),
                                           "r": BOSS_HIT_RANGE, "t0": BOSS_WINDUP})
+                    continue
+                if b.elite and d <= ELITE_QUAKE_RANGE * TILE and now >= b.quake_ready and now >= b.cooldown_until:
+                    b.state, b.windup_until, b.path, b.attack = "windup", now + ELITE_QUAKE_WINDUP, [], "quake"
+                    b.quake_ready = now + ELITE_QUAKE_COOLDOWN
+                    await self.broadcast({"t": "bossAtk", "id": b.id, "x": round(b.x, 2), "z": round(b.z, 2),
+                                          "r": ELITE_QUAKE_RADIUS, "t0": ELITE_QUAKE_WINDUP, "quake": True})
                     continue
                 if now >= b.next_path or not b.path:
                     b.path = self.bfs(b.tile(), q.tile())[:12]
@@ -828,18 +929,22 @@ class Room:
 
     async def boss_smash(self, b, now):
         b.state, b.cooldown_until = "chase", now + BOSS_COOLDOWN
+        quake = b.attack == "quake"
+        r, dmg, stun = ((ELITE_QUAKE_RADIUS, ELITE_QUAKE_DAMAGE, ELITE_QUAKE_STUN) if quake
+                        else (BOSS_HIT_RANGE, b.damage, BOSS_SMASH_STUN))
+        b.attack = "smash"
         hit, shielded = [], []
         for q in self.players.values():
-            if q.ko_until or math.hypot(q.x - b.x, q.z - b.z) > BOSS_HIT_RANGE * TILE:
+            if q.ko_until or math.hypot(q.x - b.x, q.z - b.z) > r * TILE:
                 continue
             if self._absorb(q):
                 shielded.append(q.id)
             else:
-                q.stun_until = max(q.stun_until, now + BOSS_SMASH_STUN)
-                self.hurt(q, b.damage, now)
+                q.stun_until = max(q.stun_until, now + stun)
+                self.hurt(q, dmg, now)
                 hit.append(q.id)
-        await self.broadcast({"t": "bossSmash", "id": b.id, "x": round(b.x, 2), "z": round(b.z, 2), "r": BOSS_HIT_RANGE,
-                              "hit": hit, "shielded": shielded, "damage": b.damage, "stun": BOSS_SMASH_STUN})
+        await self.broadcast({"t": "bossSmash", "id": b.id, "x": round(b.x, 2), "z": round(b.z, 2), "r": r,
+                              "hit": hit, "shielded": shielded, "damage": dmg, "stun": stun, "quake": quake})
         await self.flush_kos()
 
     async def damage_boss(self, b, dmg, by, stagger=0.0):
@@ -865,6 +970,8 @@ class Room:
         rewards = {pid: d // BOSS_DAMAGE_POINTS for pid, d in b.dmg_by.items() if pid in self.players}
         if killer in self.players:
             rewards[killer] = rewards.get(killer, 0) + BOSS_KILL_REWARD
+        if b.elite:
+            rewards = {pid: pts * ELITE_REWARD for pid, pts in rewards.items()}
         for pid, pts in rewards.items():
             self.players[pid].score += pts
         await self.stat(self.players.get(killer), bosses=1)
@@ -873,13 +980,14 @@ class Room:
         spots = [(x, y) for x, y in self.bfs((bx, by_), max_depth=2)
                  if idx(x, y) not in self.items and idx(x, y) not in self.buried and idx(x, y) not in (self.mines or ())]
         random.shuffle(spots)
-        kinds = ["potion"] + random.choices([k for k in ITEM_WEIGHTS if k not in FOOD and not (self.coop and k == "scatter")], k=2)
+        kinds = ["potion"] + random.choices([k for k in ITEM_WEIGHTS if k not in FOOD and not (self.coop and k == "scatter")],
+                                            k=4 if b.elite else 2)
         loot = []
         for (x, y), k in zip(spots, kinds):
             self.items[idx(x, y)] = k
             loot.append([x, y, k])
         await self.broadcast({"t": "bossDown", "id": b.id, "name": b.name, "killer": killer,
-                              "x": round(b.x, 2), "z": round(b.z, 2), "loot": loot, "rewards": rewards})
+                              "x": round(b.x, 2), "z": round(b.z, 2), "loot": loot, "rewards": rewards, "elite": b.elite})
 
     async def attack(self, p):
         """Player melee swing: hits the nearest boss in range."""
@@ -896,7 +1004,9 @@ class Room:
             return
         target = min(near, key=lambda nb: nb[0])[1]
         if isinstance(target, Boss):
-            await self.damage_boss(target, ATTACK_DAMAGE, p.id)
+            if "vampire" in p.relics and not p.ko_until:
+                p.hp = min(p.max_hp, p.hp + VAMPIRE_HEAL)
+            await self.damage_boss(target, round(ATTACK_DAMAGE * (BRUTE_MULT if "brute" in p.relics else 1)), p.id)
             return
         shielded = self._absorb(target)
         if not shielded:
@@ -935,20 +1045,16 @@ class Room:
     def generate(self, sx, sy):
         rng = self.rng
         forbidden = {idx(sx, sy)} | {idx(nx, ny) for nx, ny in neighbors(sx, sy)}
-        if self.daily:
-            # the same mines for everyone today: lay them from the day's seed, then move any that fall
-            # in the first dig's 3x3 (the first dig is always safe) to other seeded spots
+        seeded = bool(self.daily or self.weekly)
+        if seeded:
+            # the same board for everyone (daily dungeon, weekly descent): mines, loot, traps and the
+            # key all come from the seed first, without looking at where the first dig was...
             mines = set(rng.sample(self.floor_tiles, min(self.n_mines, len(self.floor_tiles))))
-            spare = [i for i in self.floor_tiles if i not in mines and i not in forbidden]
-            for m in sorted(mines & forbidden):
-                mines.discard(m)
-                mines.add(spare.pop(rng.randrange(len(spare))))
-            self.mines = mines
+            safe = [i for i in self.floor_tiles if i not in mines]
         else:
             candidates = [i for i in self.floor_tiles if i not in forbidden]
-            self.mines = set(rng.sample(candidates, min(self.n_mines, len(candidates))))
-        self.recount()
-        safe = [i for i in self.floor_tiles if i not in self.mines and i not in forbidden]
+            mines = set(rng.sample(candidates, min(self.n_mines, len(candidates))))
+            safe = [i for i in self.floor_tiles if i not in mines and i not in forbidden]
         n_items = min(len(safe), round(ITEM_DENSITY * len(self.floor_tiles) * (2 if self.modifier == "trove" else 1)))
         pool = {k: w for k, w in ITEM_WEIGHTS.items() if not (self.coop and k == "scatter")}
         kinds = rng.choices(list(pool), weights=list(pool.values()), k=n_items)
@@ -966,6 +1072,16 @@ class Room:
             outside = [i for i in free if i not in self.vault and i not in self.traps and i not in self.buried]
             if outside:
                 self.buried[rng.choice(outside)] = "key"
+        if seeded:
+            # ...then any mine in the first dig's 3x3 (the first dig is always safe) moves to a free
+            # seeded spot, so only those few mines differ between teams
+            spare = [i for i in free if i not in forbidden and i not in self.traps and i not in self.buried]
+            for m in sorted(mines & forbidden):
+                mines.discard(m)
+                if spare:
+                    mines.add(spare.pop(rng.randrange(len(spare))))
+        self.mines = mines
+        self.recount()
 
     def recount(self):
         self.counts = [0] * (W * H)
@@ -999,6 +1115,8 @@ class Room:
             "depth": self.depth if self.mode == "descent" else None,
             "stairs": None if self.stairs is None else [self.stairs % W, self.stairs // W],
             "modifier": None if not self.modifier else {"id": self.modifier, **MODIFIERS[self.modifier]},
+            "weekly": self.weekly,
+            "elite": self.mode == "descent" and self.depth % ELITE_EVERY == 0,
             "shop": [{"id": k, **SHOP[k], "cost": self.price(k)} for k in self.shop],
             "minesLeft": self.mines_left(),
             "safeLeft": self.safe_left,
@@ -1117,6 +1235,8 @@ class Room:
         if not opened:
             return
         gain = len(opened) * (GOLD_MULT if time.time() < p.gold_until else 1) * (2 if self.modifier == "rich" else 1)
+        if "greed" in p.relics:
+            gain = round(gain * GREED_MULT)
         p.score += gain
         for pid, amt in penalties.items():
             if pid in self.players:
@@ -1142,6 +1262,8 @@ class Room:
             penalty, stun, damage = 0, 0, 0
         else:
             penalty, stun, damage = MINE_PENALTY, STUN_SECONDS, VOLATILE_DAMAGE if self.modifier == "volatile" else MINE_DAMAGE
+            if "sapper" in p.relics:
+                damage //= 2
             p.score += penalty
             p.stun_until = now + stun
             self.hurt(p, damage, now)
@@ -1160,8 +1282,14 @@ class Room:
         In PvP, `by` (another player) earns KO_REWARD; in co-op every KO costs the team a life."""
         if q.ko_until or amount <= 0:
             return False
+        if "iron" in q.relics:
+            amount = max(1, round(amount * IRON_SKIN))
         q.hp = max(0, q.hp - amount)
         if q.hp > 0:
+            return False
+        if "phoenix" in q.relics and not q.phoenix_used:   # the feather burns instead
+            q.phoenix_used, q.hp = True, 1
+            self.saves.append(q.id)
             return False
         q.ko_until = now + RESPAWN_SECONDS
         q.stun_until = max(q.stun_until, q.ko_until)
@@ -1177,6 +1305,8 @@ class Room:
         return True
 
     async def flush_kos(self):
+        while self.saves:
+            await self.broadcast({"t": "phoenix", "pid": self.saves.pop(0)})
         while self.kos:
             pid, by, reward = self.kos.pop(0)
             await self.broadcast({"t": "ko", "pid": pid, "penalty": KO_PENALTY, "respawn": RESPAWN_SECONDS,
@@ -1417,7 +1547,7 @@ class Room:
                 await self.damage_boss(b, BOSS_POWER_DAMAGE["scatter"], pid, stagger=1.2)
 
     async def flag(self, p, x, y):
-        if not self.can_act(p, x, y):
+        if self.modifier == "cursed" or not self.can_act(p, x, y):
             return
         i = idx(x, y)
         if self.revealed[i]:
@@ -1439,10 +1569,11 @@ class Room:
                 continue
             dx, dz = p.tx - p.x, p.tz - p.z
             d = math.hypot(dx, dz)
-            if p.held and now >= p.throw_at and self.state == "playing" and now >= p.stun_until:
+            v4 = getattr(p.brain, "version", 1) >= 4     # v4 models decide when to use items themselves
+            if not v4 and p.held and now >= p.throw_at and self.state == "playing" and now >= p.stun_until:
                 await self.bot_use(p, now)
             if d > 1e-3:
-                step = BOT_SPEED * dt * (BOOTS_SPEED if now < p.boots_until else 1)
+                step = BOT_SPEED * dt * (BOOTS_SPEED if now < p.boots_until else 1) * (FLOOD_SLOW if self.modifier == "flooded" else 1)
                 if d <= step:
                     p.x, p.z = p.tx, p.tz
                 else:
@@ -1507,6 +1638,9 @@ class Room:
                     soon = now + BOT_STEP_SECONDS
                     extra.update(traps=[(i % W, i // W, self.spikes_up(i, soon)) for i in self.traps if self.revealed[i]],
                                  items=[(i % W, i // W) for i in self.items], goal=goal)
+                if v4:   # what it holds, and whether using it now would hit something
+                    extra.update(held=p.held or "", shield=p.shield,
+                                 use_ok=bool(p.held) and self.mines is not None and self.bot_aim(p, now) is not None)
                 others = [] if self.coop else [q.tile() for q in mates]
             else:
                 others = [q.tile() for q in self.players.values() if q is not p]
@@ -1514,6 +1648,11 @@ class Room:
                                           floor=self.floor, extra=extra)
             if kind == "attack":
                 await self.attack(p)
+                continue
+            if kind == "use":
+                target = self.bot_aim(p, now)
+                if target:
+                    await self.use(p, *target)
                 continue
             tx, ty = x + ox, y + oy
             if not self.is_floor(tx, ty):
@@ -1528,8 +1667,19 @@ class Room:
                 await self.flag(p, tx, ty)
 
     async def bot_use(self, p, now):
-        """Heuristics for held items (not learned): aim at the nearest opponent in range,
-        shockwave when someone is close, blink toward unexplored ground. Otherwise retry later."""
+        """Heuristic for held items (v1-v3 bots; not learned): use it as soon as bot_aim finds a target
+        (a shockwave only when someone is close). Otherwise retry later."""
+        target = self.bot_aim(p, now, shock_needs_foe=True)
+        if target:
+            return await self.use(p, *target)
+        p.throw_at = now + 1.0
+
+    def bot_aim(self, p, now, shock_needs_foe=False):
+        """Where a bot aims its held item: the nearest opponent in range for scatter and freeze, its own
+        tile for a shockwave, and for blink the reachable dug-up tile with the most hidden ground
+        around it. None when there's nothing worth using it on (ai/env.py MineEnv uses the same rule)."""
+        if not p.held:
+            return None
         px, py = p.tile()
         foes = []
         for q in (self.players.values() if self.hits_players() else ()):   # teammates aren't targets in co-op
@@ -1541,11 +1691,14 @@ class Room:
             bx, by = b.tile()
             foes.append((max(abs(bx - px), abs(by - py)), bx, by))
         foes.sort()
+        if p.held == "shockwave" and not shock_needs_foe:
+            return (px, py)
         rng = {"scatter": THROW_RANGE, "freeze": FREEZE_RANGE - 1, "shockwave": SHOCK_RADIUS - 1}.get(p.held)
         if rng is not None:
             if foes and foes[0][0] <= rng:
-                return await self.use(p, foes[0][1], foes[0][2])
-        elif p.held == "blink":
+                return (foes[0][1], foes[0][2])
+            return None
+        if p.held == "blink":
             # the reachable tile with the most hidden tiles around it
             best, best_n = None, 2
             for _ in range(40):
@@ -1556,9 +1709,8 @@ class Room:
                 n = sum(1 for nx, ny in self.nb(x, y) if not self.revealed[idx(nx, ny)])
                 if n > best_n:
                     best, best_n = (x, y), n
-            if best:
-                return await self.use(p, *best)
-        p.throw_at = now + 1.0
+            return best
+        return None
 
     async def end_round(self):
         self.state = "over"
@@ -1587,7 +1739,8 @@ class Room:
                             daily=int(bool(self.daily) and not self.failed))
         if self.mode == "descent" and any(not q.is_bot for q in standings):
             descent_board.record([{"name": q.name, "color": q.color, "bot": q.is_bot} for q in standings],
-                                 self.depth, sum(q.score for q in standings), round(time.time() - self.run_started))
+                                 self.depth, sum(q.score for q in standings), round(time.time() - self.run_started),
+                                 week=self.weekly)
         rec, self.rec, self.rec_pending = self.rec, None, False
         if rec:
             rec.last_scores = {q.id: q.score for q in standings}    # final scores, flag bonuses included
@@ -1604,7 +1757,7 @@ class Room:
             "mines": self.all_mines(),
             "next": NEXT_ROUND_DELAY,
             "duration": duration,
-            "daily": self.daily,
+            "daily": self.daily, "weekly": self.weekly,
             "recap": recap, "replay": replay_id,
         }
         if rec:
@@ -1629,6 +1782,7 @@ class Room:
             q.hp = q.max_hp = MAX_HP
             q.ko_until = 0.0
             q.perks.clear(); q.bought.clear()
+            q.relics.clear(); q.relic_offer = []; q.phoenix_used = False
             q.reset_items()
             q.round_id = self.run_id
             self.place(q)   # the new layout has different floor, so everyone gets a fresh spawn
@@ -1667,7 +1821,7 @@ def welcome_msg(room, who, spectator=False):
         "t": "welcome", "id": who.id, "room": room.name, "spectator": spectator,
         "token": None if spectator else who.token, "serverTime": time.time(),
         "cfg": {"w": W, "h": H, "mines": room.n_mines, "tile": TILE, "reach": REACH, "realm": room.realm,
-                "mode": room.mode, "daily": room.daily,
+                "mode": room.mode, "daily": room.daily, "weekly": room.weekly,
                 "throwRange": THROW_RANGE, "scatterRadius": SCATTER_RADIUS, "bootsSpeed": BOOTS_SPEED,
                 "freezeRange": FREEZE_RANGE, "blinkRange": BLINK_RANGE, "shockRadius": SHOCK_RADIUS,
                 "held": HELD, "maxHp": MAX_HP, "keyBit": KEY_BIT, "spikeCycle": SPIKE_CYCLE, "spikeUp": SPIKE_UP,
@@ -1680,6 +1834,8 @@ def welcome_msg(room, who, spectator=False):
 def make_room(room_name, data):
     if room_name == daily_name():
         return Room(room_name, daily=today())
+    if room_name == weekly_name():
+        return Room(room_name, weekly=this_week())
     return Room(room_name, data.get("realm"), data.get("layout"), data.get("mode"))
 
 
@@ -1841,6 +1997,8 @@ async def ws_handler(request):
                 await room.attack(player)
             elif t == "buy":
                 await room.buy(player, data.get("id") if isinstance(data.get("id"), str) else "")
+            elif t == "relic":
+                await room.pick_relic(player, data.get("id") if isinstance(data.get("id"), str) else "")
             elif t in ("use", "throw"):
                 try:
                     x, y = int(data.get("x", -1)), int(data.get("y", -1))
@@ -1881,7 +2039,7 @@ def lobby_summary():
             "progress": round(done / total, 3) if total else 0,
             "bosses": len(r.bosses), "lives": r.lives if r.coop else None,
             "age": round(time.time() - r.started_at),
-            "spectators": len(r.spectators), "away": len(r.away), "daily": bool(r.daily),
+            "spectators": len(r.spectators), "away": len(r.away), "daily": bool(r.daily), "weekly": bool(r.weekly),
             "depth": r.depth if r.mode == "descent" else None,
             "vault": None if not r.doors else ("open" if r.vault_open else "locked"),
         })
@@ -1908,7 +2066,8 @@ async def api_profile(request):
 
 
 async def api_descents(_):
-    return web.json_response(descent_board.board(), headers=NO_STORE)
+    week = this_week()
+    return web.json_response({**descent_board.board(week=week), "week": week, "room": weekly_name(week)}, headers=NO_STORE)
 
 
 def save_replay(rec, meta):

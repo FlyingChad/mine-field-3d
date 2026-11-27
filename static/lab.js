@@ -296,6 +296,8 @@ function renderProgress() {
       ...(h.some((g) => g.spikes !== undefined)
         ? [{ name: 'Spiked (v3)', color: SERIES[2], values: h.map((g) => g.spikes ?? 0) },
            { name: 'Pickups (v3)', color: SERIES[3], values: h.map((g) => g.items ?? 0) }] : []),
+      ...(h.some((g) => g.uses !== undefined)
+        ? [{ name: 'Items used (v4)', color: SERIES[4], values: h.map((g) => g.uses ?? 0) }] : []),
     ], 'lg-kos');
     lineChart('ch-boss', xs, [{ name: 'Boss damage', color: SERIES[0], values: h.map((g) => g.boss_damage ?? 0) }]);
   }
@@ -424,6 +426,7 @@ const MOVE_ARROWS = ['↖', '↑', '↗', '←', '→', '↙', '↓', '↘'];
 const NEAR = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0], [1, 1]];
 function actionName(a) {
   if (a === 26) return 'Attack';
+  if (a === 27) return 'Use item';
   if (a < 8) return `Move ${MOVE_ARROWS[a]}`;
   if (a < 17) return a - 8 === 4 ? 'Dig own tile' : `Dig ${NEAR_ARROWS[a - 8]}`;
   return a - 17 === 4 ? 'Flag own tile' : `Flag ${NEAR_ARROWS[a - 17]}`;
@@ -575,7 +578,8 @@ const netView = (() => {
       g.strokeStyle = 'rgba(158,172,189,.18)'; g.beginPath(); g.moveTo(n.x + 6, n.y); g.lineTo(pt.x, pt.y); g.stroke();
     });
     const GLOBAL_NAMES = target.version >= 3
-      ? ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'descent', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up', 'goal ↕', 'goal ↔', 'goal d', 'goal?']
+      ? ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'descent', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up', 'goal ↕', 'goal ↔', 'goal d', 'goal?',
+        'scatter', 'freeze', 'shock', 'blink', 'shield']
       : ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up'];
     const gl = layout.input.slice(-target.glob.length);
     g.font = '10px system-ui';
@@ -726,6 +730,7 @@ function drawFrame(f) {
     el('span', {}, `${k + 1}. ${a.label}`), el('span', { class: 'sc' }, fmt(a.score)),
     el('span', { class: 'meta' }, `${a.tiles} tiles · ${a.mines} mines hit` +
       (a.hp !== null && a.hp !== undefined ? ` · ${Math.round(a.hp * 100)} HP · ${a.kos} KOs · ${a.bossDmg} boss dmg` : '') +
+      (a.held !== null && a.held !== undefined ? ` · holding ${a.held || 'nothing'}${a.shield ? ' · shield' : ''} · ${a.uses} used` : '') +
       ` · last: ${actionName(a.act)}${a.ko ? ' · knocked out' : a.stun ? ' · stunned' : ''}`))));
   if (f.prefs) {
     const top = f.prefs.map((p, a) => [p, a]).filter(([p]) => p > 0.001).sort((x, y) => y[0] - x[0]).slice(0, 6);

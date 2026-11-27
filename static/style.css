@@ -215,7 +215,7 @@ body.touch .center { padding: 18px; }
 .daily .lbl { margin: 0; color: #ffd23f; }
 .daily .dSub { font-size: 12px; color: #c6d1de; margin-top: 2px; }
 .daily button { font-size: 13px; font-weight: 800; padding: 8px 14px; border-radius: 9px; border: 0; background: #ffd23f; color: #1a1400; white-space: nowrap; }
-.daily .dBoards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+.daily .dBoards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .roomCard .chips .descent { background: #6b3fa0; color: #fff; }
 /* big centre-screen announcements (descent floors) */
 .banner { position: fixed; left: 50%; top: 22%; transform: translate(-50%, -50%); text-align: center; pointer-events: none;
@@ -226,6 +226,7 @@ body.touch .center { padding: 18px; }
 #fade { position: fixed; inset: 0; background: #000; opacity: 0; pointer-events: none; transition: opacity .9s; }
 body.touch .banner #bannerBig { font-size: 34px; }
 .modRow { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #c6d1de; max-width: 220px; }
+.modRow #modDesc { min-width: 0; overflow-wrap: anywhere; }
 .chip.mod { background: #a0522d; white-space: nowrap; }
 /* the stairs shop */
 .shop { left: 50%; bottom: 96px; transform: translateX(-50%); width: min(640px, calc(100vw - 24px)); padding: 10px 12px; }
@@ -370,3 +371,15 @@ body.spectating .fsBtn { top: calc(78px + env(safe-area-inset-top)); }   /* belo
 .installBtn { width: auto; margin: -4px auto 12px; padding: 6px 14px; font-size: 13px; border-radius: 9px;
   background: transparent; color: #ffd23f; border: 1px solid #8a6a12; }
 .installBtn[hidden] { display: none; }
+
+/* ---- descent extras: relics, weekly ladder ---- */
+.relics { left: 50%; top: 84px; transform: translateX(-50%); width: min(640px, calc(100vw - 24px)); padding: 10px 12px; z-index: 6;
+  border: 1px solid #8a6a12; }
+.relics .shopHead b { color: #ffe28a; }
+.relicRow { display: flex; flex-wrap: wrap; gap: 4px; max-width: 260px; }
+.chip.relic { background: #3a2d08; color: #ffe28a; border: 1px solid #8a6a12; }
+.daily .weeklyBtn { margin: 6px 0 0; width: auto; padding: 5px 10px; font-size: 12px; font-weight: 800; border-radius: 8px; border: 0;
+  background: #c77dff; color: #1a0b26; }
+.weeklyBtn[hidden] { display: none; }
+body.touch .relics { top: auto; bottom: calc(190px + env(safe-area-inset-bottom)); }
+@media (max-width: 900px) and (min-width: 721px) { .daily .dBoards { grid-template-columns: 1fr 1fr; } }

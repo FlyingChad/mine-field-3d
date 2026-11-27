@@ -260,6 +260,131 @@ class V3(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
+class V4(unittest.TestCase):
+    """Power-ups (powers=True, v4 models): held items, shields and the USE action."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+
+    def env(self, mode="pvp", agents=2, bosses=False):
+        from ai.env import MineEnv, DIG0
+        e = MineEnv(1, agents, 12, 12, 12, 300, 3, rich=True, mode=mode, bosses=bosses, powers=True,
+                    rewards={"step": 0})
+        e.pos[0, :] = torch.tensor([6, 6])
+        e.step(torch.tensor([[DIG0 + 4] + [26] * (agents - 1)]))
+        e.traps.zero_(); e.items.zero_()
+        e.stun.zero_(); e.hp.fill_(100.0)        # (in PvP the opening "attack" may have hit someone)
+        return e
+
+    def test_shapes_and_upgrade(self):
+        from ai.env import MineEnv, obs_dim, n_actions, N_CHANNELS_V3, N_GLOBAL_V4, USE
+        from ai.policy import Spec, upgrade, USE_BIAS
+        s4 = Spec(2, [16, 8], "tanh", 4)
+        self.assertEqual((s4.in_dim, s4.out_dim), (25 * N_CHANNELS_V3 + N_GLOBAL_V4, 28))
+        self.assertEqual((n_actions(4), USE), (28, 27))
+        e = MineEnv(4, 2, 12, 12, 20, 100, 3, rich=True, mode="mixed", bosses=True, powers=True)
+        self.assertEqual(tuple(e.observe(0, 2, 4).shape), (4, obs_dim(2, 4)))
+        self.assertEqual(tuple(e.mask(0, 4).shape), (4, 28))
+        for old_v in (2, 3):
+            old = Spec(2, [16, 8], "tanh", old_v)
+            w = old.init(1)[0] + torch.randn(old.n_params) * 0.3
+            w4 = upgrade(old, w, s4)
+            l_old = old.forward(w[None], e.observe(0, 2, old_v)[None])[0]
+            l4 = s4.forward(w4[None], e.observe(0, 2, 4)[None])[0]     # nobody holds anything yet
+            if old_v == 3:
+                self.assertTrue(torch.allclose(l_old, l4[:, :27], atol=1e-5))
+            self.assertTrue(torch.allclose(l4[:, 27], torch.full((4,), USE_BIAS)))
+
+    def test_pickups_and_shield(self):
+        from ai.env import DIG0
+        e = self.env()
+        y, x = (e.revealed[0] & ~e.mines[0]).nonzero()[0].tolist()
+        e.pos[0, 0] = torch.tensor([y, x])
+        e.items[0, y, x] = 5                       # freeze
+        e.step(torch.tensor([[26, 26]]))
+        self.assertEqual(int(e.held[0, 0]), 2)
+        e.items[0, y, x] = 7                       # blink: hands are full
+        e.step(torch.tensor([[26, 26]]))
+        self.assertEqual((int(e.held[0, 0]), int(e.items[0, y, x])), (2, 7))
+        e.items[0, y, x] = 3
+        e.step(torch.tensor([[26, 26]]))
+        self.assertTrue(bool(e.shield[0, 0]))
+        # the shield soaks a mine: no penalty, no stun, no damage
+        my, mx = (~e.revealed[0] & e.mines[0]).nonzero()[0].tolist()
+        e.pos[0, 0] = torch.tensor([my, mx])
+        s0, hp = e.score[0, 0].item(), e.hp[0, 0].item()
+        e.step(torch.tensor([[DIG0 + 4, 26]]))
+        self.assertEqual((e.score[0, 0].item(), e.hp[0, 0].item(), int(e.stun[0, 0])), (s0, hp, 0))
+        self.assertFalse(bool(e.shield[0, 0]))
+
+    def test_freeze_shockwave_and_coop(self):
+        from ai.env import USE, RICH
+        e = self.env("pvp")
+        e.pos[0, 0] = torch.tensor([6, 6]); e.pos[0, 1] = torch.tensor([6, 9])
+        self.assertFalse(bool(e.use_ok(0)[0]), "nothing held")
+        e.held[0, 0] = 2
+        self.assertTrue(bool(e.use_ok(0)[0]))
+        e.step(torch.tensor([[USE, 26]]))
+        self.assertEqual(int(e.held[0, 0]), 0)
+        self.assertGreaterEqual(int(e.stun[0, 1]), RICH["freeze_steps"] - 1)
+        e.stun.zero_()
+        e.held[0, 0] = 3
+        hp = e.hp[0, 1].item()
+        e.step(torch.tensor([[USE, 26]]))
+        self.assertEqual(hp - e.hp[0, 1].item(), RICH["shock_damage"])
+        c = self.env("coop")
+        c.pos[0, 0] = torch.tensor([6, 6]); c.pos[0, 1] = torch.tensor([6, 7])
+        c.held[0, 0] = 2
+        self.assertFalse(bool(c.use_ok(0)[0]), "no freezing teammates")
+        c.held[0, 0] = 3
+        hp = c.hp[0, 1].item()
+        c.step(torch.tensor([[USE, 26]]))
+        self.assertEqual(c.hp[0, 1].item(), hp, "the shockwave spares teammates")
+
+    def test_freeze_and_shock_the_boss(self):
+        from ai.env import USE, RICH
+        e = self.env("coop", agents=1, bosses=True)
+        e.boss_on[0] = True; e.boss_hp[0] = 300.0
+        e.boss_pos[0] = torch.tensor([6, 9]); e.pos[0, 0] = torch.tensor([6, 6])
+        e.held[0, 0] = 2
+        e.step(torch.tensor([[USE]]))
+        self.assertEqual(e.boss_hp[0].item(), 300 - RICH["freeze_boss"])
+        self.assertGreater(int(e.boss_stun[0]), 0)
+        pos = e.boss_pos[0].clone()
+        e.step(torch.tensor([[26]]))
+        self.assertTrue(torch.equal(e.boss_pos[0], pos), "a frozen boss stays put")
+
+    def test_scatter_recovers_and_reseeds(self):
+        import torch.nn.functional as F
+        from ai.env import USE, RICH
+        e = self.env("pvp")
+        e.pos[0, 0] = torch.tensor([6, 6]); e.pos[0, 1] = torch.tensor([6, 9])
+        e.revealed[0, 4:9, 7:12] = True
+        e.held[0, 0] = 1
+        e.step(torch.tensor([[USE, 26]]))
+        area = e.revealed[0, 4:9, 7:12]
+        self.assertFalse(bool(area.any()), "the blast re-covers a 5x5")
+        self.assertEqual(int(e.mines[0, 4:9, 7:12].sum()), RICH["scatter_mines"])
+        c = F.conv2d(e.mines.float()[:, None], torch.ones(1, 1, 3, 3), padding=1)[:, 0].long() - e.mines.long()
+        self.assertTrue(torch.equal(c, e.counts))
+        self.assertEqual(int(e.safe_total[0]), int((e.floor[0] & ~e.mines[0]).sum()))
+        self.assertLess(e.hp[0, 1].item(), 100)
+
+    def test_blink_goes_somewhere_worth_digging(self):
+        from ai.env import USE
+        e = self.env("race", agents=1)
+        e.held[0, 0] = 4
+        ok, by, bx = e._blink_spot(0)
+        if not bool(ok[0]):
+            self.skipTest("no spot on this board")
+        e.step(torch.tensor([[USE]]))
+        y, x = e.pos[0, 0].tolist()
+        self.assertTrue(bool(e.revealed[0, y, x]))
+        hidden = (~e.revealed[0] & e.floor[0])[max(0, y - 1):y + 2, max(0, x - 1):x + 2].sum()
+        self.assertGreater(int(hidden), 2)
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class InGameBot(unittest.IsolatedAsyncioTestCase):
     async def test_v3_bot_in_descent(self):
         """A v3 brain gets traps, pickups and the goal from a live descent room and acts on them."""
@@ -301,6 +426,31 @@ class InGameBot(unittest.IsolatedAsyncioTestCase):
         await r.update_bots(t0 + 100, 0.07)
         path = r.bfs((bx, by), (far % S.W, far // S.W))
         self.assertEqual(S.tile_center(*path[0]), (bot.tx, bot.tz))
+
+    async def test_v4_bot_uses_its_item(self):
+        """A v4 bot (upgraded from v3, so it uses items whenever they'd hit) freezes a rival in PvP,
+        and the built-in rule no longer fires for it."""
+        from ai.bots import Brain
+        from ai.policy import Spec, upgrade
+        from helpers import S, player, at, field_room
+        r = field_room("pvp", name="v4")
+        h = player(r, "H")
+        bot = S.BotPlayer(Brain.__new__(Brain), "bot", "#123", "robot", "insane", 0.05)
+        s3, s4 = Spec(3, [16], "tanh", 3), Spec(3, [16], "tanh", 4)
+        bot.brain.name, bot.brain.spec = "v4", s4
+        bot.brain.w = upgrade(s3, s3.init(1)[0], s4)[None]
+        r.players[bot.id] = bot
+        at(bot, 20, 20); bot.tx, bot.tz = bot.x, bot.z
+        at(h, 24, 20)
+        r.generate(10, 10)
+        bot.held, bot.throw_at = "freeze", 0
+        t0 = 1e9
+        for k in range(10):
+            await r.update_bots(t0 + k * 0.1, 0.1)
+            if not bot.held:
+                break
+        self.assertIsNone(bot.held, "the v4 bot used its freeze")
+        self.assertGreater(h.frozen_until, 0)
 
     async def test_bot_stays_on_floor_and_carries_the_key(self):
         from ai.bots import Brain

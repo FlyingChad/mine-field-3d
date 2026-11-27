@@ -115,6 +115,26 @@ Clearing a floor gives everyone **+10 × the floor number** and the team **+1 li
 | Swarm | One extra boss, but every boss has 60% health |
 | Treasure trove | Twice as many power-ups are buried |
 | Volatile | Mines hit for 50 damage instead of 35 |
+| Cursed ground | Flags won't stay planted: no flags on this floor |
+| Flooded | Knee-deep water slows everyone to 70% speed, monsters too |
+
+**Relics:** when a floor is cleared, everyone is also offered 3 relics they don't have yet and may take one, free. Relics last the whole run:
+
+| Relic | Effect |
+|---|---|
+| Iron Skin | Take 25% less damage |
+| Prospector | +50% points for every tile you dig |
+| Brute | Your sword hits bosses 50% harder |
+| Bloodthirst | Heal 4 HP every time your sword hits a boss |
+| Sapper's Luck | Mines deal half damage to you |
+| Iron Boots | Spike traps can't hurt you |
+| Scavenger | Start every floor holding a power-up |
+| Phoenix Feather | Once per floor, a knockout leaves you on 1 HP instead |
+| Cartographer | A radar sweep where you land on every floor |
+
+The relics you hold show under the floor's twist in the top-left panel.
+
+**Elite bosses:** every 5th floor, one boss is an **elite** (Ogre Warlord, Wraith Queen or Golem Colossus): bigger, with 2.5× the health and a harder smash. Besides its smash it winds up a **quake**, a wide red ring (3.5 tiles) that hits everyone inside for 25 and stuns them, so back off when it winds up. Beating it pays double rewards and drops extra loot.
 
 Every floor down is harder:
 
@@ -129,6 +149,8 @@ What carries over between floors:
 - **Lost:** timed effects (boots, gold rush) and the vault key.
 
 The run ends when the team runs out of lives. It's then recorded on the **Deepest descents** board on the join screen (`data/descents.json`), and a new run starts at floor 1. Reaching floor 5 unlocks the **Lantern** hat.
+
+**The weekly descent:** press **Play the weekly descent** on the join screen (room `weekly-2026-W48` for that ISO week). Every team gets the same floors all week: the same layouts, mines, loot, traps and floor twists, floor after floor. Runs go on that week's ladder, next to the all-time board.
 
 ## Health
 
@@ -259,12 +281,15 @@ Pick one of 18 characters and a colour on the join screen: Miner, Robot, Knight,
 Open **http://localhost:8080/lab** to evolve neural-network opponents. This needs PyTorch; see `requirements-ai.txt`.
 
 1. **Training:** set the hyperparameters on the left (board, map layout, network size, population, mutation, reward weights) and press **Start training**. Set *Map layout* to **dungeon** to train bots on rooms and corridors like the game's dungeons.
-   - **Model type 3** (the default) trains bots for the whole dungeon. On top of everything type 2 sees, they see **spike traps** (and whether the spikes are up), **pickups** and a **goal**: the stairs once a Descent floor is cleared, or the vault door while carrying the key. They learn **Descent** as a fourth mode.
+   - **Model type 4** (the default) adds **power-ups**. Pickups in training are now the real ones: shields soak a hit, food heals, and the held items (scatter, freeze, shockwave, blink) fill the bot's item slot. A type 4 bot sees what it's holding and has a **Use item** action. It learns *when* to use an item; *where* to aim is the game's built-in rule (the nearest rival or boss in range, everyone around you for the shockwave, and the dug-up spot with the most hidden ground for a blink).
+     - **Warm start:** a type 3 (or type 2) model with the same vision radius and layers can seed a type 4 run. It starts out using items whenever they'd hit something, like the built-in rule, and evolution learns when holding on is better.
+     - The Progress tab adds an "Items used" line.
+   - **Model type 3** trains bots for the whole dungeon. On top of everything type 2 sees, they see **spike traps** (and whether the spikes are up), **pickups** and a **goal**: the stairs once a Descent floor is cleared, or the vault door while carrying the key. They learn **Descent** as a fourth mode.
      - On training boards, revealed traps hurt while their spikes are up, pickups pay a small reward (food heals, and is only taken when hurt), and a cleared Descent board opens stairs 2–4 tiles away that everyone is rewarded for reaching.
      - *Descent practice* (0.5 by default, LIVE) starts that share of Descent boards almost fully dug, so finishing a floor and finding the stairs comes up often enough to learn.
      - **Warm start:** pick a type 2 model with the same vision radius and layers (such as **allmodes**) in *Start from model*. The type 3 run keeps everything it knew and starts out blind to the new inputs, so it plays exactly like the old model until evolution finds a use for them.
    - **Model type 2** trains bots that play Race, PvP and Co-op. They see their own health, the boss and its wind-up danger zone, which players are teammates, and which mode they're in. They can **attack**.
-   - *Game mode* **mixed** gives each training board a random mode (Race, PvP, Co-op, and Descent for type 3), so one model learns them all.
+   - *Game mode* **mixed** gives each training board a random mode (Race, PvP, Co-op, and Descent for types 3 and 4), so one model learns them all.
    - In Co-op, every bot is scored on the team's average, so they learn to work together. In PvP, knocking out a rival pays.
    - *Bosses* adds a boss to every training board.
    - **Model type 1** is the classic minesweeper-only bot.
@@ -287,7 +312,8 @@ Open **http://localhost:8080/lab** to evolve neural-network opponents. This need
 5. **Deploy bots:** add a model to any game room as a player with a character and a difficulty (how fast it acts). Bots follow exactly the same rules as people.
    - Type 2 bots read the room's mode, their health, nearby bosses and their teammates, and decide for themselves when to attack.
    - Type 3 bots also decide for themselves about traps, pickups and food, and walk to the stairs or the vault door when it is within 4 tiles; further away, a built-in path-finder takes them there.
-   - Types 1 and 2 use built-in rules for food, traps, the key and the stairs. Held power-ups are used by built-in rules for every bot.
+   - Type 4 bots also decide when to use their held power-up (the game aims it for them).
+   - Types 1 and 2 use built-in rules for food, traps, the key and the stairs. Types 1–3 use held power-ups by a built-in rule.
 
 Models are saved in `models/`, configs in `configs/` and run histories in `runs/`.
 

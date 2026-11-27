@@ -1,7 +1,7 @@
 """Bot brains: run a trained network against a live game room (server.Room) to choose actions."""
 import torch
 
-from .env import ATTACK, DIG0, FLAG0, MODES, MOVES, NEAR, action_mask, encode
+from .env import ATTACK, DIG0, FLAG0, HELD, MODES, MOVES, NEAR, USE, action_mask, encode
 from .models import load_model
 from .policy import choose
 
@@ -27,7 +27,8 @@ class Brain:
         extra (v2 models): {"hp": 0..1, "mode": "race"|"pvp"|"coop", "allies": [(x, y)],
         "boss": (x, y, hp 0..1, winding_up) or None, "attack_ok": bool}. others_xy are then rivals only.
         v3 models also read "traps": [(x, y, up)], "items": [(x, y)] and "goal": (x, y) or None, and
-        mode may be "descent"."""
+        mode may be "descent". v4 models also read "held" (an id from HELD, "" for none), "shield" and
+        "use_ok" (the game found a target for the held item), and may answer ('use', 0, 0)."""
         rev = torch.frombuffer(bytearray(revealed), dtype=torch.uint8).view(1, H, W).bool()
         fl = torch.frombuffer(bytearray(floor), dtype=torch.uint8).view(1, H, W).bool() if floor is not None else None
         cnt = torch.tensor(counts, dtype=torch.long).view(1, H, W) if counts else torch.zeros(1, H, W, dtype=torch.long)
@@ -85,12 +86,20 @@ class Brain:
                     goal[0, g[1], g[0]] = True
                     gpos, gon = torch.tensor([[g[1], g[0]]]), torch.tensor([True])
                 ex.update(trap=trap, spikes=spikes, items=items, goal=goal, goal_pos=gpos, goal_on=gon)
+            use_ok = None
+            if self.version >= 4:
+                h = extra.get("held") or ""
+                ex.update(held=torch.tensor([HELD.index(h) if h in HELD else 0]),
+                          shield=torch.tensor([bool(extra.get("shield"))]))
+                use_ok = torch.tensor([bool(extra.get("use_ok")) and bool(h)])
             obs = encode(rev, cnt, exp, fo, pos, oth, self.spec.radius, fl, ex)
-            mask = action_mask(rev, fo, pos, 0, fl, torch.tensor([bool(extra.get("attack_ok", False))]))
+            mask = action_mask(rev, fo, pos, 0, fl, torch.tensor([bool(extra.get("attack_ok", False))]), use_ok)
         else:
             obs = encode(rev, cnt, exp, fo, pos, oth, self.spec.radius, fl)
             mask = action_mask(rev, fo, pos, 0, fl)
         a = int(choose(self.spec.forward(self.w, obs.unsqueeze(0))[0], mask)[0])
+        if a == USE:
+            return "use", 0, 0
         if a == ATTACK:
             return "attack", 0, 0
         if a < DIG0:

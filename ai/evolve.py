@@ -26,7 +26,7 @@ SCHEMA = [
         {"key": "run_name", "label": "Run name", "type": "text", "default": "", "help": "Name used for auto-saved models. Blank = timestamp."},
         {"key": "generations", "label": "Generations", "type": "int", "default": 0, "min": 0, "max": 100000, "help": "Stop after this many generations (0 = run until stopped)."},
         {"key": "save_every", "label": "Auto-save every", "type": "int", "default": 10, "min": 1, "max": 1000, "help": "Save the current best model every N generations."},
-        {"key": "seed_model", "label": "Start from model", "type": "model", "default": "", "help": "Continue evolving a saved model (same network shape). A v2 model can seed a v3 run with the same radius and layers: it keeps everything it knows and starts blind to the new inputs."},
+        {"key": "seed_model", "label": "Start from model", "type": "model", "default": "", "help": "Continue evolving a saved model (same network shape). An older model (v2, v3) can seed a newer run (v3, v4) with the same radius and layers: it keeps everything it knows."},
         {"key": "device", "label": "Device", "type": "select", "options": ["auto", "cuda", "cpu"], "default": "auto"},
     ]},
     {"group": "Environment", "fields": [
@@ -45,8 +45,8 @@ SCHEMA = [
         {"key": "bosses", "label": "Bosses", "type": "bool", "default": True, "help": "v2 models only. A boss roams every board, winds up and smashes; bots can attack it."},
     ]},
     {"group": "Network", "fields": [
-        {"key": "model_version", "label": "Model type", "type": "select", "options": ["3", "2", "1"], "default": "3",
-         "help": "3 = also sees spike traps, pickups and the stairs, and learns Descent. 2 = every mode: health, bosses, allies, attack. 1 = classic minesweeper only."},
+        {"key": "model_version", "label": "Model type", "type": "select", "options": ["4", "3", "2", "1"], "default": "4",
+         "help": "4 = also holds power-ups and learns when to use them. 3 = sees spike traps, pickups and the stairs, and learns Descent. 2 = every mode: health, bosses, allies, attack. 1 = classic minesweeper only."},
         {"key": "radius", "label": "Vision radius", "type": "int", "default": 3, "min": 1, "max": 7, "help": "The bot sees a (2r+1)² window of tiles around itself."},
         {"key": "hidden", "label": "Hidden layers", "type": "text", "default": "64", "help": "Comma-separated layer sizes, e.g. 64 or 128,64."},
         {"key": "activation", "label": "Activation", "type": "select", "options": ["tanh", "relu", "elu"], "default": "tanh"},
@@ -152,7 +152,8 @@ def make_env(cfg, n, agents, device, version=None, mode=None):
     return MineEnv(n, agents, cfg["board_h"], cfg["board_w"], cfg["mines"], cfg["episode_steps"],
                    cfg["stun_steps"], rewards_from(cfg), device, cfg.get("layout", "field"),
                    rich=version >= 2, mode=mode or cfg.get("mode", "race"), bosses=cfg.get("bosses", False),
-                   extras=version >= 3, params={"descent_practice": float(cfg.get("descent_practice", 0))})
+                   extras=version >= 3, powers=version >= 4,
+                   params={"descent_practice": float(cfg.get("descent_practice", 0))})
 
 
 @torch.no_grad()
@@ -208,9 +209,9 @@ def _train(cfg, cmd_q, evt_q):
     if cfg["seed_model"]:
         m = load_model(cfg["seed_model"])
         old = m["spec_obj"]
-        if old.version == 2 and spec.version == 3 and (old.radius, old.hidden, old.activation) == (
+        if 2 <= old.version < spec.version and (old.radius, old.hidden, old.activation) == (
                 spec.radius, spec.hidden, spec.activation):
-            m["weights"] = upgrade(old, m["weights"], spec)     # warm-start v3 from a v2 model
+            m["weights"] = upgrade(old, m["weights"], spec)     # warm-start a newer model from an older one
             m["spec_obj"] = spec
         if not m["spec_obj"].same_shape(spec):
             raise ValueError(f"Model {cfg['seed_model']} has network {m['spec_obj'].describe()}, but this run uses "
@@ -278,7 +279,7 @@ def _train(cfg, cmd_q, evt_q):
             "unflags": stats["unflags"].mean().item(),
             "best_tiles": stats["tiles"][0].item(), "best_mines_hit": stats["mines_hit"][0].item(),
             "clear_rate": cleared,
-            **{k: stats[k].mean().item() for k in ("kos", "boss_damage", "boss_kills", "pvp_kos", "items", "spikes", "stairs") if k in stats},
+            **{k: stats[k].mean().item() for k in ("kos", "boss_damage", "boss_kills", "pvp_kos", "items", "spikes", "stairs", "uses") if k in stats},
             "weights": best_vec.float().cpu().numpy(), "spec": spec.to_dict(),
         })
         if gen % cfg["save_every"] == 0:

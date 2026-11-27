@@ -116,7 +116,11 @@ class Recorder:
         elif kind == "bossHit" and m.get("by"):
             self._st(m["by"])["bossDmg"] += m.get("dmg", 0)
         elif kind == "bossSpawn":
-            self._moment(t, "boss", f"A {m.get('name', 'boss')} appeared")
+            self._moment(t, "boss", f"{'An elite' if m.get('elite') else 'A'} {m.get('name', 'boss')} appeared")
+        elif kind == "relic" and pid:
+            self._moment(t, "relic", f"{self._who(pid)} took the {m.get('name', 'relic')}", pid)
+        elif kind == "phoenix" and pid:
+            self._moment(t, "phoenix", f"{self._who(pid)}'s Phoenix Feather saved them", pid)
         elif kind == "bossDown":
             k = m.get("killer")
             if k:

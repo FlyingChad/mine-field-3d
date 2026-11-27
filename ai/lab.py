@@ -15,7 +15,7 @@ import torch
 from aiohttp import WSMsgType, web
 
 from . import evolve
-from .env import MODES
+from .env import HELD, MODES
 from .models import (CONFIGS_DIR, RUNS_DIR, delete_model, list_models, load_model, rename_model, safe_name)
 from .policy import Spec, choose
 
@@ -248,7 +248,7 @@ class Lab:
         v2 = {}
         if spec.version >= 2:   # boss, danger zone and allies within the vision window
             named = (("boss", 9), ("danger", 10), ("allies", 11))
-            if spec.version >= 3:   # traps, spikes up, pickups, the goal
+            if spec.version >= 3:   # traps, spikes up, pickups, the goal (v4 sees the same planes)
                 named += (("traps", 12), ("spikes", 13), ("items", 14), ("goal", 15))
             v2 = {k: [int(c) for c in (win[i] > 0).nonzero().view(-1).tolist()] for k, i in named}
 
@@ -291,7 +291,9 @@ class Lab:
                    "hp": round(env.hp[0, a].item() / env.p["max_hp"], 3) if env.rich else None,
                    "ko": bool(env.ko[0, a]) if env.rich else False,
                    "kos": int(env.stats["kos"][0, a]) if env.rich else 0,
-                   "bossDmg": int(env.stats["boss_damage"][0, a]) if env.rich else 0}
+                   "bossDmg": int(env.stats["boss_damage"][0, a]) if env.rich else 0,
+                   "held": HELD[int(env.held[0, a])] if env.powers else None, "shield": bool(env.shield[0, a]) if env.powers else False,
+                   "uses": int(env.stats["uses"][0, a]) if env.powers else 0}
                   for a, s in enumerate(sources)]
         boss = None
         if env.rich and bool(env.boss_on[0]):

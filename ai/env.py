@@ -28,7 +28,13 @@ extras=True (v3 models) adds the dungeon's newer pieces on top of rich:
     pays `floor` to everyone; the board ends when someone reaches the stairs (`stairs` to everyone) or
     after `stairs_auto` steps. The stairs are the "goal" the v3 observation points at (in the game the
     goal is also the vault door while carrying the key).
-Version-1/2 observations/actions are still produced for older models, so they keep working.
+powers=True (v4 models) also simulates the power-ups (server.py ITEM_WEIGHTS): pickups are generic
+(boots / radar / gold: just the `item` reward), food, a shield (absorbs the next hit) or one of the
+held items (scatter, freeze, shockwave, blink), which take the single item slot. Action USE fires the
+held item. Aiming is a fixed rule, the same as the game's: the nearest foe (a rival, or the boss) in
+range for scatter and freeze, everyone around you for the shockwave, and for blink the dug-up tile
+within reach with the most hidden ground around it. So v4 learns *when* to use an item, not where.
+Version-1/2/3 observations/actions are still produced for older models, so they keep working.
 
 `encode()` and `action_mask()` are standalone so the in-game bots (ai/bots.py) build exactly the same
 observations as training does.
@@ -45,7 +51,7 @@ import layouts  # noqa: E402  (shared with server.py so bots train on the same d
 
 MOVES = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]   # (dy, dx)
 NEAR = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]                      # reachable tiles
-DIG0, FLAG0, ATTACK = 8, 17, 26
+DIG0, FLAG0, ATTACK, USE = 8, 17, 26, 27
 N_ACTIONS = 26                 # v1
 N_CHANNELS = 10                # v1: hidden, flagged, exploded, n0, n1, n2, n3, n4+, other agent, out of bounds
 N_GLOBAL = 3                   # v1: direction (dy, dx) and distance to the nearest diggable tile
@@ -58,6 +64,14 @@ MODES = ["race", "pvp", "coop", "descent"]   # v2 sees descent as coop (it only 
 N_CHANNELS_V3 = 17
 # v3 globals: v2's with a 4-way mode one-hot (14), then goal dy, dx, distance, present
 N_GLOBAL_V3 = 18
+# v4 (powers): v3's channels; globals v3's 18 + held item one-hot (scatter, freeze, shockwave, blink) + shield
+N_GLOBAL_V4 = 23
+HELD = ["", "scatter", "freeze", "shockwave", "blink"]   # held item ids, as in server.HELD
+# item codes on the board when powers=True: 1 generic, 2 food, 3 shield, 4.. held items (4 + HELD index - 1)
+ITEM_CODES = {"radar": 1, "boots": 1, "gold": 1, "apple": 2, "potion": 2, "shield": 3,
+              "scatter": 4, "freeze": 5, "shockwave": 6, "blink": 7}
+ITEM_WEIGHTS = {"scatter": 4, "shield": 3, "radar": 3, "boots": 3, "freeze": 3, "gold": 3, "shockwave": 2, "blink": 3,
+                "apple": 5, "potion": 2}   # as in server.py
 
 # unflag: charged when an agent removes its own flag. Training-only shaping that stops bots from
 # toggling a flag on and off as a "safe" way to pass a turn (the lab's default is -0.5).
@@ -72,11 +86,17 @@ RICH = dict(max_hp=100, mine_damage=35, smash_damage=30, pvp_damage=15, attack_d
             # curriculum: this share of descent boards start with everything dug except a square of
             # radius 1..practice_radius around the first dig, so finishing a floor and finding the
             # stairs comes up often (radius 1 = the safe first dig clears it at once)
-            descent_practice=0.0, practice_radius=3)
+            descent_practice=0.0, practice_radius=3,
+            # powers (v4), from server.py's THROW_RANGE, SCATTER_*, FREEZE_*, SHOCK_*, BLINK_RANGE, BOSS_POWER_DAMAGE
+            throw_range=6, scatter_radius=2, scatter_mines=6, scatter_damage=25, scatter_stun=3, scatter_boss=60,
+            freeze_range=9, freeze_steps=8, freeze_boss=20, shock_radius=3, shock_damage=10, shock_stun=3,
+            shock_boss=40, boss_stagger=2, blink_range=8)
 
 
 def obs_dim(radius, version=1):
     K2 = (2 * radius + 1) ** 2
+    if version >= 4:
+        return K2 * N_CHANNELS_V3 + N_GLOBAL_V4
     if version >= 3:
         return K2 * N_CHANNELS_V3 + N_GLOBAL_V3
     return K2 * N_CHANNELS + N_GLOBAL if version < 2 else K2 * N_CHANNELS_V2 + N_GLOBAL_V2
@@ -87,7 +107,7 @@ def n_channels(version=1):
 
 
 def n_actions(version=1):
-    return N_ACTIONS if version < 2 else N_ACTIONS + 1
+    return N_ACTIONS if version < 2 else N_ACTIONS + 1 if version < 4 else N_ACTIONS + 2
 
 
 def _gather(t, flat):
@@ -107,7 +127,8 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
     extra (v2 only): dict with boss, danger, allies (N,H,W) bool; hp (N,) in 0..1; mode (N,) long;
     boss_pos (N,2) long; boss_on (N,) bool; boss_hp (N,) in 0..1; windup (N,) bool.
     v3 when extra also has "goal": trap, spikes, items, goal (N,H,W) bool; goal_pos (N,2); goal_on (N,).
-    Returns (N, obs_dim(radius, 1, 2 or 3)) float32.
+    v4 when extra also has "held": held (N,) long (index in HELD), shield (N,) bool.
+    Returns (N, obs_dim(radius, version)) float32.
     """
     N, H, W = revealed.shape
     r, K = radius, 2 * radius + 1
@@ -174,13 +195,16 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
         zero = torch.zeros(N, device=dev)
         g += [torch.where(gon, gdy / gden, zero), torch.where(gon, gdx / gden, zero),
               torch.where(gon, gd.clamp(max=16.0) / 16.0, torch.ones(N, device=dev)), gon.float()]
+    if extra is not None and "held" in extra:
+        held = extra["held"]
+        g += [(held == k).float() for k in range(1, len(HELD))] + [extra["shield"].float()]
     return torch.cat([win, torch.stack(g, 1)], 1)
 
 
-def action_mask(revealed, flag_owner, pos, agent, floor=None, attack_ok=None):
-    """(N, N_ACTIONS [+1]) bool of actions that would do something for `agent` standing at pos (N,2).
+def action_mask(revealed, flag_owner, pos, agent, floor=None, attack_ok=None, use_ok=None):
+    """(N, N_ACTIONS [+1 [+1]]) bool of actions that would do something for `agent` standing at pos (N,2).
     With a floor mask, moves into walls and digs/flags on walls are masked out. With attack_ok (N,)
-    (v2), an attack column is appended."""
+    (v2), an attack column is appended; with use_ok (N,) (v4) a use-item column after it."""
     N, H, W = revealed.shape
     dev = revealed.device
     mv = torch.tensor(MOVES, device=dev)
@@ -203,6 +227,8 @@ def action_mask(revealed, flag_owner, pos, agent, floor=None, attack_ok=None):
     parts = [move_ok, dig_ok, flag_ok]
     if attack_ok is not None:
         parts.append(attack_ok.view(N, 1))
+    if use_ok is not None:
+        parts.append(use_ok.view(N, 1))
     return torch.cat(parts, 1)
 
 
@@ -220,7 +246,7 @@ def dungeon_bank(h, w, size=96):
 
 class MineEnv:
     def __init__(self, n, agents=1, h=16, w=16, mines=40, steps=250, stun=10, rewards=None, device="cpu",
-                 layout="field", rich=False, mode="race", bosses=False, params=None, extras=False):
+                 layout="field", rich=False, mode="race", bosses=False, params=None, extras=False, powers=False):
         """layout: "field" (every tile is floor) or "dungeon" (rooms and corridors from layouts.py).
         For dungeons `mines` is read as a density: each board gets mines/(h*w) of its floor tiles.
         rich / mode / bosses: see the module docstring."""
@@ -233,7 +259,8 @@ class MineEnv:
         self.rich = bool(rich)
         self.mode_name = mode if mode in MODES + ["mixed"] else "race"
         self.bosses = bool(bosses) and self.rich
-        self.extras = bool(extras) and self.rich
+        self.extras = bool(extras or powers) and self.rich
+        self.powers = bool(powers) and self.extras
         self.p = {**RICH, **(params or {})}
         self.device = torch.device(device)
         self.kernel = torch.ones(1, 1, 3, 3, device=self.device)
@@ -298,6 +325,12 @@ class MineEnv:
         self.stairs_t = torch.zeros(N, dtype=torch.long, device=dev)
         if self.extras:
             self.stats.update(items=z(), spikes=z(), stairs=z())
+        # powers (v4) state: the held item (index in HELD), a shield, and a boss stagger/freeze timer
+        self.held = torch.zeros(N, A, dtype=torch.long, device=dev)
+        self.shield = torch.zeros(N, A, dtype=torch.bool, device=dev)
+        self.boss_stun = torch.zeros(N, dtype=torch.long, device=dev)
+        if self.powers:
+            self.stats.update(uses=z(), shielded=z())
 
     # ---------------------------------------------------------------- observations
     def others_mask(self, a, split=False):
@@ -346,6 +379,8 @@ class MineEnv:
             goal[torch.arange(N, device=self.device), self.stairs_pos[:, 0], self.stairs_pos[:, 1]] = self.stairs_on
             ex.update(trap=self.traps & self.revealed, spikes=self.spikes_up(), items=(self.items > 0) & self.revealed,
                       goal=goal, goal_pos=self.stairs_pos, goal_on=self.stairs_on)
+        if version >= 4:
+            ex.update(held=self.held[:, a], shield=self.shield[:, a])
         return rivals, ex
 
     def observe(self, a, radius, version=1):
@@ -368,7 +403,54 @@ class MineEnv:
             ok |= (self.mode == 1) & (d.min(1).values <= 1)
         return ok
 
+    def _foe(self, a):
+        """The nearest foe of agent a on every board: a conscious rival (not in co-op) or the boss.
+        Returns (distance (N,) float (1e9 = none), y, x, is_boss (N,) bool, rival index (N,))."""
+        N, A = self.N, self.A
+        py, px = self.pos[:, a, 0], self.pos[:, a, 1]
+        d = torch.maximum((self.pos[:, :, 0] - py[:, None]).abs(), (self.pos[:, :, 1] - px[:, None]).abs()).float()
+        d[:, a] = 1e9
+        d[self.ko | (self.stun > 0)] = 1e9       # like the game, skip rivals who are already stunned
+        d[self.mode >= 2] = 1e9                  # teammates aren't targets
+        dr, ri = d.min(1)
+        db = torch.where(self.boss_on, torch.maximum((self.boss_pos[:, 0] - py).abs(),
+                                                     (self.boss_pos[:, 1] - px).abs()).float(), torch.full_like(dr, 1e9))
+        boss = db < dr                           # rivals first on a tie, like the game's sort
+        ar = torch.arange(N, device=self.device)
+        y = torch.where(boss, self.boss_pos[:, 0], self.pos[ar, ri, 0])
+        x = torch.where(boss, self.boss_pos[:, 1], self.pos[ar, ri, 1])
+        return torch.minimum(dr, db), y, x, boss, ri
+
+    def _blink_spot(self, a):
+        """Where a blink would take agent a: the dug-up tile within blink_range with the most hidden
+        neighbours (more than 2), or none. Returns (ok (N,), y, x)."""
+        N, H, W = self.N, self.H, self.W
+        hid = (~self.revealed & self.floor).float().unsqueeze(1)
+        n = F.conv2d(hid, self.kernel, padding=1).squeeze(1)
+        py, px = self.pos[:, a, 0].view(N, 1, 1), self.pos[:, a, 1].view(N, 1, 1)
+        yy = torch.arange(H, device=self.device).view(1, H, 1)
+        xx = torch.arange(W, device=self.device).view(1, 1, W)
+        near = torch.maximum((yy - py).abs(), (xx - px).abs()) <= self.p["blink_range"]
+        cand = self.revealed & ~self.exploded & self.floor & near & (n > 2)
+        score = torch.where(cand, n + torch.rand(N, H, W, device=self.device) * 0.5, torch.full_like(n, -1.0))
+        best = score.reshape(N, -1).argmax(1)
+        return cand.reshape(N, -1).any(1), best // W, best % W
+
+    def use_ok(self, a):
+        """Would USE do something? The held item has a target (scatter, freeze), always (shockwave), or
+        somewhere worth blinking to. Items only work once the board has mines (as in the game)."""
+        h = self.held[:, a]
+        ok = (h == 3)
+        if bool(((h == 1) | (h == 2)).any()):
+            d = self._foe(a)[0]
+            ok |= (h == 1) & (d <= self.p["throw_range"]) | (h == 2) & (d <= self.p["freeze_range"])
+        if bool((h == 4).any()):
+            ok |= (h == 4) & self._blink_spot(a)[0]
+        return ok & (h > 0) & self.generated & ~self.ko[:, a]
+
     def mask(self, a, version=1):
+        if version >= 4:
+            return action_mask(self.revealed, self.flag_owner, self.pos[:, a], a, self.floor, self.attack_ok(a), self.use_ok(a))
         if version >= 2:
             return action_mask(self.revealed, self.flag_owner, self.pos[:, a], a, self.floor, self.attack_ok(a))
         return action_mask(self.revealed, self.flag_owner, self.pos[:, a], a, self.floor)
@@ -410,8 +492,17 @@ class MineEnv:
             self.traps[idx] = tr
             self.phase[idx] = torch.randint(0, p["spike_cycle"], (n, H, W), device=self.device)
             it = free & ~tr & (torch.rand(n, H, W, device=self.device) < p["item_density"])
-            food = torch.rand(n, H, W, device=self.device) < p["food_share"]
-            self.items[idx] = torch.where(it, torch.where(food, 2, 1), 0).to(torch.int8)
+            if self.powers:
+                kinds = list(ITEM_WEIGHTS)
+                w = torch.tensor([ITEM_WEIGHTS[k] for k in kinds], dtype=torch.float, device=self.device)
+                pick = torch.multinomial(w, n * H * W, replacement=True).view(n, H, W)
+                code = torch.tensor([ITEM_CODES[k] for k in kinds], dtype=torch.int8, device=self.device)[pick]
+                coop = (self.mode[idx] >= 2).view(n, 1, 1)
+                code = torch.where(coop & (code == ITEM_CODES["scatter"]), torch.ones_like(code), code)   # no scatter in co-op
+                self.items[idx] = torch.where(it, code, torch.zeros_like(code))
+            else:
+                food = torch.rand(n, H, W, device=self.device) < p["food_share"]
+                self.items[idx] = torch.where(it, torch.where(food, 2, 1), 0).to(torch.int8)
             practice = (self.mode[idx] == 3) & (torch.rand(n, device=self.device) < p["descent_practice"])
             if practice.any():
                 rad = torch.randint(1, p["practice_radius"] + 1, (n, 1, 1), device=self.device)
@@ -443,6 +534,15 @@ class MineEnv:
         """Damage agents ag on boards b (1-D long tensors, unique boards). Handles knockouts."""
         if b.numel() == 0:
             return
+        if self.powers:
+            sh = self.shield[b, ag]
+            if sh.any():          # a shield soaks the whole hit
+                self.shield[b[sh], ag[sh]] = False
+                self.stats["shielded"][b[sh], ag[sh]] += 1
+                b, ag = b[~sh], ag[~sh]
+                by = by[~sh] if by is not None else None
+                if b.numel() == 0:
+                    return
         self.hp[b, ag] -= amount
         if stun:
             self.stun[b, ag] = torch.maximum(self.stun[b, ag], torch.full_like(self.stun[b, ag], stun))
@@ -481,7 +581,9 @@ class MineEnv:
             self.boss_hp[s] = float(p["boss_hp"])
             self.boss_windup[s] = 0
             self.boss_cd[s] = 0
-        on = live & self.boss_on
+        held_still = self.boss_stun > 0               # frozen or staggered (power-ups)
+        self.boss_stun = (self.boss_stun - 1).clamp(min=0)
+        on = live & self.boss_on & ~held_still
         if not on.any():
             return
         d = torch.maximum((self.pos[:, :, 0] - self.boss_pos[:, None, 0]).abs(),
@@ -558,6 +660,11 @@ class MineEnv:
                     self.revealed.view(N, -1)[b, flat[b]] = True
                     self.exploded.view(N, -1)[b, flat[b]] = True
                     self.flag_owner.view(N, -1)[b, flat[b]] = -1
+                    if self.powers:   # a shield soaks the blast: no penalty, stun or damage
+                        sh = self.shield[b, ab]
+                        self.shield[b[sh], ab[sh]] = False
+                        self.stats["shielded"][b[sh], ab[sh]] += 1
+                        b, ab = b[~sh], ab[~sh]
                     self.score[b, ab] += rw["mine"]
                     self.stun[b, ab] = self.stun_steps
                     self.stats["mines_hit"][b, ab] += 1
@@ -601,16 +708,7 @@ class MineEnv:
                 hit_boss = at & self.boss_on & (d_boss <= 1)
                 if hit_boss.any():
                     hb = hit_boss.nonzero().squeeze(1)
-                    dmg = float(self.p["attack_damage"])
-                    self.boss_hp[hb] -= dmg
-                    self.score[hb, a[hb]] += rw["boss_hit"] * dmg / 10
-                    self.stats["boss_damage"][hb, a[hb]] += dmg
-                    dead = hb[self.boss_hp[hb] <= 0]
-                    if dead.numel():
-                        self.boss_on[dead] = False
-                        self.boss_next[dead] = self.t + self.p["boss_respawn"]
-                        self.score[dead, a[dead]] += rw["boss_kill"]
-                        self.stats["boss_kills"][dead, a[dead]] += 1
+                    self._damage_boss(hb, a[hb], float(self.p["attack_damage"]))
                 pvp = at & ~hit_boss & (self.mode == 1)
                 if pvp.any() and A > 1:
                     d = torch.maximum((self.pos[:, :, 0] - py[:, None]).abs(), (self.pos[:, :, 1] - px[:, None]).abs()).float()
@@ -619,6 +717,10 @@ class MineEnv:
                     dmin, victim = d.min(1)
                     hit = (pvp & (dmin <= 1)).nonzero().squeeze(1)
                     self._hurt(hit, victim[hit], self.p["pvp_damage"], by=a[hit], stun=1)
+
+            us = active & (act == USE)
+            if self.powers and us.any():
+                self._use(us & self.use_ok_cached(a), a)
 
         if self.bosses:
             self._boss_step(live)
@@ -641,6 +743,99 @@ class MineEnv:
             self._finish(finished, finished & self.cleared)
         return self.score - before
 
+    def use_ok_cached(self, a):
+        """use_ok for the acting agents. a: (N,) agent index per board (the acting order differs by board)."""
+        out = torch.zeros(self.N, dtype=torch.bool, device=self.device)
+        for k in range(self.A):
+            sel = a == k
+            if sel.any():
+                out |= sel & self.use_ok(k)
+        return out
+
+    def _damage_boss(self, b, by, dmg, stun=0):
+        """Hurt the boss on boards b, credited to agents `by` (boss_hit per 10 damage, boss_kill)."""
+        if b.numel() == 0:
+            return
+        rw = self.rw
+        self.boss_hp[b] -= dmg
+        self.score[b, by] += rw["boss_hit"] * dmg / 10
+        self.stats["boss_damage"][b, by] += dmg
+        if stun:
+            self.boss_stun[b] = torch.maximum(self.boss_stun[b], torch.full_like(self.boss_stun[b], stun))
+            self.boss_windup[b] = 0          # a stagger interrupts the wind-up
+        dead = self.boss_hp[b] <= 0
+        db, dby = b[dead], by[dead]
+        if db.numel():
+            self.boss_on[db] = False
+            self.boss_next[db] = self.t + self.p["boss_respawn"]
+            self.score[db, dby] += rw["boss_kill"]
+            self.stats["boss_kills"][db, dby] += 1
+
+    def _use(self, sel, a):
+        """Agents a (per board) on boards `sel` use their held item (already checked by use_ok)."""
+        N, H, W, p = self.N, self.H, self.W, self.p
+        ar = torch.arange(N, device=self.device)
+        held = self.held[ar, a]
+        yy = torch.arange(H, device=self.device).view(1, H, 1)
+        xx = torch.arange(W, device=self.device).view(1, 1, W)
+        for b in sel.nonzero().view(-1).tolist():
+            u, h = int(a[b]), int(held[b])
+            B = torch.tensor([b], device=self.device)
+            U = torch.tensor([u], device=self.device)
+            uy, ux = int(self.pos[b, u, 0]), int(self.pos[b, u, 1])
+            others = [o for o in range(self.A) if o != u and not bool(self.ko[b, o])]
+            rivals = [] if int(self.mode[b]) >= 2 else others
+            if h in (1, 2):
+                d, ty, tx, boss, ri = (t[b] for t in self._foe(u))
+                ty, tx = int(ty), int(tx)
+            if h == 1:        # scatter: re-cover a 5x5, new mines in it, hurt everyone inside
+                r = p["scatter_radius"]
+                area = (torch.maximum((yy[0] - ty).abs(), (xx[0] - tx).abs()) <= r) & self.floor[b]
+                for t in (self.revealed, self.exploded, self.mines, self.traps):
+                    t[b][area] = False
+                self.flag_owner[b][area] = -1
+                self.items[b][area] = 0
+                cells = area.view(-1).nonzero().view(-1)
+                k = min(p["scatter_mines"], max(0, cells.numel() - 1))
+                if k:
+                    self.mines[b].view(-1)[cells[torch.randperm(cells.numel(), device=self.device)[:k]]] = True
+                m = self.mines[b].float().view(1, 1, H, W)
+                self.counts[b] = (F.conv2d(m, self.kernel, padding=1).view(H, W).round().long() - self.mines[b].long())
+                self.safe_total[b] = self.floor[b].sum() - self.mines[b].sum()
+                hit = [o for o in rivals + ([u] if int(self.mode[b]) < 2 else [])
+                       if max(abs(int(self.pos[b, o, 0]) - ty), abs(int(self.pos[b, o, 1]) - tx)) <= r]
+                if hit:
+                    self._hurt(B.repeat(len(hit)), torch.tensor(hit, device=self.device), p["scatter_damage"],
+                               by=U.repeat(len(hit)), stun=p["scatter_stun"])
+                if bool(self.boss_on[b]) and max(abs(int(self.boss_pos[b, 0]) - ty), abs(int(self.boss_pos[b, 1]) - tx)) <= r:
+                    self._damage_boss(B, U, float(p["scatter_boss"]), stun=p["boss_stagger"])
+            elif h == 2:      # freeze: the nearest foe in range is frozen
+                if bool(boss):
+                    self.boss_stun[b] = max(int(self.boss_stun[b]), p["freeze_steps"])
+                    self.boss_windup[b] = 0
+                    self._damage_boss(B, U, float(p["freeze_boss"]))
+                else:
+                    V = torch.tensor([int(ri)], device=self.device)
+                    if self.powers and bool(self.shield[b, int(ri)]):
+                        self.shield[b, int(ri)] = False
+                        self.stats["shielded"][b, int(ri)] += 1
+                    else:
+                        self.stun[B, V] = torch.maximum(self.stun[B, V], torch.full_like(V, p["freeze_steps"]))
+            elif h == 3:      # shockwave: everyone within shock_radius (Euclidean)
+                r2 = p["shock_radius"] ** 2
+                hit = [o for o in rivals if (int(self.pos[b, o, 0]) - uy) ** 2 + (int(self.pos[b, o, 1]) - ux) ** 2 <= r2]
+                if hit:
+                    self._hurt(B.repeat(len(hit)), torch.tensor(hit, device=self.device), p["shock_damage"],
+                               by=U.repeat(len(hit)), stun=p["shock_stun"])
+                if bool(self.boss_on[b]) and (int(self.boss_pos[b, 0]) - uy) ** 2 + (int(self.boss_pos[b, 1]) - ux) ** 2 <= r2:
+                    self._damage_boss(B, U, float(p["shock_boss"]), stun=p["boss_stagger"])
+            elif h == 4:      # blink: to the most promising dug-up tile within reach
+                ok, by_, bx_ = self._blink_spot(u)
+                if bool(ok[b]):
+                    self.pos[b, u, 0], self.pos[b, u, 1] = by_[b], bx_[b]
+            self.held[b, u] = 0
+            self.stats["uses"][b, u] += 1
+
     def _extras_step(self, live):
         """Pickups, spikes and the stairs, after everyone has acted. Returns boards whose stairs were reached."""
         N, A, p, rw = self.N, self.A, self.p, self.rw
@@ -654,12 +849,20 @@ class MineEnv:
             kind = _gather(self.items, flat)
             rev = _gather(self.revealed, flat)
             hurt = self.hp[:, a] < p["max_hp"]
-            take = awake & (self.stun[:, a] == 0) & rev & ((kind == 1) | ((kind == 2) & hurt))
+            wants = (kind == 1) | ((kind == 2) & hurt)
+            if self.powers:   # a shield only if you have none; a held item only with empty hands
+                wants |= ((kind == 3) & ~self.shield[:, a]) | ((kind >= 4) & (self.held[:, a] == 0))
+            take = awake & (self.stun[:, a] == 0) & rev & wants
             if take.any():
                 t = take.nonzero().squeeze(1)
                 self.items.view(N, -1)[t, flat[t]] = 0
                 food = t[kind[t] == 2]
                 self.hp[food, a] = (self.hp[food, a] + p["food_heal"]).clamp(max=float(p["max_hp"]))
+                if self.powers:
+                    k = kind[t].long()
+                    self.shield[t[k == 3], a] = True
+                    hk = k >= 4
+                    self.held[t[hk], a] = k[hk] - 3
                 self.score[t, a] += rw["item"]
                 self.stats["items"][t, a] += 1
             spiked = awake & (self.spike_cd[:, a] == 0) & _gather(up, flat)

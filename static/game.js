@@ -187,6 +187,11 @@ function layoutExtent(layoutStr) {
 // The realm's sky, fog and lights; the Darkness floor modifier turns them right down and lights a
 // lantern around the player instead.
 const lantern = new THREE.PointLight(0xffd59a, 0, 22, 1.4);
+// flooded floors (descent modifier): a sheet of water over the board; everyone wades at modifier.slow
+const water = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+  new THREE.MeshStandardMaterial({ color: 0x2f7fd0, transparent: true, opacity: 0.38, roughness: 0.15, metalness: 0.1, depthWrite: false }));
+water.rotation.x = -Math.PI / 2; water.position.y = 0.34; water.visible = false; water.renderOrder = 2;
+const wadeSpeed = () => (modifier?.slow ?? 1);
 scene.add(lantern);
 function lightRealm() {
   const dark = modifier?.id === 'dark';
@@ -198,6 +203,11 @@ function lightRealm() {
   sun.color.set(realm.sun[0]); sun.intensity = realm.sun[1] * (dark ? 0.02 : 1);
   lantern.intensity = 260;
   lantern.visible = dark;   // an invisible light costs nothing in the shaders; it's only on dark floors
+  water.visible = modifier?.id === 'flooded';
+  if (water.visible) {
+    if (!water.parent) scene.add(water);
+    water.scale.set(W * T, H * T, 1);
+  }
 }
 
 // (Re)build everything that belongs to the realm: ground, board meshes, scenery, weather, lighting.
@@ -688,6 +698,30 @@ function renderModRow() {
   if (modifier) { $('modChip').textContent = modifier.name.toUpperCase(); $('modDesc').textContent = modifier.desc; }
 }
 
+// relics: while the stairs are open, each player may take one of the relics offered to them (free,
+// lasts the run). The offer is private; everyone hears what was taken.
+const RELIC_NAMES = { iron: 'Iron Skin', greed: 'Prospector', brute: 'Brute', vampire: 'Bloodthirst', sapper: 'Sapper\'s Luck',
+  boots: 'Iron Boots', scavenger: 'Scavenger', phoenix: 'Phoenix Feather', cartographer: 'Cartographer' };   // match server.py RELICS
+let relicOffer = [], myRelics = new Set();
+function renderRelics() {
+  const box = $('relics');
+  box.hidden = !relicOffer.length || spectating || roundState !== 'playing';
+  if (box.hidden) return;
+  $('relicItems').replaceChildren(...relicOffer.map((o) => {
+    const b = document.createElement('button'); b.type = 'button';
+    const nm = document.createElement('b'); nm.textContent = o.name;
+    const ds = document.createElement('span'); ds.textContent = o.desc;
+    b.append(nm, ds);
+    b.addEventListener('click', () => { send({ t: 'relic', id: o.id }); for (const x of box.querySelectorAll('button')) x.disabled = true; });
+    return b;
+  }));
+}
+function renderRelicRow() {
+  const row = $('relicRow');
+  row.hidden = !myRelics.size;
+  row.replaceChildren(...[...myRelics].map((k) => { const c = document.createElement('span'); c.className = 'chip relic'; c.textContent = RELIC_NAMES[k] || k; return c; }));
+}
+
 // the stairs shop: shown while the stairs are open; each offer can be bought once per floor
 function renderShop() {
   const box = $('shop');
@@ -1015,11 +1049,22 @@ function playerPos(pid) {
 }
 
 // ---------------------------------------------------------------- bosses
-function makeBoss(id, kind) {
+const ELITE_NAMES = { ogre: 'Ogre Warlord', wraith: 'Wraith Queen', golem: 'Golem Colossus' };   // match server.py
+const ELITE_SCALE = 1.35;
+function makeBoss(id, kind, elite = false) {
   const def = BOSSES[kind] || BOSSES.ogre;
   const m = def.build();
   const g = m.root;
-  const label = textSprite(def.name, { dot: def.color, scale: 1.1, color: '#ffd2d2' });
+  if (elite) {   // bigger, with a golden ring of light at its feet
+    m.top *= ELITE_SCALE;
+    const inner = new THREE.Group();          // scale the model, not the parts its animation touches
+    inner.add(...g.children); inner.scale.setScalar(ELITE_SCALE); g.add(inner);
+    const aura = new THREE.Mesh(new THREE.RingGeometry(1.5, 2.1, 40),
+      new THREE.MeshBasicMaterial({ color: 0xffd23f, transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide }));
+    aura.rotation.x = -Math.PI / 2; aura.position.y = 0.12; aura.name = 'aura';
+    g.add(aura);
+  }
+  const label = textSprite(elite ? `★ ${ELITE_NAMES[kind] || def.name}` : def.name, { dot: def.color, scale: elite ? 1.3 : 1.1, color: elite ? '#ffe28a' : '#ffd2d2' });
   label.position.y = m.top + 1.2;
   const hpCanvas = document.createElement('canvas'); hpCanvas.width = 160; hpCanvas.height = 22;
   const hpTex = new THREE.CanvasTexture(hpCanvas); hpTex.colorSpace = THREE.SRGBColorSpace;
@@ -1036,7 +1081,7 @@ function makeBoss(id, kind) {
   stars.position.y = m.top + 0.2; stars.visible = false;
   g.add(label, hpBar, ice, stars);
   scene.add(g);
-  const b = { id, kind, m, group: g, hpBar, hpCanvas, ice, stars, x: NaN, z: 0, y: 0, tx: 0, tz: 0, r: 0, tr: 0,
+  const b = { id, kind, elite, m, group: g, hpBar, hpCanvas, ice, stars, x: NaN, z: 0, y: 0, tx: 0, tz: 0, r: 0, tr: 0,
     hp: 1, max: 1, state: 0, hitFlash: 0, phase: Math.random() * 6 };
   bosses.set(id, b);
   return b;
@@ -1394,6 +1439,8 @@ function handle(m) {
       $('join').hidden = true; $('hud').hidden = false;
       applySnapshot(m.snapshot);
       if (dailyDate) feed({ text: 'Daily dungeon', color: '#ffd23f' }, ` for ${dailyDate}: everyone gets this same map today. Clear it for the leaderboard!`);
+      if (m.cfg.weekly) feed({ text: 'Weekly descent', color: '#c77dff' }, ` ${m.cfg.weekly}: every team gets the same floors this week. Go as deep as you can for the ladder!`);
+      myRelics = new Set(); relicOffer = []; renderRelics(); renderRelicRow();
       break;
     }
     case 'profile':
@@ -1434,6 +1481,28 @@ function handle(m) {
       feed(who(m.pid), ' unlocked the ', { text: 'vault', color: '#ffc233' }, '! Treasure inside.');
       break;
     }
+    case 'relics':   // private: this floor's relic choice
+      relicOffer = m.offer || [];
+      renderRelics();
+      break;
+    case 'relic': {
+      const r = RELIC_NAMES[m.id] || m.name;
+      if (m.pid === myId) { myRelics.add(m.id); relicOffer = []; renderRelics(); renderRelicRow(); sfx.chest(); }
+      const pp = playerPos(m.pid);
+      if (pp) floatText(r, '#ffd23f', pp[0], pp[1] + 4.2, pp[2]);
+      feed(who(m.pid), ' took the relic ', { text: r, color: '#ffd23f' });
+      break;
+    }
+    case 'phoenix': {
+      const pp = playerPos(m.pid);
+      if (pp) {
+        floatText('PHOENIX!', '#ff9f43', pp[0], pp[1] + 3.8, pp[2]);
+        burst(new THREE.Vector3(pp[0], 1.5, pp[2]), { count: 120, colors: [0xff9f43, 0xffd23f, 0xff3d1f], speed: [3, 9], life: 1.2, size: 0.4, gravity: -4 });
+      }
+      feed(who(m.pid), '\'s ', { text: 'Phoenix Feather', color: '#ff9f43' }, ' burned instead of a knockout!');
+      sfx.heal();
+      break;
+    }
     case 'stairs': {
       setStairs([m.x, m.y]);
       teamLives = m.lives; renderModeRow();
@@ -1470,6 +1539,7 @@ function handle(m) {
       break;
     }
     case 'descending':
+      relicOffer = []; renderRelics();
       shopOffers = []; shopKey = '';
       showBanner(`DESCENDING…`, `to floor ${m.depth}`, m.in + 1);
       feed(m.by ? who(m.by) : 'The team', ` heads down to floor ${m.depth}`);
@@ -1530,9 +1600,9 @@ function handle(m) {
       }
       {
         const seen = new Set();
-        for (const [id, kind, x, z, r, hp, max, state] of m.b || []) {
+        for (const [id, kind, x, z, r, hp, max, state, elite = 0] of m.b || []) {
           seen.add(id);
-          const b = bosses.get(id) || makeBoss(id, kind);
+          const b = bosses.get(id) || makeBoss(id, kind, !!elite);
           b.tx = x; b.tz = z; b.tr = r; b.state = state;
           if (Number.isNaN(b.x)) { b.x = x; b.z = z; b.r = r; b.y = groundAt(x, z); }
           if (b.hp !== hp || b.max !== max) { b.hp = hp; b.max = max; drawBossHp(b); }
@@ -1542,8 +1612,14 @@ function handle(m) {
       renderScores();
       break;
     case 'bossSpawn':
-      feed('⚠ ', { text: `A ${m.name}`, color: BOSSES[m.kind]?.color || '#ff5d5d' }, ' is prowling the dungeon!');
-      sfx.roar(distVol(m.x, m.z));
+      if (m.elite) {
+        feed('⚠ ', { text: `ELITE: ${m.name}`, color: '#ffd23f' }, ' has arrived! It quakes the ground around it. Keep your distance when it winds up.');
+        showBanner(`★ ${m.name.toUpperCase()} ★`, 'An elite guards this floor. Double rewards, extra loot.', 4);
+        sfx.roar(1); setTimeout(() => sfx.roar(0.8), 350);
+      } else {
+        feed('⚠ ', { text: `A ${m.name}`, color: BOSSES[m.kind]?.color || '#ff5d5d' }, ' is prowling the dungeon!');
+        sfx.roar(distVol(m.x, m.z));
+      }
       break;
     case 'bossAtk':
       telegraph(m.x, m.z, m.r, m.t0);
@@ -1562,7 +1638,8 @@ function handle(m) {
       });
       burst(new THREE.Vector3(m.x, 0.7, m.z), { count: 120, colors: [0x8a6a4a, realm.cover[0], 0xffffff], speed: [6, 14], up: 0.4, life: 1.1, size: 0.4 });
       const v = distVol(m.x, m.z);
-      sfx.smash(v); cam.shake = Math.max(cam.shake, v * 1.5);
+      sfx.smash(v); cam.shake = Math.max(cam.shake, v * (m.quake ? 3 : 1.5));
+      if (m.quake) sfx.shock(v);
       for (const pid of [...m.hit, ...m.shielded]) {
         const pp = playerPos(pid), sh = m.shielded.includes(pid);
         if (pp) floatText(sh ? 'SHIELDED' : `-${m.damage} HP`, sh ? '#7fc0ff' : '#ff8080', pp[0], pp[1] + 3.6, pp[2]);
@@ -1594,7 +1671,8 @@ function handle(m) {
       const v = distVol(m.x, m.z);
       sfx.bossDown(v); cam.shake = Math.max(cam.shake, v);
       const best = Object.entries(m.rewards || {}).sort((a, b2) => b2[1] - a[1]);
-      if (m.killer) feed(who(m.killer), ' slew the ', { text: m.name, color: '#ffd23f' }, best.length ? ` (+${m.rewards[m.killer] ?? 0})` : '');
+      if (m.killer) feed(who(m.killer), m.elite ? ' brought down the elite ' : ' slew the ', { text: m.name, color: '#ffd23f' }, best.length ? ` (+${m.rewards[m.killer] ?? 0})` : '');
+      if (m.elite) showBanner('ELITE DEFEATED!', `${m.name} drops a pile of loot. Double rewards for everyone who fought.`, 3.5);
       break;
     }
     case 'swing':
@@ -1899,7 +1977,7 @@ function handle(m) {
       if (m.mode === 'descent') {
         const s = m.runSecs || 0;
         $('resultsSub').textContent = `Reached floor ${m.depth} with a team score of ${m.team} in ${Math.floor(s / 60)}m ${s % 60}s. `
-          + 'The run is on the Deepest descents board. A new run starts at floor 1.';
+          + (m.weekly ? 'The run is on this week\'s ladder. ' : 'The run is on the Deepest descents board. ') + 'A new run starts at floor 1.';
       }
       if (m.daily) {
         $('resultsTitle').textContent = 'Daily dungeon cleared!';
@@ -1910,6 +1988,8 @@ function handle(m) {
       break;
     case 'round':
       for (const p of players.values()) { if (!m.depth) p.score = 0; p.hp = maxHp; }
+      relicOffer = []; renderRelics();
+      if (!m.depth) { myRelics = new Set(); renderRelicRow(); }   // a new run starts without relics
       // a descent floor (or a new run) can be in another realm: rebuild the world first
       if (m.snapshot.realm && m.snapshot.realm !== realm.id) {
         buildWorld(m.snapshot.realm, layoutExtent(m.snapshot.layout || ''));
@@ -1918,7 +1998,8 @@ function handle(m) {
       applySnapshot(m.snapshot);
       $('fade').style.opacity = 0;
       if (m.depth) {
-        showBanner(`FLOOR ${m.depth}`, modifier ? `${realm.name} · ${modifier.name}: ${modifier.desc}` : `${realm.name} · more mines, tougher monsters`, 4.5);
+        showBanner(`FLOOR ${m.depth}`, (m.snapshot.elite ? '★ An elite guards this floor · ' : '')
+          + (modifier ? `${realm.name} · ${modifier.name}: ${modifier.desc}` : `${realm.name} · more mines, tougher monsters`), 4.5);
         feed({ text: `Floor ${m.depth}`, color: '#c77dff' }, `: ${realm.name}`, modifier ? ' · ' : '. Keep going!',
           modifier ? { text: modifier.name, color: '#ff9f43' } : '', modifier ? `. ${modifier.desc}` : '');
       }
@@ -1939,8 +2020,9 @@ const fmtClock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padS
 const RECAP_COLS = [['tiles', 'Tiles'], ['mines', 'Mines hit'], ['kos', 'KOs'], ['pvpKos', 'Rivals KO’d'],
   ['bossDmg', 'Boss dmg'], ['bossKills', 'Bosses'], ['items', 'Pickups'], ['spikes', 'Spiked']];
 const MOMENTS = { boom: ['#ff7b29', 'Mine'], ko: ['#ff5d5d', 'Knockout'], boss: ['#c77dff', 'Boss'], bossDown: ['#ffd23f', 'Boss down'],
-  key: ['#ffc233', 'Key'], chest: ['#ffd23f', 'Chest'], door: ['#ffc233', 'Vault'], stairs: ['#7ee0ff', 'Stairs'], floor: ['#7ee0ff', 'Floor'] };
-const MOMENT_RANK = { bossDown: 0, door: 1, chest: 2, floor: 3, stairs: 3, key: 4, ko: 5, boss: 6, boom: 7 };
+  key: ['#ffc233', 'Key'], chest: ['#ffd23f', 'Chest'], door: ['#ffc233', 'Vault'], stairs: ['#7ee0ff', 'Stairs'], floor: ['#7ee0ff', 'Floor'],
+  relic: ['#ffe28a', 'Relic'], phoenix: ['#ff9f43', 'Phoenix'] };
+const MOMENT_RANK = { bossDown: 0, door: 1, chest: 2, floor: 3, stairs: 3, phoenix: 4, key: 4, relic: 5, ko: 5, boss: 6, boom: 7 };
 const mkEl = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
 const SVGNS = 'http://www.w3.org/2000/svg';
 const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
@@ -2430,7 +2512,21 @@ function renderDaily() {
   });
   fill('descents', runs, (r) => `floor ${r.depth}`);
   if (!runs.length) $('descents').firstChild.textContent = 'No descents yet. Pick Descent mode below!';
+  // this week's descent: the same floors for every team until the week turns over
+  const week = (lobby.descents?.weekly || []).map((r) => {
+    const humans = r.team.filter((p) => !p.bot);
+    const names = humans.slice(0, 2).map((p) => p.name).join(' & ') + (humans.length > 2 ? ` +${humans.length - 2}` : '');
+    return { name: names || 'Bots', color: humans[0]?.color, depth: r.depth };
+  });
+  fill('weekly', week, (r) => `floor ${r.depth}`);
+  if (!week.length) $('weekly').firstChild.textContent = 'Nobody has gone down yet this week.';
+  $('weeklyBtn').hidden = !lobby.descents?.room;
+  if (lobby.descents?.week) $('weeklyLbl').textContent = `Weekly descent · ${lobby.descents.week.split('-').pop()}`;
 }
+$('weeklyBtn').addEventListener('click', () => {
+  if (!lobby.descents?.room) return;
+  $('room').value = lobby.descents.room; updateRoomNote(); $('joinForm').requestSubmit();
+});
 $('dailyBtn').addEventListener('click', () => {
   if (!lobby.daily) return;
   $('room').value = lobby.daily.room; updateRoomNote(); $('joinForm').requestSubmit();
@@ -2450,6 +2546,7 @@ function renderLobby() {
     chips.append(mk('span', r.mode, MODE_NAMES[r.mode] || r.mode), mk('span', '', LAYOUT_NAMES[r.layout] || r.layout),
       mk('span', '', REALM_BY_ID[r.realm]?.name || r.realm));
     if (r.daily) chips.prepend(mk('span', 'daily', 'Daily'));
+    if (r.weekly) chips.prepend(mk('span', 'daily', 'Weekly'));
     if (r.depth) chips.append(mk('span', 'descent', `Floor ${r.depth}`));
     if (r.bosses) chips.append(mk('span', 'boss', r.bosses > 1 ? `${r.bosses} bosses` : 'boss out'));
     if (r.lives !== null && r.lives !== undefined) chips.append(mk('span', 'coop', `♥ ${r.lives}`));
@@ -2606,6 +2703,7 @@ function pingHere() {
 let lastTooFar = 0;
 function act(kind, target = hover) {
   if (spectating || !$('join').hidden || !target || roundState !== 'playing' || me.stun > 0) return;
+  if (kind === 'flag' && modifier?.id === 'cursed') { nag('Cursed ground: flags won\'t stay planted on this floor.'); return; }
   if (!target.inReach) {
     if (performance.now() - lastTooFar > 1500) { lastTooFar = performance.now(); feed('Too far away. Walk next to that tile first.'); }
     return;
@@ -2970,7 +3068,7 @@ function frame(now) {
   let speed = 0;
   if (len > 0 && !stunned) {
     const sprint = keys.has('ShiftLeft') || keys.has('ShiftRight') || joyMag > 0.95;
-    speed = (sprint ? 11 : 7) * (me.fx & 2 ? bootsSpeed : 1) * (joyMag > 0.12 ? Math.min(1, joyMag * 1.25) : 1);
+    speed = (sprint ? 11 : 7) * (me.fx & 2 ? bootsSpeed : 1) * (joyMag > 0.12 ? Math.min(1, joyMag * 1.25) : 1) * wadeSpeed();
     mx /= len; mz /= len;
     me.r = lerpAngle(me.r, Math.atan2(mx, mz), 1 - Math.exp(-14 * dt));
   } else { mx = mz = 0; }

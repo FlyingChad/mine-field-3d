@@ -13,13 +13,14 @@ ACTIVATIONS = {"tanh": torch.tanh, "relu": torch.relu, "elu": F.elu}
 class Spec:
     """version 1: classic minesweeper bot (26 actions). version 2: also sees health, the boss and its
     danger zone, allies and the game mode, and has an attack action (27 actions). version 3: also sees
-    spike traps (and whether they're up), pickups, the goal (stairs / vault door) and the descent mode."""
+    spike traps (and whether they're up), pickups, the goal (stairs / vault door) and the descent mode.
+    version 4: also sees its held item and shield, and has a "use item" action (28 actions)."""
 
     def __init__(self, radius=3, hidden=(64,), activation="tanh", version=1):
         self.radius = int(radius)
         self.hidden = [int(h) for h in hidden]
         self.activation = activation if activation in ACTIVATIONS else "tanh"
-        self.version = max(1, min(3, int(version)))
+        self.version = max(1, min(4, int(version)))
         self.in_dim = obs_dim(self.radius, self.version)
         self.out_dim = n_actions(self.version)
         dims = [self.in_dim] + self.hidden + [self.out_dim]
@@ -85,14 +86,32 @@ class Spec:
         return outs
 
 
+USE_BIAS = 5.0   # a v3->v4 upgrade starts "use item" here: above nearly every other action's score
+
+
 def upgrade(old, w, new):
-    """Warm start: the weights of a v2 network `old` (Spec) laid out for a v3 network `new` with the
-    same radius / hidden layers / activation. Every v2 input keeps its weights, the new inputs
-    (traps, spikes, pickups, goal) start at zero, and "descent" starts as a copy of "co-op", so
-    the v3 network plays exactly like the v2 one until evolution finds a use for what it now sees."""
-    from .env import N_CHANNELS_V2
-    assert old.version == 2 and new.version == 3
+    """Warm start: the weights of an older network `old` (Spec) laid out for a newer one `new` with
+    the same radius / hidden layers / activation (v2 -> v3, v3 -> v4, or v2 -> v4).
+
+    v2 -> v3: every v2 input keeps its weights, the new inputs (traps, spikes, pickups, goal) start at
+    zero and "descent" starts as a copy of "co-op", so the v3 network plays exactly like the v2 one
+    until evolution finds a use for what it now sees.
+    v3 -> v4: the new inputs (held item, shield) start at zero and the new USE action gets a bias of
+    USE_BIAS and no weights: it fires whenever an item would hit something, like the game's built-in
+    rule, and evolution learns when holding on is better. Every other action is unchanged."""
     assert (old.radius, old.hidden, old.activation) == (new.radius, new.hidden, new.activation)
+    assert 2 <= old.version < new.version <= 4
+    if old.version == 2:
+        w = _v2_to_v3(old, w)
+        old = Spec(old.radius, old.hidden, old.activation, 3)
+    if new.version == 4:
+        w = _v3_to_v4(old, w)
+    assert w.numel() == new.n_params
+    return w
+
+
+def _v2_to_v3(old, w):
+    from .env import N_CHANNELS_V2
     KK = (2 * old.radius + 1) ** 2
     (W1, b1), *rest = old.weights(w)
     h = W1.shape[1]
@@ -102,9 +121,24 @@ def upgrade(old, w, new):
     win3 = torch.cat([win[:12], zeros(4), win[12:13]])           # 12 shared planes, 4 new, out of bounds
     g3 = torch.cat([g[:7], g[6:7], g[7:], torch.zeros(4, h, dtype=W1.dtype, device=W1.device)])
     W1n = torch.cat([win3.reshape(-1, h), g3])
-    assert W1n.shape[0] == new.in_dim
-    parts = [W1n.reshape(-1), b1] + [t.reshape(-1) for Wb in rest for t in Wb]
-    return torch.cat(parts)
+    return torch.cat([W1n.reshape(-1), b1] + [t.reshape(-1) for Wb in rest for t in Wb])
+
+
+def _v3_to_v4(old, w):
+    from .env import N_GLOBAL_V4, N_GLOBAL_V3
+    layers = old.weights(w)
+    (W1, b1) = layers[0]
+    h = W1.shape[1]
+    W1n = torch.cat([W1, torch.zeros(N_GLOBAL_V4 - N_GLOBAL_V3, h, dtype=W1.dtype, device=W1.device)])
+    if len(layers) == 1:                            # no hidden layers: W1 is also the output layer
+        W1n = torch.cat([W1n, torch.zeros(W1n.shape[0], 1, dtype=W1.dtype, device=W1.device)], 1)
+        b1 = torch.cat([b1, torch.tensor([USE_BIAS], dtype=b1.dtype, device=b1.device)])
+        return torch.cat([W1n.reshape(-1), b1])
+    mid = layers[1:-1]
+    Wo, bo = layers[-1]
+    Won = torch.cat([Wo, torch.zeros(Wo.shape[0], 1, dtype=Wo.dtype, device=Wo.device)], 1)
+    bon = torch.cat([bo, torch.tensor([USE_BIAS], dtype=bo.dtype, device=bo.device)])
+    return torch.cat([W1n.reshape(-1), b1] + [t.reshape(-1) for Wb in mid for t in Wb] + [Won.reshape(-1), bon])
 
 
 def choose(logits, mask=None, noise=0.0):
