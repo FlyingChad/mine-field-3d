@@ -39,7 +39,7 @@ def at(p, x, y):
 
 def player(room, name="A", color="#fff", ws=None, **kw):
     p = S.Player(ws or FakeWS(), name, color, **kw)
-    p.round_id = room.round_id
+    p.round_id = room.run_id
     room.players[p.id] = p
     return p
 

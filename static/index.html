@@ -28,6 +28,7 @@
       <div class="dBoards">
         <div><div class="dT">Top scores</div><ol id="dailyScores"></ol></div>
         <div><div class="dT">Fastest clears</div><ol id="dailyTimes"></ol></div>
+        <div><div class="dT">Deepest descents</div><ol id="descents"></ol></div>
       </div>
     </div>
     <div class="lobbyHead"><span class="lbl">Open rooms</span><span id="lobbyCount" class="hint"></span></div>
@@ -50,6 +51,7 @@
           <button type="button" data-id="race"><b>Race</b><span>Everyone for themselves. Most points wins.</span></button>
           <button type="button" data-id="pvp"><b>PvP</b><span>Race, but your sword hits players. KOs score.</span></button>
           <button type="button" data-id="coop"><b>Co-op</b><span>One team, shared lives, no friendly fire.</span></button>
+          <button type="button" data-id="descent"><b>Descent</b><span>Co-op down floor after floor. How deep can you go?</span></button>
         </div>
         <div id="layouts" class="layouts">
           <button type="button" data-id="dungeon"><b>Dungeon</b><span>Rooms and corridors to explore. A new one every round.</span></button>
@@ -117,6 +119,8 @@
     <button type="button" id="specLeave" class="secondary small">Leave</button>
   </div>
   <div id="reconnect" class="panel reconnect" hidden>Connection lost. Reconnecting…</div>
+  <div id="fade"></div>
+  <div id="banner" class="banner" hidden><div id="bannerBig"></div><div id="bannerSmall"></div></div>
   <div id="inventory" class="panel" hidden>
     <div id="invHeld" class="inv" hidden><span id="invHeldDot" class="dot" style="--c:#c77dff"></span><b id="invHeldName">Scatter bomb</b> · <span id="invHeldHint"></span></div>
     <div id="invGold" class="inv" hidden><span class="dot" style="--c:#ffd23f"></span><b>Gold rush ×2</b> <span id="goldLeft"></span>s</div>

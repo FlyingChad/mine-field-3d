@@ -136,10 +136,11 @@ ol li.me .nm::after { content: " (you)"; color: #a9b6c7; font-weight: 400; }
 .roomNote { font-size: 12px; color: #ffd23f; margin-top: -6px; }
 #realmField.dim { opacity: .4; }
 .layouts { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
-.layouts.modes { grid-template-columns: 1fr 1fr 1fr; }
+.layouts.modes { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 720px) { .layouts.modes { grid-template-columns: 1fr 1fr; } }
 .modeRow { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #c6d1de; font-variant-numeric: tabular-nums; }
 .chip { font-size: 10px; font-weight: 800; letter-spacing: .5px; padding: 1px 6px; border-radius: 5px; background: #2c3e55; color: #fff; }
-.chip.pvp { background: #b8322f; } .chip.coop { background: #1f8a5a; }
+.chip.pvp { background: #b8322f; } .chip.coop { background: #1f8a5a; } .chip.descent { background: #6b3fa0; }
 .hearts { color: #ff6b8a; letter-spacing: 1px; }
 .layouts button { text-align: left; padding: 8px 10px; border: 2px solid transparent; border-radius: 10px; background: #0b1522; color: #c6d1de; }
 .layouts button b { display: block; font-size: 13px; color: #fff; }
@@ -214,7 +215,16 @@ body.touch .center { padding: 18px; }
 .daily .lbl { margin: 0; color: #ffd23f; }
 .daily .dSub { font-size: 12px; color: #c6d1de; margin-top: 2px; }
 .daily button { font-size: 13px; font-weight: 800; padding: 8px 14px; border-radius: 9px; border: 0; background: #ffd23f; color: #1a1400; white-space: nowrap; }
-.daily .dBoards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.daily .dBoards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+.roomCard .chips .descent { background: #6b3fa0; color: #fff; }
+/* big centre-screen announcements (descent floors) */
+.banner { position: fixed; left: 50%; top: 22%; transform: translate(-50%, -50%); text-align: center; pointer-events: none;
+  text-shadow: 0 4px 24px rgba(0,0,0,.7); animation: bannerIn .5s ease-out; }
+.banner #bannerBig { font-size: 52px; font-weight: 900; letter-spacing: 2px; color: #ffd23f; }
+.banner #bannerSmall { font-size: 18px; font-weight: 700; color: #fff; }
+@keyframes bannerIn { from { opacity: 0; transform: translate(-50%, -50%) scale(.85); } }
+#fade { position: fixed; inset: 0; background: #000; opacity: 0; pointer-events: none; transition: opacity .9s; }
+body.touch .banner #bannerBig { font-size: 34px; }
 .daily .dT { font-size: 11px; color: #a9b6c7; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
 .daily ol { font-size: 12px; gap: 2px; }
 .daily ol li .sw { width: 9px; height: 9px; border-radius: 3px; }

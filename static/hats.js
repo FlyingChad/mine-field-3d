@@ -16,10 +16,11 @@ export const HATS = [
   { id: 'tophat', name: 'Top hat' },
   { id: 'crown', name: 'Crown' },
   { id: 'halo', name: 'Halo' },
+  { id: 'lantern', name: 'Lantern' },
 ];
 
 // height the hat adds above the character (name tags and health bars move up by this much)
-export const HAT_HEIGHT = { party: 0.55, beanie: 0.25, flower: 0.3, horns: 0.35, tophat: 0.55, crown: 0.35, halo: 0.45 };
+export const HAT_HEIGHT = { party: 0.55, beanie: 0.25, flower: 0.3, horns: 0.35, tophat: 0.55, crown: 0.35, halo: 0.45, lantern: 0.5 };
 
 export function buildHat(id, color = '#ffd23f') {
   const g = new THREE.Group();
@@ -62,6 +63,20 @@ export function buildHat(id, color = '#ffd23f') {
       color: 0xfff3b0, emissive: 0xffe066, emissiveIntensity: 1.4, roughness: 0.3 }), 0, 0.35, 0, Math.PI / 2);
     ring.castShadow = false;
     g.userData.tick = (t) => { ring.position.y = 0.35 + Math.sin(t * 2.2) * 0.04; };
+  } else if (id === 'lantern') {
+    // a delver's lantern on a little stand: brass caps, a glowing flame and a carry ring
+    const brass = std(0xc8902c, { metalness: 0.8, roughness: 0.3 });
+    add(g, new THREE.CylinderGeometry(0.2, 0.22, 0.06, 16), brass, 0, 0.02, 0);
+    const flame = add(g, new THREE.CylinderGeometry(0.13, 0.13, 0.26, 12), new THREE.MeshStandardMaterial({
+      color: 0xffe08a, emissive: 0xffb020, emissiveIntensity: 1.8, transparent: true, opacity: 0.9 }), 0, 0.18, 0);
+    flame.castShadow = false;
+    for (let k = 0; k < 4; k++) {
+      const a = (k / 4) * Math.PI * 2 + Math.PI / 4;
+      add(g, new THREE.CylinderGeometry(0.015, 0.015, 0.28, 6), brass, Math.cos(a) * 0.15, 0.18, Math.sin(a) * 0.15);
+    }
+    add(g, new THREE.ConeGeometry(0.2, 0.12, 16), brass, 0, 0.37, 0);
+    add(g, new THREE.TorusGeometry(0.07, 0.015, 6, 16), brass, 0, 0.47, 0);
+    g.userData.tick = (t) => { flame.material.emissiveIntensity = 1.6 + Math.sin(t * 9) * 0.25 + Math.sin(t * 23) * 0.1; };
   }
   return g;
 }

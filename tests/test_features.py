@@ -110,6 +110,98 @@ class Vault(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.held, "blink")
 
 
+class Descent(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._cd = S.ACTION_COOLDOWN
+        S.ACTION_COOLDOWN = 0
+
+    def tearDown(self):
+        S.ACTION_COOLDOWN = self._cd
+
+    async def clear_floor(self, r, p):
+        if r.mines is None:
+            await r.dig(p, *p.tile())
+        if not r.vault_open:   # carry the key to the door
+            d = r.doors[0]
+            at(p, *next(t for t in r.nb(d % S.W, d // S.W) if S.idx(*t) not in r.vault))
+            p.key = True
+            await r.check_doors()
+        for i in list(r.floor_tiles):
+            if r.stairs is not None:
+                break
+            if not r.revealed[i] and i not in r.mines:
+                at(p, i % S.W, i // S.W)
+                await r.dig(p, i % S.W, i // S.W)
+
+    async def test_floors_carry_over_and_get_harder(self):
+        r = S.Room("deep", "meadow", "field", "descent")
+        self.assertEqual((r.layout_kind, r.realm, r.depth), ("dungeon", S.DESCENT_REALMS[0], 1))
+        self.assertTrue(r.coop, "descent plays by co-op rules")
+        ws = FakeWS()
+        p = player(r, ws=ws)
+        r.place(p)
+        lives0 = r.lives
+        await self.clear_floor(r, p)
+        self.assertEqual(r.state, "playing", "clearing a floor doesn't end the run")
+        st = ws.of("stairs")[-1]
+        self.assertEqual(r.lives, lives0 + S.DESCENT_LIFE_PER_FLOOR)
+        self.assertEqual(r.boss_target_count(), 0, "no bosses while the stairs are open")
+        score = p.score
+        # stepping on the stairs takes everyone down after a short delay
+        at(p, st["x"], st["y"])
+        now = time.time()
+        await r.check_stairs(now)
+        self.assertEqual(ws.of("descending")[-1]["depth"], 2)
+        await r.check_stairs(now + S.DESCEND_DELAY + 0.1)
+        self.assertEqual((r.depth, r.realm, r.stairs), (2, S.DESCENT_REALMS[1], None))
+        self.assertEqual(p.score, score, "scores carry over")
+        self.assertEqual(r.lives, lives0 + S.DESCENT_LIFE_PER_FLOOR, "lives carry over")
+        self.assertTrue(r.is_floor(*p.tile()))
+        self.assertEqual(ws.of("round")[-1]["snapshot"]["depth"], 2)
+        # deeper floors: denser mines and more bosses
+        r.depth = 7
+        r.new_round(next_floor=True)
+        self.assertAlmostEqual(r.n_mines / len(r.floor_tiles),
+                               min(S.DESCENT_MAX_DENSITY, S.MINE_DENSITY * (1 + S.DESCENT_MINES_PER_FLOOR * 6)), places=2)
+        self.assertEqual(r.boss_target_count(), 3)
+
+    async def test_stairs_open_on_their_own(self):
+        r = S.Room("deep", "meadow", "dungeon", "descent")
+        ws = FakeWS()
+        p = player(r, ws=ws)
+        r.place(p)
+        await self.clear_floor(r, p)
+        r.place(p)
+        while S.idx(*p.tile()) == r.stairs:   # stand somewhere other than the stairs
+            r.place(p)
+        await r.check_stairs(r.stairs_auto + 0.01)
+        self.assertIsNone(ws.of("descending")[-1]["by"])
+
+    async def test_run_ends_on_lives_and_is_recorded(self):
+        r = S.Room("deep", "meadow", "dungeon", "descent")
+        ws = FakeWS()
+        p = player(r, "Delver", ws=ws)
+        p.profile = S.profiles.get("cd" * 16, "Delver")
+        r.depth = 6
+        r.lives = 1
+        r.hurt(p, 999, time.time())
+        await r.flush_kos()
+        over = ws.of("over")[-1]
+        self.assertTrue(over["failed"])
+        self.assertEqual(over["depth"], 6)
+        self.assertEqual(S.descent_board.board()["all"][0]["depth"], 6)
+        self.assertEqual(p.profile["deepest"], 6)
+        self.assertIn("lantern", store.unlocked(p.profile))
+        r.round_task.cancel()
+        # a new run starts back at floor 1
+        S_delay, S.NEXT_ROUND_DELAY = S.NEXT_ROUND_DELAY, 0
+        try:
+            await r.restart_later()
+        finally:
+            S.NEXT_ROUND_DELAY = S_delay
+        self.assertEqual((r.depth, p.score), (1, 0))
+
+
 class Traps(unittest.IsolatedAsyncioTestCase):
     async def test_spikes(self):
         r = field_room()

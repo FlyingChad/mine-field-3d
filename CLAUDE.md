@@ -79,6 +79,15 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
     - boss HP scales with the player count;
     - `room.lives` is a shared pool (`COOP_LIVES_BASE` + 1 per player). Every KO costs one, and at 0 `flush_kos()` ends the round with `failed=True`.
   - Any new damage source must pass `by=` to `hurt()` and respect `hits_players()`.
+  - `descent` (`DESCENT_*`, `FLOOR_BONUS`, `STAIRS_AUTO`, `DESCEND_DELAY`):
+    - `Room.coop` is true for both coop and descent, so every co-op rule applies. Check `self.mode == "coop"` only for co-op-specific things, such as the `coop_wins` stat.
+    - Descent is always a dungeon. `room.depth` is the floor; the realm is `DESCENT_REALMS[depth-1]` and the mine density grows with depth. `boss_target_count()` adds bosses every `DESCENT_FLOORS_PER_BOSS` floors, and boss HP scales with depth.
+    - `open_tiles` calls `floor_cleared(p)` when `safe_left` hits 0. In other modes that just calls `end_round()`; in descent it places `room.stairs` near p, pays `FLOOR_BONUS × depth` to everyone, adds a life, clears the bosses and broadcasts `stairs`.
+    - `check_stairs(now)` runs every tick: a conscious player on the stairs, or `STAIRS_AUTO`, triggers `descending`. After `DESCEND_DELAY` comes `next_floor()`: depth+1, then `new_round(next_floor=True)`, which keeps `run_id`, lives and scores. Players get full HP and lose timed effects and the key, then `round {snapshot, spawns, depth}`.
+    - `run_id` changes only for a new run (or a new round in other modes). `Player.round_id` stores the `run_id` it belongs to, so a resume mid-descent keeps the score.
+    - The run ends only via co-op lives (`flush_kos` → `end_round` failed). `over` carries `depth` and `runSecs`, and `store.Descents` records the team (`GET /api/descents`, the "Deepest descents" column on the join screen). The `deepest` stat (a max, via `stat(deepest=)`) unlocks the `lantern` hat.
+    - Client: the `round` handler rebuilds the world when `snapshot.realm` changes, and `#fade` / `showBanner` cover the floor change.
+    - Bots BFS-walk to the stairs, and v2 brains are told the mode is `"coop"`, since the AI only knows race, pvp and coop.
 - **Touch / mobile** (game.js `IS_TOUCH`, `body.touch` CSS; `?touch=1` forces it on desktop):
   - Controls: a pointer-events joystick (analogue; full tilt sprints) and Dig / Flag / Attack / Use / Jump buttons.
   - Dig and Flag act on `digTarget()`, shown by the pulsing yellow `digMark`: the tapped tile if it's in reach, else the hidden tile in the facing direction (`me.r`), else the hidden neighbour closest to it. Holding Dig repeats every 320 ms.
@@ -178,6 +187,7 @@ Server → client:
 - `welcome {id, room, spectator, token, resumed?, serverTime, cfg:{…, realm, mode, daily, throwRange, scatterRadius, bootsSpeed, freezeRange, blinkRange, shockRadius, held, maxHp, keyBit, spikeCycle, spikeUp, quick, resumeSeconds}, spawn, snapshot}` (the snapshot includes `layout` (W*H string of 0/1), `layoutKind`, `items:[[x,y,kind]]`, `traps:[[x,y,phase]]`, `doors:[[x,y]]` (empty once open) and `daily`)
 - `roster {players:[{id,name,color,char,hat}]}`
 - `profile {stats, unlocked, hats, new?}` (only to its owner)
+- `stairs {x, y, depth, bonus, lives, auto, by}`, `descending {by|null, depth, in}` (descent); snapshots also carry `realm`, `depth` and `stairs`
 - `emote {pid, id}`, `ping {pid, x, y}`, `door {pid, tiles, reward}` (followed by a `reveal`), `drop {pid|null, x, y, kind}` (the key), `spike {pid, x, y, shielded, dmg, stun}`
 - `players {p:[[id,x,z,rot,score,stunLeft,fx,hp]]}` (15 Hz tick; `fx` bits: 1 shield, 2 boots, 4 gold rush, 8 frozen, `KEY_BIT` (1024) carrying the key; `(fx >> 4) & 15` is the index of the held item in `cfg.held`)
 - the `players` message also has `b:[[id,kind,x,z,rot,hp,maxHp,state]]` (state 0 wander, 1 chase, 2 wind-up, 3 frozen, 4 stunned)

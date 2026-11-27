@@ -99,12 +99,26 @@ BOSS_POWER_DAMAGE = {"scatter": 60, "shockwave": 40, "freeze": 20}
 #   coop - one team against the dungeon: no friendly fire, no scatter bombs (they only undo the
 #          team's progress), bosses scale with the team, and a shared pool of lives; run out and the
 #          round is lost
-MODES = ["race", "pvp", "coop"]
+MODES = ["race", "pvp", "coop", "descent"]
 PVP_MELEE_DAMAGE = 15
 PVP_MELEE_STUN = 0.35
 KO_REWARD = 20
 COOP_LIVES_BASE = 3           # team lives = this + 1 per player at round start (KOs cost one)
 COOP_BOSS_HP_PER_PLAYER = 0.5 # boss HP x (1 + this * (players - 1))
+
+# descent: co-op rules (one team, shared lives, no friendly fire, no scatter bombs) across a run of
+# floors. Clearing a floor opens a staircase near whoever finished it; stepping on it (or waiting
+# STAIRS_AUTO seconds) takes the whole team down to a bigger, deadlier floor in the next realm. Scores,
+# held items and lives carry over; the run ends when the lives run out and goes on the records board.
+DESCENT_REALMS = ["meadow", "jungle", "desert", "tundra", "reef", "spooky", "volcano", "candy", "neon", "moon"]
+DESCENT_MINES_PER_FLOOR = 0.07   # mine density x (1 + this * (depth - 1)), capped at DESCENT_MAX_DENSITY
+DESCENT_MAX_DENSITY = 0.21
+DESCENT_BOSS_HP_PER_FLOOR = 0.2  # boss HP x (1 + this * (depth - 1)) on top of the team scaling
+DESCENT_FLOORS_PER_BOSS = 3      # one more boss at once every this many floors (max 3)
+FLOOR_BONUS = 10                 # every player gets this x the floor number for clearing it
+DESCENT_LIFE_PER_FLOOR = 1       # lives gained for each floor cleared
+STAIRS_AUTO = 30.0               # seconds before the team descends anyway
+DESCEND_DELAY = 2.5              # seconds between stepping on the stairs and arriving below
 
 # the dungeon vault: a side room sealed by a locked door (two door tiles across a corridor). A key is
 # buried somewhere else in the dungeon; whoever carries it to the door opens it for everyone and earns
@@ -319,10 +333,22 @@ class Room:
         self.hold_until = time.time() + 60 # a new room (e.g. one the lab put bots in) waits for its first human
         self.round_task = None
         self.kos: list[str] = []
+        self.depth = 1                     # descent: the floor the team is on
+        if self.mode == "descent":
+            self.layout_kind = "dungeon"
         self.new_round()
 
     # ---------- round lifecycle ----------
-    def new_round(self):
+    def new_round(self, next_floor=False):
+        """A fresh board. `next_floor` (descent) keeps the run going: same run, scores and lives."""
+        if not next_floor:
+            self.run_id = getattr(self, "run_id", 0) + 1   # resumes within a run keep their score
+            self.depth = 1
+            self.run_started = time.time()
+        if self.mode == "descent":
+            self.realm = DESCENT_REALMS[(self.depth - 1) % len(DESCENT_REALMS)]
+        self.stairs = None                 # descent: the staircase tile once the floor is cleared
+        self.stairs_auto = self.descend_at = 0.0
         # the daily dungeon replays one seeded layout all day; other dungeons are new every round
         self.rng = random.Random("mf3d-" + self.daily) if self.daily else random.Random()
         self.floor = layouts.make(self.layout_kind, W, H, rng=self.rng, field_size=(FIELD_SIZE, FIELD_SIZE))
@@ -334,7 +360,10 @@ class Room:
             self.setup_vault()
         self.spawn_tiles = [i for i in self.floor_tiles if i not in self.vault]
         self.traps: dict[int, float] = {}  # tile index -> spike phase offset (seconds)
-        self.n_mines = round(MINE_DENSITY * len(self.floor_tiles))
+        density = MINE_DENSITY
+        if self.mode == "descent":
+            density = min(DESCENT_MAX_DENSITY, MINE_DENSITY * (1 + DESCENT_MINES_PER_FLOOR * (self.depth - 1)))
+        self.n_mines = round(density * len(self.floor_tiles))
         self.mines = None            # set of tile indices, generated on first dig
         self.counts = None
         self.revealed = bytearray(W * H)
@@ -350,8 +379,59 @@ class Room:
         self.bomb_seq = 0
         self.bosses: dict[str, Boss] = {}
         self.next_boss_at = time.time() + BOSS_FIRST_DELAY
-        self.lives = COOP_LIVES_BASE + len(getattr(self, "players", {}) or {})
+        if not next_floor:   # lives carry over from floor to floor in a descent
+            self.lives = COOP_LIVES_BASE + len(getattr(self, "players", {}) or {})
         self.failed = False
+
+    # ---------- descent ----------
+    async def floor_cleared(self, p):
+        """Every safe tile is dug up. Descent: open the stairs down; other modes: the round ends."""
+        if self.mode != "descent":
+            await self.end_round()
+            return
+        if self.stairs is not None:
+            return
+        x, y = p.tile() if self.is_floor(*p.tile()) else divmod(self.spawn_tiles[0], W)[::-1]
+        spots = [t for t in self.bfs((x, y), max_depth=4)
+                 if idx(*t) not in self.booms and idx(*t) not in self.traps and idx(*t) not in self.items]
+        sx, sy = min(spots, key=lambda t: (max(abs(t[0] - x), abs(t[1] - y)) != 2, random.random())) if spots else (x, y)
+        self.stairs = idx(sx, sy)
+        self.stairs_auto = time.time() + STAIRS_AUTO
+        bonus = FLOOR_BONUS * self.depth
+        for q in self.players.values():
+            q.score += bonus
+        self.lives += DESCENT_LIFE_PER_FLOOR
+        self.bosses.clear()                 # the floor's monsters flee
+        self.next_boss_at = float("inf")
+        await self.broadcast({"t": "stairs", "x": sx, "y": sy, "depth": self.depth, "bonus": bonus,
+                              "lives": self.lives, "auto": STAIRS_AUTO, "by": p.id})
+
+    async def check_stairs(self, now):
+        if self.stairs is None or self.state != "playing":
+            return
+        if self.descend_at:
+            if now >= self.descend_at:
+                await self.next_floor()
+            return
+        by = next((q for q in self.players.values() if not q.ko_until and idx(*q.tile()) == self.stairs
+                   and 0 <= q.tile()[0] < W), None)
+        if by or now >= self.stairs_auto:
+            self.descend_at = now + DESCEND_DELAY
+            await self.broadcast({"t": "descending", "by": by.id if by else None, "depth": self.depth + 1,
+                                  "in": DESCEND_DELAY})
+
+    async def next_floor(self):
+        self.depth += 1
+        self.new_round(next_floor=True)
+        spawns = {}
+        for q in self.players.values():
+            q.hp, q.ko_until, q.stun_until, q.frozen_until = MAX_HP, 0.0, 0.0, 0.0
+            q.key, q.boots_until, q.gold_until = False, 0.0, 0.0   # held items and shields come along
+            self.place(q)
+            spawns[q.id] = [round(q.x, 2), round(q.z, 2)]
+        for q in self.players.values():
+            await self.stat(q, deepest=self.depth)
+        await self.broadcast({"t": "round", "snapshot": self.snapshot(), "spawns": spawns, "depth": self.depth})
 
     # ---------- the vault ----------
     def setup_vault(self):
@@ -479,10 +559,10 @@ class Room:
             await self.flush_kos()
 
     # ---------- profiles (stats that unlock hats) ----------
-    async def stat(self, p, best=None, **inc):
+    async def stat(self, p, best=None, deepest=None, **inc):
         if p is None or not p.profile:
             return
-        new = profiles.bump(p.profile, best=best, **inc)
+        new = profiles.bump(p.profile, best=best, deepest=deepest, **inc)
         if new:
             await self.send_to(p, {"t": "profile", **store.public(p.profile), "new": new})
 
@@ -494,7 +574,8 @@ class Room:
 
     @property
     def coop(self):
-        return self.mode == "coop"
+        """Team modes: co-op and descent share the rules (no friendly fire, shared lives, ...)."""
+        return self.mode in ("coop", "descent")
 
     def hits_players(self):
         """Do player-made attacks (power-ups, melee) affect other players? Not in co-op."""
@@ -502,9 +583,12 @@ class Room:
 
     # ---------- bosses ----------
     def boss_target_count(self):
-        if self.layout_kind != "dungeon" or self.state != "playing":
+        if self.layout_kind != "dungeon" or self.state != "playing" or self.stairs is not None:
             return 0
-        return 2 if len(self.players) >= 4 else 1
+        n = 2 if len(self.players) >= 4 else 1
+        if self.mode == "descent":   # deeper floors are more crowded
+            n += min(2, (self.depth - 1) // DESCENT_FLOORS_PER_BOSS)
+        return n
 
     def walkable_step(self, x, y, dx, dy):
         """8-way step on floor that doesn't cut through a wall corner."""
@@ -555,6 +639,8 @@ class Room:
             b = Boss(kind, x, z)
             if self.coop:   # a bigger team faces a tougher boss
                 b.max_hp = b.hp = round(b.max_hp * (1 + COOP_BOSS_HP_PER_PLAYER * max(0, len(self.players) - 1)))
+            if self.mode == "descent":   # and so does a deeper floor
+                b.max_hp = b.hp = round(b.max_hp * (1 + DESCENT_BOSS_HP_PER_FLOOR * (self.depth - 1)))
             self.bosses[b.id] = b
             self.next_boss_at = now + 6.0     # stagger a second spawn
             await self.broadcast({"t": "bossSpawn", "id": b.id, "kind": kind, "name": b.name, "x": round(x, 2), "z": round(z, 2)})
@@ -780,6 +866,9 @@ class Room:
             "traps": [[i % W, i // W, ph] for i, ph in self.traps.items() if self.revealed[i]],
             "doors": [] if self.vault_open else [[d % W, d // W] for d in self.doors],
             "daily": self.daily,
+            "realm": self.realm,
+            "depth": self.depth if self.mode == "descent" else None,
+            "stairs": None if self.stairs is None else [self.stairs % W, self.stairs // W],
             "minesLeft": self.mines_left(),
             "safeLeft": self.safe_left,
             "next": max(0, (self.round_ends_at or 0) - time.time()),
@@ -894,7 +983,7 @@ class Room:
         })
         await self.stat(p, tiles=len(opened))
         if self.safe_left == 0:
-            await self.end_round()
+            await self.floor_cleared(p)
 
     async def explode(self, p, x, y):
         i = idx(x, y)
@@ -1252,11 +1341,18 @@ class Room:
                     if path:
                         p.tx, p.tz = tile_center(*path[0])
                         continue
+            # heuristic (not learned): head down the stairs once the floor is cleared
+            if self.stairs is not None:
+                path = self.bfs((x, y), (self.stairs % W, self.stairs // W))
+                if path:
+                    p.tx, p.tz = tile_center(*path[0])
+                continue
             mates = [q for q in self.players.values() if q is not p and not q.ko_until]
             extra = None
             if v2:   # what a v2 model also sees: its health, the mode, teammates and the nearest boss
                 boss = min(self.bosses.values(), key=lambda b: math.hypot(b.x - p.x, b.z - p.z), default=None)
-                extra = {"hp": p.hp / MAX_HP, "mode": self.mode, "attack_ok": can_hit,
+                # models know race / pvp / coop; descent plays by co-op rules
+                extra = {"hp": p.hp / MAX_HP, "mode": "coop" if self.coop else self.mode, "attack_ok": can_hit,
                          "allies": [q.tile() for q in mates] if self.coop else [],
                          "boss": (*boss.tile(), boss.hp / boss.max_hp, boss.state == "windup") if boss else None}
                 others = [] if self.coop else [q.tile() for q in mates]
@@ -1332,12 +1428,19 @@ class Room:
             won = not self.coop and len(standings) >= 2 and q is top and q.score > standings[1].score
             if self.daily and not self.failed:
                 daily_board.record(self.daily, q.name, q.score, duration, q.char, q.color, len(standings))
+            if self.mode == "descent":
+                await self.stat(q, deepest=self.depth, descents=1)
             await self.stat(q, best=q.score, rounds=1, flags=bonuses.get(q.id, 0) // FLAG_CORRECT,
-                            wins=int(won), coop_wins=int(self.coop and not self.failed),
+                            wins=int(won), coop_wins=int(self.mode == "coop" and not self.failed),
                             daily=int(bool(self.daily) and not self.failed))
+        if self.mode == "descent" and any(not q.is_bot for q in standings):
+            descent_board.record([{"name": q.name, "color": q.color, "bot": q.is_bot} for q in standings],
+                                 self.depth, sum(q.score for q in standings), round(time.time() - self.run_started))
         await self.broadcast({
             "t": "over",
             "mode": self.mode, "failed": self.failed,
+            "depth": self.depth if self.mode == "descent" else None,
+            "runSecs": round(time.time() - self.run_started),
             "team": sum(q.score for q in standings) if self.coop else None,
             "results": [{"id": q.id, "name": q.name, "color": q.color, "score": q.score,
                          "flagBonus": bonuses.get(q.id, 0)} for q in standings],
@@ -1360,7 +1463,7 @@ class Room:
             q.stun_until = 0
             q.hp, q.ko_until = MAX_HP, 0.0
             q.reset_items()
-            q.round_id = self.round_id
+            q.round_id = self.run_id
             self.place(q)   # the new layout has different floor, so everyone gets a fresh spawn
             spawns[q.id] = [round(q.x, 2), round(q.z, 2)]
         await self.broadcast({"t": "round", "snapshot": self.snapshot(), "spawns": spawns})
@@ -1445,10 +1548,13 @@ async def resume(room, token, ws):
         asyncio.create_task(old.close())     # the stale connection: its cleanup sees it was replaced
     if p.color in {q.color for q in room.players.values() if q is not p}:
         p.color = pick_color(room, None)
-    if p.round_id != room.round_id:          # a new round started while they were away
+    if p.round_id != room.run_id:            # a new round (or descent run) started while they were away
         p.score, p.hp, p.ko_until, p.stun_until = 0, MAX_HP, 0.0, 0.0
         p.reset_items()
-        p.round_id = room.round_id
+        p.round_id = room.run_id
+        room.place(p)
+    elif not room.is_floor(*p.tile()):       # same descent run, but the team went down a floor
+        p.key = False
         room.place(p)
     room.players[p.id] = p
     return p
@@ -1506,7 +1612,7 @@ async def ws_handler(request):
                 name = clean(data.get("name"), 16, "Sweeper")
                 prof = profiles.get(data.get("profile"), name)
                 player = Player(ws, name, color, pick_char(data.get("char")), pick_hat(prof, data.get("hat")))
-                player.profile, player.round_id = prof, room.round_id
+                player.profile, player.round_id = prof, room.run_id
                 room.place(player)
                 room.players[player.id] = player
                 if room.coop and room.state == "playing":
@@ -1606,6 +1712,7 @@ def lobby_summary():
             "bosses": len(r.bosses), "lives": r.lives if r.coop else None,
             "age": round(time.time() - r.started_at),
             "spectators": len(r.spectators), "away": len(r.away), "daily": bool(r.daily),
+            "depth": r.depth if r.mode == "descent" else None,
             "vault": None if not r.doors else ("open" if r.vault_open else "locked"),
         })
     out.sort(key=lambda d: (-d["humans"], d["name"]))
@@ -1630,8 +1737,13 @@ async def api_profile(request):
     return web.json_response(store.public(profiles.peek(request.query.get("token"))), headers=NO_STORE)
 
 
+async def api_descents(_):
+    return web.json_response(descent_board.board(), headers=NO_STORE)
+
+
 profiles = store.Profiles(store.DATA / "profiles.json")
 daily_board = store.Daily(store.DATA / "daily.json")
+descent_board = store.Descents(store.DATA / "descents.json")
 
 
 # ---------------------------------------------------------------- bots (used by the lab)
@@ -1685,6 +1797,7 @@ async def tick_loop(app):
                 saved = now
                 profiles.save()
                 daily_board.save()
+                descent_board.save()
             for room in list(rooms.values()):
                 for token, (_, until) in list(room.away.items()):
                     if now >= until:
@@ -1701,6 +1814,7 @@ async def tick_loop(app):
                 await room.update_bosses(now, dt)
                 await room.pickups(now)
                 await room.check_doors()
+                await room.check_stairs(now)
                 await room.spikes(now)
                 await room.respawns(now)
                 await room.broadcast({"t": "players", "p": [
@@ -1713,6 +1827,7 @@ async def tick_loop(app):
     task.cancel()
     profiles.save()
     daily_board.save()
+    descent_board.save()
 
 
 async def index(_):
@@ -1726,6 +1841,7 @@ def make_app(lab=True):
     app.router.add_get("/api/rooms", api_rooms)
     app.router.add_get("/api/daily", api_daily)
     app.router.add_get("/api/profile", api_profile)
+    app.router.add_get("/api/descents", api_descents)
     app.router.add_static("/static", STATIC)
     app.cleanup_ctx.append(tick_loop)
     if lab:

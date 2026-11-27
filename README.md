@@ -63,6 +63,7 @@ The first player into a room picks the mode, along with the map and realm:
 | **Race** | Everyone for themselves. Most points wins. |
 | **PvP** | Race, but your sword (**R** / ⚔) also hits other players for 15. Knocking someone out earns you **+20**. |
 | **Co-op** | One team against the dungeon. See below. |
+| **Descent** | Co-op, floor after floor, as deep as you can go. See below. |
 
 How co-op works:
 
@@ -72,7 +73,27 @@ How co-op works:
 - **Shared lives:** the team starts with 3 lives, plus 1 per player, shown as ♥ in the HUD. Every knockout costs one.
 - **Winning and losing:** clear the dungeon to win. Run out of lives and the round is lost.
 
-Add `?mode=pvp` or `?mode=coop` to a link to preselect a mode.
+Add `?mode=pvp`, `?mode=coop` or `?mode=descent` to a link to preselect a mode.
+
+### Descent
+
+Descent plays by the co-op rules (one team, shared lives, no friendly fire, no scatter bombs), but clearing the dungeon doesn't end the game. It opens a **staircase down**, marked by a purple beam and a pulsing square on the minimap. Step on it, or wait 30 seconds, and the whole team descends to the next floor.
+
+Clearing a floor gives everyone **+10 × the floor number** and the team **+1 life**.
+
+Every floor down is harder:
+
+- **New realm:** Meadow → Lost Jungle → Dune Sea → Frostbite Tundra → Coral Reef → Haunted Hollow → Molten Caldera → Candyfloss Hills → Neon Grid → Lunar Base, then round again.
+- **More mines:** the density goes up 7% per floor, capped at 21% of floor tiles.
+- **Tougher bosses:** they get 20% more health per floor, and an extra boss joins every 3 floors, up to 3 more.
+
+What carries over between floors:
+
+- **Kept:** scores, lives, held power-ups and shields.
+- **Refilled:** health goes back to full.
+- **Lost:** timed effects (boots, gold rush) and the vault key.
+
+The run ends when the team runs out of lives. It's then recorded on the **Deepest descents** board on the join screen (`data/descents.json`), and a new run starts at floor 1. Reaching floor 5 unlocks the **Lantern** hat.
 
 ## Health
 
@@ -132,6 +153,7 @@ Your browser keeps a private profile id, and the server saves your stats under i
 | Top hat | Flag 100 mines correctly |
 | Crown | Win 3 rounds against other players (bots count) |
 | Halo | Clear 2 co-op dungeons |
+| Lantern | Reach floor 5 in a descent |
 
 Locked hats show your progress. Profiles live in `data/profiles.json`. Clearing your browser's site data gives you a fresh profile.
 

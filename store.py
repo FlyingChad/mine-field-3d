@@ -26,8 +26,10 @@ HATS = {
     "tophat": ("Top hat",   "flags",     100, "Flag 100 mines correctly"),
     "crown":  ("Crown",     "wins",      3,   "Win 3 rounds against other players"),
     "halo":   ("Halo",      "coop_wins", 2,   "Clear 2 co-op dungeons"),
+    "lantern": ("Lantern",  "deepest",   5,   "Reach floor 5 in a descent"),
 }
-STATS = ["rounds", "wins", "coop_wins", "tiles", "flags", "mines", "bosses", "kos", "daily", "best"]
+STATS = ["rounds", "wins", "coop_wins", "tiles", "flags", "mines", "bosses", "kos", "daily", "best",
+         "deepest", "descents"]
 
 
 def unlocked(prof):
@@ -82,15 +84,36 @@ class Profiles(JsonFile):
         self.dirty = True
         return prof
 
-    def bump(self, prof, best=None, **inc):
-        """Add to a profile's stats; returns the hats this unlocked."""
+    def bump(self, prof, best=None, deepest=None, **inc):
+        """Add to a profile's stats (best score and deepest floor keep their maximum); returns the
+        hats this unlocked."""
         before = set(unlocked(prof))
         for k, v in inc.items():
             prof[k] = prof.get(k, 0) + v
         if best is not None:
             prof["best"] = max(prof.get("best", 0), best)
+        if deepest is not None:
+            prof["deepest"] = max(prof.get("deepest", 0), deepest)
         self.dirty = True
         return [h for h in unlocked(prof) if h not in before]
+
+
+class Descents(JsonFile):
+    """Records of descent runs: how deep each team got. Keeps the best MAX_ROWS runs ever."""
+    MAX_ROWS = 300
+
+    def record(self, team, depth, score, secs, date=None):
+        rows = self.data.setdefault("runs", [])
+        rows.append({"team": team[:12], "depth": depth, "score": score, "secs": secs,
+                     "date": date or time.strftime("%Y-%m-%d"), "at": int(time.time())})
+        rows.sort(key=lambda r: (-r["depth"], -r["score"], r["secs"]))
+        del rows[self.MAX_ROWS:]
+        self.dirty = True
+
+    def board(self, n=10, date=None):
+        rows = self.data.get("runs", [])
+        today = [r for r in rows if r["date"] == (date or time.strftime("%Y-%m-%d"))]
+        return {"all": rows[:n], "today": today[:n]}
 
 
 class Daily(JsonFile):

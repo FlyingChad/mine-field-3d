@@ -32,11 +32,14 @@ let spectating = false, specTarget = null;   // watching a room instead of playi
 const QUICK = { help: 'Help!', boss: 'Boss here!', nice: 'Nice!', follow: 'Follow me', gg: 'GG', oops: 'Oops' };
 let quickIds = Object.keys(QUICK);
 
+let depth = null;                        // descent: the floor the team is on
+let stairs = null;                       // descent: { i, group } the staircase down, once the floor is cleared
+
 function renderModeRow() {
   const chip = $('modeChip');
-  chip.textContent = { race: 'RACE', pvp: 'PVP', coop: 'CO-OP' }[gameMode] || 'RACE';
+  chip.textContent = { race: 'RACE', pvp: 'PVP', coop: 'CO-OP', descent: `FLOOR ${depth ?? 1}` }[gameMode] || 'RACE';
   chip.className = `chip ${gameMode}`;
-  if (gameMode === 'coop') {
+  if (gameMode === 'coop' || gameMode === 'descent') {
     const team = [...players.values()].reduce((s, p) => s + p.score, 0);
     const n = Math.max(0, teamLives ?? 0);
     $('teamInfo').replaceChildren(
@@ -599,6 +602,48 @@ function addTrap(x, y, phase) {
   traps.set(i, { group: g, spikes, holes, phase });
 }
 
+// ---------------------------------------------------------------- descent: the stairs down
+function makeStairs() {
+  // a dark shaft with steps spiralling down into it, a glowing rim and a beacon so the team finds it
+  const g = new THREE.Group();
+  const pit = new THREE.Mesh(new THREE.BoxGeometry(T * 0.9, 0.02, T * 0.9), new THREE.MeshBasicMaterial({ color: 0x05070c }));
+  pit.position.y = 0.11; g.add(pit);
+  // steps across the pit, each one darker, so they read as going down into the dark
+  const stepGeo = new THREE.BoxGeometry(T * 0.8, 0.06, T * 0.15);
+  for (let k = 0; k < 5; k++) {
+    const shade = new THREE.Color(0x9aa3ad).multiplyScalar(1 - k * 0.18);
+    const step = new THREE.Mesh(stepGeo, new THREE.MeshStandardMaterial({ color: shade, roughness: 0.9 }));
+    step.position.set(0, 0.13, -T * 0.32 + k * T * 0.16);
+    g.add(step);
+  }
+  const rim = new THREE.Mesh(new THREE.RingGeometry(T * 0.62, T * 0.72, 4, 1, Math.PI / 4), new THREE.MeshBasicMaterial({
+    color: 0xc77dff, transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }));
+  rim.rotation.x = -Math.PI / 2; rim.position.y = 0.16; g.add(rim);
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.9, 18, 20, 1, true), new THREE.MeshBasicMaterial({
+    color: 0xc77dff, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide }));
+  beam.position.y = 9; g.add(beam);
+  const arrow = new THREE.Mesh(new THREE.ConeGeometry(0.45, 0.8, 4), new THREE.MeshStandardMaterial({
+    color: 0xc77dff, emissive: 0x8a3ffc, emissiveIntensity: 0.9 }));
+  arrow.rotation.x = Math.PI; arrow.position.y = 3; g.add(arrow);
+  g.userData = { rim, arrow };
+  return g;
+}
+
+function setStairs(xy) {
+  if (stairs) { scene.remove(stairs.group); disposeTree(stairs.group); stairs = null; }
+  if (!xy) return;
+  const [x, y] = xy, [wx, wz] = tileCenter(x, y);
+  const group = makeStairs(); group.position.set(wx, 0, wz); scene.add(group);
+  stairs = { i: y * W + x, x, y, group };
+}
+
+function showBanner(big, small, secs = 3) {
+  $('bannerBig').textContent = big; $('bannerSmall').textContent = small || '';
+  const b = $('banner'); b.hidden = false;
+  b.style.animation = 'none'; void b.offsetWidth; b.style.animation = '';
+  clearTimeout(showBanner.t); showBanner.t = setTimeout(() => { b.hidden = true; }, secs * 1000);
+}
+
 function clearTraps() {
   for (const t of traps.values()) { scene.remove(t.group); disposeTree(t.group); }
   traps.clear();
@@ -1148,6 +1193,7 @@ function connect(name, room, { spectate = false } = {}) {
 
 function leaveGame() {
   $('hud').hidden = true; $('results').hidden = true; $('reconnect').hidden = true; $('quick').hidden = true;
+  $('fade').style.opacity = 0;
   setSpectating(false);
   openPicker(false);
 }
@@ -1192,6 +1238,8 @@ function applySnapshot(s) {
   dailyDate = s.daily || null;
   if (s.mode) gameMode = s.mode;
   teamLives = s.lives ?? null;
+  depth = s.depth ?? null;
+  setStairs(s.stairs);
   renderModeRow();
   for (let i = 0; i < W * H; i++) if (!floor[i]) tiles[i] = -3;
   for (const [x, y, v] of s.tiles) {
@@ -1221,7 +1269,7 @@ function handle(m) {
       break;
     case 'welcome': {
       myId = m.id;
-      reconnecting = null; $('reconnect').hidden = true;
+      reconnecting = null; $('reconnect').hidden = true; $('fade').style.opacity = 0;
       setSpectating(!!m.spectator);
       if (m.token) saveSession({ room: m.room, token: m.token });
       if (m.serverTime) serverOffset = m.serverTime - performance.now() / 1000;
@@ -1290,6 +1338,23 @@ function handle(m) {
       feed(who(m.pid), ' unlocked the ', { text: 'vault', color: '#ffc233' }, '! Treasure inside.');
       break;
     }
+    case 'stairs': {
+      setStairs([m.x, m.y]);
+      teamLives = m.lives; renderModeRow();
+      for (const id of [...bosses.keys()]) removeBoss(id);   // the floor's monsters flee
+      showBanner('FLOOR CLEARED!', `+${m.bonus} each · +1 life · find the stairs down (or wait ${m.auto | 0}s)`, 4);
+      feed({ text: 'Stairs down', color: '#c77dff' }, ` opened! Step on them to descend to floor ${m.depth + 1}.`);
+      sfx.door(1);
+      const [wx, wz] = tileCenter(m.x, m.y);
+      burst(new THREE.Vector3(wx, 1, wz), { count: 120, colors: [0xc77dff, 0xffffff, 0x8a3ffc], speed: [3, 10], life: 1.4, size: 0.35 });
+      break;
+    }
+    case 'descending':
+      showBanner(`DESCENDING…`, `to floor ${m.depth}`, m.in + 1);
+      feed(m.by ? who(m.by) : 'The team', ` heads down to floor ${m.depth}`);
+      $('fade').style.opacity = 1;     // fade to black; the next floor's 'round' fades back in
+      sfx.blink(1);
+      break;
     case 'drop':
       addItem(m.x, m.y, m.kind);
       if (m.kind === 'key') feed(m.pid ? who(m.pid) : 'The vault key', m.pid ? ' dropped the ' : ' turned up again', m.pid ? { text: 'vault key', color: '#ffc233' } : '', '!');
@@ -1700,10 +1765,15 @@ function handle(m) {
       bombs.clear(); clearRadar();
       showAllMines(m.mines);
       showResults(m.results, m.next, m.duration);
-      $('resultsTitle').textContent = m.mode === 'coop'
-        ? (m.failed ? 'Out of lives. The dungeon wins!' : `Dungeon cleared! Team score ${m.team}`)
+      $('resultsTitle').textContent = m.mode === 'descent' ? `The dungeon claimed you on floor ${m.depth}`
+        : m.mode === 'coop' ? (m.failed ? 'Out of lives. The dungeon wins!' : `Dungeon cleared! Team score ${m.team}`)
         : m.mode === 'pvp' ? 'Battle over!' : 'Field cleared!';
       if (m.failed) $('resultsSub').textContent = 'Your team was knocked out too many times. A new dungeon awaits.';
+      if (m.mode === 'descent') {
+        const s = m.runSecs || 0;
+        $('resultsSub').textContent = `Reached floor ${m.depth} with a team score of ${m.team} in ${Math.floor(s / 60)}m ${s % 60}s. `
+          + 'The run is on the Deepest descents board. A new run starts at floor 1.';
+      }
       if (m.daily) {
         $('resultsTitle').textContent = 'Daily dungeon cleared!';
         $('resultsSub').textContent += ' Your result is on today\'s leaderboard. The same map comes back next round, so you can try to beat it.';
@@ -1711,8 +1781,18 @@ function handle(m) {
       sfx.win();
       break;
     case 'round':
-      for (const p of players.values()) { p.score = 0; p.hp = maxHp; }
+      for (const p of players.values()) { if (!m.depth) p.score = 0; p.hp = maxHp; }
+      // a descent floor (or a new run) can be in another realm: rebuild the world first
+      if (m.snapshot.realm && m.snapshot.realm !== realm.id) {
+        buildWorld(m.snapshot.realm, layoutExtent(m.snapshot.layout || ''));
+        worldKey = `${m.snapshot.realm}|${m.snapshot.layoutKind}|${W}x${H}`;
+      }
       applySnapshot(m.snapshot);
+      $('fade').style.opacity = 0;
+      if (m.depth) {
+        showBanner(`FLOOR ${m.depth}`, `${realm.name} · more mines, tougher monsters`, 3.5);
+        feed({ text: `Floor ${m.depth}`, color: '#c77dff' }, `: ${realm.name}. Keep going!`);
+      }
       if (m.spawns?.[myId]) { [me.x, me.z] = m.spawns[myId]; me.kx = me.kz = 0; me.y = 1; }
       for (const [id, [x, z]] of Object.entries(m.spawns || {})) {
         const p = players.get(id);
@@ -1915,7 +1995,7 @@ function closePicker() {
 
 // ---------------------------------------------------------------- lobby (open rooms)
 const lobby = { rooms: [], timer: 0 };
-const MODE_NAMES = { race: 'Race', pvp: 'PvP', coop: 'Co-op' };
+const MODE_NAMES = { race: 'Race', pvp: 'PvP', coop: 'Co-op', descent: 'Descent' };
 const LAYOUT_NAMES = { dungeon: 'Dungeon', field: 'Open field' };
 
 async function refreshLobby() {
@@ -1929,6 +2009,7 @@ async function refreshLobby() {
   if (!lobby.dailyAt || performance.now() - lobby.dailyAt > 15000) {
     lobby.dailyAt = performance.now();
     try { lobby.daily = await (await fetch('/api/daily', { cache: 'no-store' })).json(); } catch { lobby.daily = null; }
+    try { lobby.descents = await (await fetch('/api/descents', { cache: 'no-store' })).json(); } catch { lobby.descents = null; }
     renderDaily();
   }
   lobby.timer = setTimeout(refreshLobby, 3000);
@@ -1952,6 +2033,14 @@ function renderDaily() {
   };
   fill('dailyScores', d.scores || [], (r) => r.score);
   fill('dailyTimes', d.times || [], (r) => fmt(r.secs));
+  // descent records (all time): the team, shown by its first two names
+  const runs = (lobby.descents?.all || []).map((r) => {
+    const humans = r.team.filter((p) => !p.bot);
+    const names = humans.slice(0, 2).map((p) => p.name).join(' & ') + (humans.length > 2 ? ` +${humans.length - 2}` : '');
+    return { name: names || 'Bots', color: humans[0]?.color, depth: r.depth };
+  });
+  fill('descents', runs, (r) => `floor ${r.depth}`);
+  if (!runs.length) $('descents').firstChild.textContent = 'No descents yet. Pick Descent mode below!';
 }
 $('dailyBtn').addEventListener('click', () => {
   if (!lobby.daily) return;
@@ -1972,6 +2061,7 @@ function renderLobby() {
     chips.append(mk('span', r.mode, MODE_NAMES[r.mode] || r.mode), mk('span', '', LAYOUT_NAMES[r.layout] || r.layout),
       mk('span', '', REALM_BY_ID[r.realm]?.name || r.realm));
     if (r.daily) chips.prepend(mk('span', 'daily', 'Daily'));
+    if (r.depth) chips.append(mk('span', 'descent', `Floor ${r.depth}`));
     if (r.bosses) chips.append(mk('span', 'boss', r.bosses > 1 ? `${r.bosses} bosses` : 'boss out'));
     if (r.lives !== null && r.lives !== undefined) chips.append(mk('span', 'coop', `♥ ${r.lives}`));
     if (r.vault === 'locked') chips.append(mk('span', '', 'vault locked'));
@@ -2040,7 +2130,7 @@ try {
   const okLayout = (l) => l === 'dungeon' || l === 'field';
   if (okLayout(saved.layout)) picker.layout = saved.layout;
   if (okLayout(qs.get('layout'))) picker.layout = qs.get('layout');
-  const okMode = (m) => ['race', 'pvp', 'coop'].includes(m);
+  const okMode = (m) => ['race', 'pvp', 'coop', 'descent'].includes(m);
   if (okMode(saved.mode)) picker.mode = saved.mode;
   if (okMode(qs.get('mode'))) picker.mode = qs.get('mode');
   if (qs.has('spectate') && qs.get('room')) setTimeout(() => connect($('name').value.trim() || 'Spectator', qs.get('room'), { spectate: true }), 0);
@@ -2347,6 +2437,11 @@ function drawMinimap(now) {
   for (const i of doors.keys()) g.fillRect((i % W) * S - 1, Math.floor(i / W) * S - 1, S + 2, S + 2);
   g.fillStyle = '#8a1d1d';
   for (const i of traps.keys()) g.fillRect((i % W) * S + S * 0.1, Math.floor(i / W) * S + S * 0.1, S * 0.8, S * 0.8);
+  if (stairs) {   // the way down: a pulsing purple square
+    const k = 1 + Math.sin(now / 200) * 0.25;
+    g.fillStyle = '#c77dff';
+    g.fillRect((stairs.x + 0.5) * S - S * 1.2 * k, (stairs.y + 0.5) * S - S * 1.2 * k, S * 2.4 * k, S * 2.4 * k);
+  }
   for (const p of pings) {
     const x = (p.x + 0.5) * S, y = (p.y + 0.5) * S, k = (now / 600) % 1;
     g.strokeStyle = p.color; g.lineWidth = 2; g.beginPath(); g.arc(x, y, S * (1.5 + k * 3), 0, 7); g.stroke();
@@ -2383,6 +2478,11 @@ function animateWorld(dt) {
   for (const fn of worldTicks) fn(dt, elapsed, me);
   updateBosses(dt);
   updateTraps();
+  if (stairs) {
+    const u = stairs.group.userData;
+    u.arrow.position.y = 3 + Math.sin(elapsed * 3) * 0.4; u.arrow.rotation.y += dt * 2;
+    u.rim.material.opacity = 0.6 + Math.sin(elapsed * 5) * 0.3;
+  }
   for (const d of doors.values()) {
     const l = d.userData.lock;
     l.rotation.y += dt * 1.2; l.position.y = WALL_H + 0.9 + Math.sin(elapsed * 2) * 0.15;
