@@ -163,7 +163,26 @@ HEAD_DIG = 8.0    # head start: logit pull toward digging a proven-safe neighbou
 HEAD_MOVE = 2.0   # head start: logit pull toward the nearest proven-safe tile
 
 
-def head_start(spec, pop):
+HEAD_CIRCUITS = 11   # hidden units per layer the head start takes over (9 digs + 2 move directions)
+
+
+def _layer_views(spec, pop):
+    """(W (P, i, out), b (P, out)) views into pop for every layer."""
+    P, out, o = pop.shape[0], [], 0
+    for i, n in spec.layers:
+        out.append((pop[:, o:o + i * n].view(P, i, n), pop[:, o + i * n:o + i * n + n]))
+        o += i * n + n
+    return out
+
+
+def head_units(spec, w):
+    """The hidden units the head start takes over in one network w (n_params,): in every hidden layer,
+    the HEAD_CIRCUITS with the weakest outgoing weights. A list of index lists, one per hidden layer."""
+    layers = _layer_views(spec, w.reshape(1, -1))
+    return [layers[j + 1][0][0].norm(dim=1).argsort()[:HEAD_CIRCUITS].tolist() for j in range(len(spec.hidden))]
+
+
+def head_start(spec, pop, units=None):
     """Wire the v5 logic hint straight into a population's networks (in place; pop (P, n_params)).
 
     11 hidden units in every layer are taken over (the ones with the weakest outgoing weights in
@@ -171,7 +190,8 @@ def head_start(spec, pop):
     each tile in reach to its dig action, and 2 carry the direction to the nearest safe tile to the
     moves. A head-started bot therefore digs proven-safe tiles, never digs proven mines, and walks to
     the nearest safe tile when none is in reach; everything else (no hint on the board) is the
-    network's own. Evolution is free to change all of it afterwards."""
+    network's own. Evolution is free to change all of it afterwards, unless the run locks it: then
+    this is called again on every generation with the same `units` (from head_units)."""
     from .env import N_CHANNELS_V5, N_GLOBAL_V5, NEAR, MOVES, DIG0
     if spec.version < 5:
         raise ValueError("the head start needs model type 5 (the logic hint)")
@@ -185,18 +205,12 @@ def head_start(spec, pop):
     g0 = N_CHANNELS_V5 * KK + N_GLOBAL_V5 - 4          # nearest safe dy, dx, distance, present
     circuits.append(({g0: 1.5}, {m: HEAD_MOVE * dy for m, (dy, dx) in enumerate(MOVES)}))
     circuits.append(({g0 + 1: 1.5}, {m: HEAD_MOVE * dx for m, (dy, dx) in enumerate(MOVES)}))
-    n = len(circuits)
-    if not spec.hidden or min(spec.hidden) < n:
-        raise ValueError(f"the head start needs hidden layers of at least {n} units")
-
-    P = pop.shape[0]
-    layers, o = [], 0                                  # (W view (P, i, out), b view (P, out)) per layer
-    for i, out in spec.layers:
-        Wv = pop[:, o:o + i * out].view(P, i, out); o += i * out
-        bv = pop[:, o:o + out]; o += out
-        layers.append((Wv, bv))
-    # the units to take over in each hidden layer: weakest outgoing weights
-    units = [layers[j + 1][0][0].norm(dim=1).argsort()[:n].tolist() for j in range(len(spec.hidden))]
+    assert len(circuits) == HEAD_CIRCUITS
+    if not spec.hidden or min(spec.hidden) < HEAD_CIRCUITS:
+        raise ValueError(f"the head start needs hidden layers of at least {HEAD_CIRCUITS} units")
+    if units is None:
+        units = head_units(spec, pop[0])
+    layers = _layer_views(spec, pop)
     for c, (ins, outs) in enumerate(circuits):
         W, b = layers[0]
         u = units[0][c]

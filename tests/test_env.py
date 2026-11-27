@@ -550,6 +550,44 @@ class LogicHint(unittest.TestCase):
             e.step(a[:, None])
         self.assertGreater(checked, 20)
 
+    def test_head_lock_survives_mutation(self):
+        import queue
+        from unittest import mock
+        from ai import evolve
+        from ai.policy import Spec, head_start, head_units
+        s = Spec(2, [24, 12], "tanh", 5)
+        clean = head_start(s, s.init(1))
+        # the same units put the wiring back exactly, whatever mutation did to it
+        noisy = clean + torch.randn_like(clean) * 0.5
+        fixed = head_start(s, noisy.clone(), head_units(s, clean[0]))
+        again = head_start(s, clean.clone(), head_units(s, clean[0]))
+        changed = fixed != noisy
+        self.assertTrue(torch.equal(fixed[changed], again[changed]))
+
+        # in a real (tiny) run: with the lock every generation's networks carry the same wiring
+        cfg = evolve.sanitize({"model_version": "5", "radius": 2, "hidden": "24,12", "population": 12, "elites": 2,
+                               "episodes": 1, "board_w": 10, "board_h": 10, "mines": 12, "episode_steps": 20,
+                               "agents_per_board": 1, "mode": "race", "bosses": False, "layout": "field",
+                               "head_start": True, "head_lock": True, "sigma": 0.5, "sigma_min": 0.5,
+                               "generations": 3, "device": "cpu", "run_name": "locktest"})
+        evts, saved = queue.Queue(), []
+        with mock.patch.object(evolve, "save_model", lambda name, spec, w, meta: saved.append((w.clone(), meta)) or name):
+            evolve._train(cfg, queue.Queue(), evts)
+        gens = []
+        while not evts.empty():
+            e = evts.get()
+            if e["t"] == "error":
+                self.fail(e)
+            if e["t"] == "gen":
+                gens.append(torch.tensor(e["weights"]))
+        self.assertEqual(len(gens), 3)
+        w, meta = saved[-1]
+        self.assertTrue(meta["head_start"])
+        u = meta["head_units"]
+        self.assertEqual([len(x) for x in u], [11, 11])
+        for g in gens:
+            self.assertTrue(torch.equal(head_start(s, g[None].clone(), u)[0], g), "every generation's best is wired")
+
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class Curriculum(unittest.TestCase):

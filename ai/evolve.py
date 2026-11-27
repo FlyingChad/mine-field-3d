@@ -17,7 +17,7 @@ import torch
 
 from .env import MineEnv
 from .models import load_model, save_model, safe_name
-from .policy import Spec, choose, upgrade, head_start
+from .policy import Spec, choose, upgrade, head_start, head_units, HEAD_CIRCUITS
 
 # Every hyperparameter the lab exposes. The lab UI builds its form from this list.
 # live=True means it can be changed while a run is in progress.
@@ -62,6 +62,8 @@ SCHEMA = [
         {"key": "activation", "label": "Activation", "type": "select", "options": ["tanh", "relu", "elu"], "default": "tanh"},
         {"key": "head_start", "label": "Head start (logic hint)", "type": "bool", "default": False,
          "help": "Model type 5 only, needs hidden layers of 11+ units. Wires the logic hint straight into new networks: dig a neighbour the numbers prove safe, never one they prove mined, walk to the nearest safe tile. Evolution refines it from there. Not applied again when starting from a model that already had it."},
+        {"key": "head_lock", "label": "Lock head start", "type": "bool", "default": False, "live": True,
+         "help": "Model type 5 only. Puts the head start's wiring back into every new network each generation, so mutation can't wear it away: bots always dig proven-safe tiles and never proven mines, and evolution only learns the rest (where to go when nothing is proven, when to guess, flags). Turns the head start on if it isn't yet."},
         {"key": "action_masking", "label": "Mask invalid actions", "type": "bool", "default": True, "help": "Never pick moves off the board or digs on revealed tiles."},
         {"key": "action_noise", "label": "Action noise", "type": "float", "default": 0.0, "min": 0, "max": 5, "step": 0.05, "live": True, "help": "Gumbel noise on action choice (exploration)."},
     ]},
@@ -236,11 +238,13 @@ def _train(cfg, cmd_q, evt_q):
 
     pop = spec.init(P, device)
     hinted = False                                      # seeded from a model that already had the head start
+    units = None                                        # the hidden units its wiring uses (for the lock)
     if cfg["seed_model"]:
         m = load_model(cfg["seed_model"])
         old = m["spec_obj"]
         # the meta flag says the wiring is really in there (a ticked box alone doesn't: older code skipped it)
         hinted = old.version >= 5 and bool((m.get("meta") or {}).get("head_start"))
+        units = (m.get("meta") or {}).get("head_units") if hinted else None
         if 2 <= old.version < spec.version and (old.radius, old.hidden, old.activation) == (
                 spec.radius, spec.hidden, spec.activation):
             m["weights"] = upgrade(old, m["weights"], spec)     # warm-start a newer model from an older one
@@ -251,9 +255,21 @@ def _train(cfg, cmd_q, evt_q):
         w = m["weights"].to(device)
         pop = w.unsqueeze(0) + torch.randn(P, spec.n_params, device=device) * cfg["sigma"]
         pop[0] = w
-    if cfg.get("head_start") and spec.version >= 5 and not hinted:
-        head_start(spec, pop)
+
+    def wire(pop):
+        """Apply the head start (first time: pick its units) and keep using the same units after."""
+        nonlocal hinted, units
+        if units is None:
+            units = head_units(spec, pop[0])
+        head_start(spec, pop, units)
         hinted = True
+
+    can_wire = spec.version >= 5 and bool(spec.hidden) and min(spec.hidden) >= HEAD_CIRCUITS
+    if (cfg.get("head_start") and not hinted) or cfg.get("head_lock"):
+        if not can_wire:
+            raise ValueError(f"Head start needs model type 5 and hidden layers of at least {HEAD_CIRCUITS} units "
+                             f"(this run: {spec.describe()}). Untick Head start / Lock head start or change the network.")
+        wire(pop)
 
     _put(evt_q, {"t": "status", "state": "running", "device": dev_name, "params": spec.n_params,
                  "arch": spec.describe(), "cfg": cfg})
@@ -262,7 +278,8 @@ def _train(cfg, cmd_q, evt_q):
 
     def save(name, why):
         n = save_model(name, spec, best_vec, {"run": cfg["run_name"], "generation": gen, "fitness": best_fit,
-                                              "cfg": cfg, "why": why, "head_start": hinted})
+                                              "cfg": cfg, "why": why, "head_start": hinted,
+                                              "head_units": units if hinted else None})
         _put(evt_q, {"t": "saved", "name": n, "why": why})
 
     while True:
@@ -342,6 +359,8 @@ def _train(cfg, cmd_q, evt_q):
         if cfg["mutation_rate"] < 1:
             noise *= torch.rand_like(children) < cfg["mutation_rate"]
         pop = torch.cat([pop[:E], children + noise])
+        if cfg.get("head_lock") and can_wire:
+            wire(pop)                                   # mutation can't wear the wiring away
         sigma = max(cfg["sigma_min"], sigma * cfg["sigma_decay"])
 
 
