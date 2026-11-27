@@ -227,6 +227,8 @@ body.touch .center { padding: 18px; }
 body.touch .banner #bannerBig { font-size: 34px; }
 .modRow { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #c6d1de; max-width: 220px; }
 .modRow #modDesc { min-width: 0; overflow-wrap: anywhere; }
+.flagHint { max-width: 220px; font-size: 11px; line-height: 1.35; color: #ffd23f; background: rgba(255, 210, 63, 0.1);
+  border: 1px solid rgba(255, 210, 63, 0.35); border-radius: 6px; padding: 5px 7px; margin: 2px 0 4px; }
 .chip.mod { background: #a0522d; white-space: nowrap; }
 /* the stairs shop */
 .shop { left: 50%; bottom: 96px; transform: translateX(-50%); width: min(640px, calc(100vw - 24px)); padding: 10px 12px; }

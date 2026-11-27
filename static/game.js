@@ -1268,9 +1268,31 @@ function renderScores() {
   }
 }
 
+const counters = { mines: 0, safe: 0 };
+let hintDirty = false, lastHint = '';
 function setCounters(m) {
-  if (m.minesLeft !== undefined) $('minesLeft').textContent = m.minesLeft;
-  if (m.safeLeft !== undefined) $('safeLeft').textContent = m.safeLeft;
+  if (m.minesLeft !== undefined) { $('minesLeft').textContent = m.minesLeft; counters.mines = m.minesLeft; }
+  if (m.safeLeft !== undefined) { $('safeLeft').textContent = m.safeLeft; counters.safe = m.safeLeft; }
+  hintDirty = true;           // re-checked at the end of handle(), once tiles and flags are up to date
+}
+
+// A round only ends when every safe tile is dug, and a flagged tile can't be dug. When a wrong flag is
+// all that's left the field looks finished but nothing happens, so say so.
+function updateFlagHint() {
+  hintDirty = false;
+  let text = '';
+  if (roundState === 'playing' && counters.safe > 0) {
+    let open = 0;
+    for (let i = 0; i < tiles.length; i++) if (tiles[i] === -2 && !flags.has(i)) open++;
+    const n = counters.safe, many = n > 1;
+    if (!open) text = `Every hidden tile is flagged, but ${n} safe tile${many ? 's are' : ' is'} still covered: ` +
+      `${many ? 'some flags are' : 'a flag is'} wrong. Look for a number touching more flags than it shows, remove that flag and dig the tile.`;
+    else if (counters.mines < 0) text = `More flags than mines: at least ${-counters.mines} flag${counters.mines < -1 ? 's are' : ' is'} on a safe tile.`;
+  }
+  const el = $('flagHint');
+  el.hidden = !text; el.textContent = text ? '⚠ ' + text : '';
+  if (text && text !== lastHint && text.startsWith('Every')) feed({ text: 'Not finished yet! ', color: '#ffd23f' }, text);
+  lastHint = text;
 }
 
 function showResults(results, next, duration) {
@@ -2031,6 +2053,7 @@ function handle(m) {
       break;
   }
   if (tut) tutEvent(m);
+  if (hintDirty) updateFlagHint();
 }
 
 // ---------------------------------------------------------------- settings panel
