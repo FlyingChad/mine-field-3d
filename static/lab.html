@@ -80,7 +80,7 @@
             <label class="tiny">Mines <input id="wM" type="number" value="40" min="1" max="2000"></label>
             <label class="tiny">Steps <input id="wS" type="number" value="250" min="10" max="5000"></label>
             <label class="tiny">Layout <select id="wL"><option value="field">Field</option><option value="dungeon">Dungeon</option></select></label>
-            <label class="tiny">Mode (v2) <select id="wMode"><option value="mixed">Mixed</option><option value="race">Race</option><option value="pvp">PvP</option><option value="coop">Co-op</option></select></label>
+            <label class="tiny">Mode (v2+) <select id="wMode"><option value="mixed">Mixed</option><option value="race">Race</option><option value="pvp">PvP</option><option value="coop">Co-op</option><option value="descent">Descent (v3)</option></select></label>
             <label class="tiny">Boss (v2) <select id="wBoss"><option value="1">On</option><option value="0">Off</option></select></label>
             <label class="tiny grow">Speed <input id="wSpeed" type="range" min="1" max="60" value="8"> <b id="wSpeedLbl">8</b>/s</label>
           </div>
@@ -112,6 +112,9 @@
             <li><span class="sw" style="background:#e3cfa0"></span>Revealed (number = adjacent mines)</li>
             <li><span class="sw" style="background:#b8322f"></span>Mine that was dug (exploded)</li>
             <li><span class="sw" style="background:#2b2b33"></span>Mine shown when the episode ends</li>
+            <li><span class="sw" style="background:#c82828"></span>Spike trap, spikes up (v3; grey outline when down)</li>
+            <li><span class="sw" style="background:#f2b705"></span>Pickup (v3; green = food)</li>
+            <li><span class="sw" style="background:#7ee0ff"></span>Stairs down (v3, Descent)</li>
           </ul>
         </div>
       </div>

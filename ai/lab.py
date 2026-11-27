@@ -15,6 +15,7 @@ import torch
 from aiohttp import WSMsgType, web
 
 from . import evolve
+from .env import MODES
 from .models import (CONFIGS_DIR, RUNS_DIR, delete_model, list_models, load_model, rename_model, safe_name)
 from .policy import Spec, choose
 
@@ -192,7 +193,7 @@ class Lab:
         while True:
             sources = self._watch_sources(msg)      # re-read each episode so "run" follows training
             A = len(sources)
-            env = evolve.make_env(cfg, 1, A, "cpu", rich=any(s[0].version >= 2 for s in sources))
+            env = evolve.make_env(cfg, 1, A, "cpu", version=max(s[0].version for s in sources))
             episode += 1
             prefs = net = None
             while not bool(env.done.all()):
@@ -224,7 +225,7 @@ class Lab:
         so the picture stays stable). Output: the 26 action probabilities.
         Edges: for each pair of layers, the `max_edges` strongest contributions
         (source activation x weight) this step, signed."""
-        from .env import N_CHANNELS, N_CHANNELS_V2
+        from .env import n_channels
         layers = spec.weights(w)
         acts = spec.trace(w, x)
         hidden = acts[:-1]
@@ -234,7 +235,7 @@ class Lab:
                                       for l in range(len(hidden))]}
         shown = cls._shown_cache[key]
         K = 2 * spec.radius + 1
-        KK, C = K * K, (N_CHANNELS_V2 if spec.version >= 2 else N_CHANNELS)
+        KK, C = K * K, n_channels(spec.version)
         win = x[:C * KK].view(C, KK)
         glob = x[C * KK:]
         # one character per vision cell: o = outside/wall, x = exploded, f = flagged, h = hidden, 0-4 = count
@@ -246,7 +247,10 @@ class Lab:
         others = [int(c) for c in (win[8] > 0).nonzero().view(-1).tolist()]
         v2 = {}
         if spec.version >= 2:   # boss, danger zone and allies within the vision window
-            v2 = {k: [int(c) for c in (win[i] > 0).nonzero().view(-1).tolist()] for k, i in (("boss", 9), ("danger", 10), ("allies", 11))}
+            named = (("boss", 9), ("danger", 10), ("allies", 11))
+            if spec.version >= 3:   # traps, spikes up, pickups, the goal
+                named += (("traps", 12), ("spikes", 13), ("items", 14), ("goal", 15))
+            v2 = {k: [int(c) for c in (win[i] > 0).nonzero().view(-1).tolist()] for k, i in named}
 
         def top(contrib):
             flat = contrib.reshape(-1)
@@ -294,7 +298,11 @@ class Lab:
             boss = {"y": int(env.boss_pos[0, 0]), "x": int(env.boss_pos[0, 1]), "hp": round(env.boss_hp[0].item() / env.p["boss_hp"], 3),
                     "windup": int(env.boss_windup[0])}
         return {"t": "frame", "w": W, "h": H, "cells": "".join(cells), "flags": flags, "agents": agents, "boss": boss,
-                "mode": ["race", "pvp", "coop"][int(env.mode[0])] if env.rich else None,
+                "mode": MODES[int(env.mode[0])] if env.rich else None,
+                "traps": [[i, int(up)] for i, up in zip((env.traps[0] & rev).view(-1).nonzero().view(-1).tolist(),
+                                                         env.spikes_up()[0].view(-1)[(env.traps[0] & rev).view(-1)].tolist())],
+                "items": [[i, int(env.items[0].view(-1)[i])] for i in ((env.items[0] > 0) & rev).view(-1).nonzero().view(-1).tolist()],
+                "stairs": int(env.stairs_pos[0, 0]) * W + int(env.stairs_pos[0, 1]) if bool(env.stairs_on[0]) else None,
                 "prefs": [round(p, 4) for p in prefs.tolist()] if prefs is not None else None,
                 "step": env.t, "steps": env.steps, "done": done, "cleared": bool(env.cleared[0]), "episode": episode}
 

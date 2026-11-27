@@ -27,7 +27,7 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
   - mines, scatter blasts and shockwaves deal damage through `Room.hurt()`, which queues knockouts; call `flush_kos()` after broadcasting the event;
   - at 0 HP a player loses points, drops their held item and is stunned until `Room.respawns()` puts them back on a random floor tile at full HP;
   - food (`apple`, `potion`) is a power-up that is only picked up when hurt.
-  - Health is game-layer only, not in `ai/env.py`. Hurt bots walk toward visible food (a heuristic in `update_bots`).
+  - Health is simulated in `ai/env.py` only with `rich=True` (v2+); food only with `extras=True` (v3). Hurt v1/v2 bots walk toward visible food (a heuristic in `update_bots`).
 - **Bosses** (`server.py` `Boss`, `BOSS_*` and `ATTACK_*` constants; models in `static/bosses.js`):
   - Kinds: `ogre`, `wraith`, `golem`; ids must match `BOSS_KINDS` and `BOSSES`. Only dungeon layouts have bosses (1, or 2 with 4+ players).
   - Behaviour (`Room.update_bosses`, every tick): wander with BFS paths (`Room.bfs`, 8-way, never cutting wall corners), chase the nearest player in `aggro` range with line of sight, then a telegraphed wind-up (`bossAtk`) → `boss_smash` (damage via `hurt()`, shield absorbs).
@@ -48,7 +48,7 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
   - They're announced when revealed (`reveal.traps`, `snapshot.traps`), and spikes are up when `(now + phase) % SPIKE_CYCLE < SPIKE_UP`.
   - `Room.spikes(now)` runs every tick: `hurt()` + stun, with a shield absorbing it and `SPIKE_GRACE` per player. Scatter removes traps in its area.
   - The client animates them from server time (`serverTime` in `welcome` → `serverNow()`).
-  - Bots won't step onto revealed traps. Not in `ai/env.py`.
+  - v1/v2 bots won't step onto revealed traps (heuristic). Traps are simulated in `ai/env.py` for v3 (`extras`), in steps (`RICH` spike_*), so keep those in step with `SPIKE_*`.
 - **Daily dungeon:** room name `daily_name()` = `daily-YYYY-MM-DD` (server's local date) → `make_room` creates `Room(daily=date)`.
   - Forced race / dungeon / `daily_realm(date)`. `self.rng` is `random.Random("mf3d-" + date)` and is re-seeded every round, so layout, vault, mines, items and traps match for everyone. Mines that fall in the first dig's 3×3 are moved with the same rng.
   - Use `self.rng` (not `random`) for anything that should match in the daily.
@@ -142,7 +142,7 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
     - its effect in `Room.pickups` (instant) or `Room.use` (held);
     - a bot heuristic in `Room.bot_use`;
     - on the client, `ITEM_INFO`, `itemModel()` and a message handler in game.js, plus an fx bit if other players need to see its effect.
-  - Power-ups are **not** simulated in `ai/env.py`. Bots pick them up by walking over them and use them through the heuristics in `Room.bot_use`.
+  - Power-up effects are **not** simulated in `ai/env.py` (v3 only sees pickups as generic items worth a small reward). Bots pick them up by walking over them and use held ones through the heuristics in `Room.bot_use`.
 - `static/characters.js`: 18 procedurally built characters, including dragon, mech, alien, viking, skeleton and bee. Each one is a `build(color)` that returns `{root, upper, feet, top, tick?}`. The player's colour is the character's accent.
 - `static/hats.js`: unlockable hats (`buildHat(id, color)`, `HAT_HEIGHT`). A hat sits on the character's `upper` at `top`, and `makeAvatar` raises the name tag, health bar and held item by `HAT_HEIGHT`.
 - `store.py`: `Profiles` and `Daily` JSON stores (see Profiles and the daily dungeon above).
@@ -162,9 +162,15 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
     - a boss per board (`bosses=True`): delay, chase, wind-up, smash, cooldown;
     - attack: boss damage, or in PvP a rival;
     - modes per board (`mode` = race / pvp / coop / mixed): PvP KOs pay `pvp_ko`; co-op has no friendly fire, and `env.fitness()` gives every agent the team average.
-    - Not simulated: power-ups, food, co-op shared lives, boss line of sight, boss HP scaling.
+    - Not simulated: held power-up effects, co-op shared lives, boss line of sight, boss HP scaling, the vault, shop and modifiers (v3 `extras` adds traps, pickups, food and descent stairs).
     - Change these in `RICH` alongside the server constants.
   - In the game, `server.update_bots` passes v2 brains an `extra` dict: HP, mode, allies, nearest boss with wind-up state, and attack_ok. The network's attack replaces the "swing at bosses" heuristic, which v1 bots still use.
+  - **v3** (`extras=True`, on whenever training v3): v2 plus spike traps, pickups and descent.
+    - 17 channels: v2's 12 planes, then trap (revealed), spikes up now, pickup, goal; out-of-bounds last. 18 globals: v2's with a 4-way mode one-hot (`MODES` = race, pvp, coop, descent), then goal dy / dx / distance / present. Still 27 actions.
+    - Env rules (`RICH` trap_/spike_/item_/food_/stairs_ keys): revealed traps hurt + stun while up (`(t + phase) % spike_cycle < spike_up`, grace between hits); pickups (1 power-up, 2 food) are taken by walking on them once revealed (`item` reward; food only when hurt); a cleared descent board (mode 3, co-op rules, `self.mode >= 2` means co-op) pays `floor`, opens stairs 2–4 tiles away and removes the boss, then ends on `stairs` (reward to everyone) or `stairs_auto`.
+    - `descent_practice` (lab field, LIVE) pre-digs that share of descent boards except a radius 1..`practice_radius` square around the first dig.
+    - v2 sees descent as coop. `policy.upgrade(v2spec, w, v3spec)` maps v2 weights into a v3 layout (new inputs zero, descent = coop's weights); `_train` does it when a v2 `seed_model` seeds a v3 run of the same shape, and a test checks the logits match.
+    - In the game, v3 brains also get `traps` [(x, y, up at now + `BOT_STEP_SECONDS`)], `items`, `goal` (the vault door front while carrying the key, else the stairs) and the real mode. The food, trap and goal heuristics are off for v3, except that goals further than `GOAL_NEAR` tiles are still BFS-walked.
   - `layout="dungeon"` samples boards from a cached bank of `layouts.dungeon()` maps (`self.floor`). In that mode `mines` is a density.
   - Reward shaping (training only, not game scoring): `step` (lab default −0.02) and `unflag` (lab default −0.5, charged when an agent removes its own flag) stop bots toggling a flag to pass turns. `stats["unflags"]` is charted in the Flags plot. Both lab fields are LIVE.
   - Walls block moves and digs, and appear in the observation's out-of-bounds channel.

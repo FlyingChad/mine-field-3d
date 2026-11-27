@@ -115,7 +115,193 @@ class AllModes(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
+class V3(unittest.TestCase):
+    """Traps, pickups and the descent stairs (extras=True, v3 models)."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+
+    def env(self, mode="race", agents=1, **kw):
+        from ai.env import MineEnv, DIG0
+        e = MineEnv(1, agents, 10, 10, 8, 300, 3, rich=True, mode=mode, extras=True,
+                    rewards={"step": 0}, **kw)
+        e.pos[0, :] = torch.tensor([5, 5])
+        e.step(torch.tensor([[DIG0 + 4] * agents]))      # first dig: mines, traps and items get laid
+        e.traps.zero_(); e.items.zero_()
+        return e
+
+    @staticmethod
+    def safe_tile(e, revealed=True):
+        cand = e.floor[0] & ~e.mines[0] & (e.revealed[0] if revealed else True)
+        return cand.nonzero()[0].tolist()
+
+    def test_shapes(self):
+        from ai.env import MineEnv, obs_dim, n_actions, N_CHANNELS_V3, N_GLOBAL_V3
+        from ai.policy import Spec
+        s = Spec(3, [32], "tanh", 3)
+        self.assertEqual((s.in_dim, s.out_dim), (49 * N_CHANNELS_V3 + N_GLOBAL_V3, n_actions(3)))
+        self.assertEqual(Spec.from_dict(s.to_dict()).version, 3)
+        e = MineEnv(4, 2, 12, 12, 20, 100, 3, rich=True, mode="mixed", bosses=True, extras=True)
+        for v in (1, 2, 3):
+            self.assertEqual(tuple(e.observe(0, 3, v).shape), (4, obs_dim(3, v)))
+        self.assertEqual(tuple(e.mask(0, 3).shape), (4, 27))
+
+    def test_v2_upgrade_plays_the_same(self):
+        from ai.env import MineEnv, DIG0
+        from ai.policy import Spec, upgrade
+        v2, v3 = Spec(2, [24, 16], "tanh", 2), Spec(2, [24, 16], "tanh", 3)
+        w2 = v2.init(1)[0] + torch.randn(v2.n_params) * 0.3
+        w3 = upgrade(v2, w2, v3)
+        self.assertEqual(w3.numel(), v3.n_params)
+        for mode in ("race", "pvp", "coop", "descent"):
+            e = MineEnv(16, 2, 12, 12, 20, 100, 3, rich=True, mode=mode, bosses=True, extras=True)
+            e.step(torch.full((16, 2), DIG0 + 4))
+            e.traps.zero_(); e.items.zero_()
+            for _ in range(5):
+                l2 = v2.forward(w2[None], e.observe(0, 2, 2)[None])[0]
+                l3 = v3.forward(w3[None], e.observe(0, 2, 3)[None])[0]
+                self.assertTrue(torch.allclose(l2, l3, atol=1e-5), mode)
+                e.step(torch.randint(0, 26, (16, 2)))
+                e.traps.zero_(); e.items.zero_()
+
+    def test_spikes_hurt_when_up_with_grace(self):
+        from ai.env import RICH
+        e = self.env()
+        y, x = self.safe_tile(e)
+        e.pos[0, 0] = torch.tensor([y, x])
+        e.traps[0, y, x] = True
+        e.phase[0, y, x] = (-e.t) % RICH["spike_cycle"]          # up on this step
+        obs = e.observe(0, 3, 3)
+        self.assertTrue(bool(e.spikes_up()[0, y, x]), "the observation shows them up")
+        hp = e.hp[0, 0].item()
+        e.step(torch.tensor([[26]]))                            # attack with nothing in reach = stand still
+        self.assertEqual(hp - e.hp[0, 0].item(), RICH["spike_damage"])
+        self.assertEqual(int(e.stats["spikes"][0, 0]), 1)
+        e.phase[0, y, x] = (-e.t) % RICH["spike_cycle"]
+        e.step(torch.tensor([[26]]))
+        self.assertEqual(int(e.stats["spikes"][0, 0]), 1, "grace between hits")
+        self.assertIsNotNone(obs)
+
+    def test_hidden_traps_are_harmless(self):
+        e = self.env()
+        y, x = self.safe_tile(e, revealed=False) if (~e.revealed[0] & ~e.mines[0]).any() else self.safe_tile(e)
+        e.revealed[0, y, x] = False
+        e.pos[0, 0] = torch.tensor([y, x])
+        e.traps[0, y, x] = True
+        e.phase[0, y, x] = (-e.t) % 6
+        e.step(torch.tensor([[26]]))
+        self.assertEqual(int(e.stats["spikes"][0, 0]), 0)
+
+    def test_pickups_and_food(self):
+        from ai.env import DEFAULT_REWARDS, RICH
+        e = self.env()
+        y, x = self.safe_tile(e)
+        e.pos[0, 0] = torch.tensor([y, x])
+        e.items[0, y, x] = 2                                   # food at full health stays put
+        e.step(torch.tensor([[26]]))
+        self.assertEqual(int(e.items[0, y, x]), 2)
+        e.hp[0, 0] = 50
+        s0 = e.score[0, 0].item()
+        e.step(torch.tensor([[26]]))
+        self.assertEqual(int(e.items[0, y, x]), 0)
+        self.assertEqual(e.hp[0, 0].item(), 50 + RICH["food_heal"])
+        self.assertEqual(e.score[0, 0].item() - s0, DEFAULT_REWARDS["item"])
+        e.items[0, y, x] = 1                                   # power-ups are always taken
+        e.step(torch.tensor([[26]]))
+        self.assertEqual(int(e.stats["items"][0, 0]), 2)
+
+    def clear(self, e):
+        e.revealed[0] = e.floor[0] & ~e.mines[0]
+
+    def test_descent_stairs(self):
+        from ai.env import DEFAULT_REWARDS
+        e = self.env("descent", agents=2)
+        self.clear(e)
+        s0 = e.score[0].clone()
+        e.step(torch.tensor([[26, 26]]))
+        self.assertTrue(bool(e.stairs_on[0]) and bool(e.cleared[0]))
+        self.assertFalse(bool(e.done[0]), "a cleared descent floor waits for the stairs")
+        self.assertEqual((e.score[0] - s0).tolist(), [DEFAULT_REWARDS["floor"]] * 2)
+        _, ex = e.extra(0, 3)
+        sy, sx = e.stairs_pos[0].tolist()
+        self.assertTrue(bool(ex["goal"][0, sy, sx]) and bool(ex["goal_on"][0]))
+        e.pos[0, 1] = torch.tensor([sy, sx])
+        s1 = e.score[0].clone()
+        e.step(torch.tensor([[26, 26]]))
+        self.assertTrue(bool(e.done[0]))
+        self.assertEqual((e.score[0] - s1).tolist(), [DEFAULT_REWARDS["stairs"]] * 2)
+
+    def test_descent_practice(self):
+        from ai.env import MineEnv, DIG0
+        e = MineEnv(8, 1, 16, 16, 30, 100, 3, rich=True, mode="descent", extras=True,
+                    params={"descent_practice": 1.0, "practice_radius": 3})
+        e.pos[:, 0] = torch.tensor([8, 8])
+        e.step(torch.full((8, 1), DIG0 + 4))
+        hidden_safe = (~e.revealed & ~e.mines).reshape(8, -1).sum(1)
+        self.assertTrue(bool((hidden_safe <= 49).all()), "only the area around the first dig is left")
+        far = e.revealed.clone(); far[:, 5:12, 5:12] = True
+        self.assertTrue(bool((far | e.mines).all()))
+
+    def test_descent_auto_and_other_modes(self):
+        from ai.env import RICH
+        e = self.env("descent")
+        self.clear(e)
+        e.step(torch.tensor([[26]]))
+        e.pos[0, 0] = torch.tensor([0, 0]) if (e.stairs_pos[0] != 0).any() else torch.tensor([9, 9])
+        n = 0
+        while not bool(e.done[0]):
+            e.step(torch.tensor([[26]])); n += 1
+        self.assertEqual(n, RICH["stairs_auto"] - 1)
+        self.assertEqual(int(e.stats["stairs"].sum()), 0)
+        e = self.env("coop")
+        self.clear(e)
+        e.step(torch.tensor([[26]]))
+        self.assertTrue(bool(e.done[0]) and not bool(e.stairs_on[0]), "co-op still ends on the clear")
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class InGameBot(unittest.IsolatedAsyncioTestCase):
+    async def test_v3_bot_in_descent(self):
+        """A v3 brain gets traps, pickups and the goal from a live descent room and acts on them."""
+        from ai.bots import Brain
+        from ai.policy import Spec
+        from helpers import S, player
+        r = S.Room("v3test", "meadow", "dungeon", "descent")
+        h = player(r, "H")
+        r.place(h)
+        brain = Brain.__new__(Brain)
+        brain.name, brain.spec = "v3", Spec(3, [16], "tanh", 3)
+        brain.w = brain.spec.init(1)
+        seen = {}
+        orig = brain.decide
+
+        def spy(*a, **kw):
+            seen.update(kw.get("extra") or {})
+            return orig(*a, **kw)
+        brain.decide = spy
+        bot = S.BotPlayer(brain, "bot", "#123", "robot", "insane", 0.05)
+        r.place(bot)
+        r.players[bot.id] = bot
+        r.generate(*h.tile())
+        t0 = 1e9
+        for k in range(200):
+            await r.update_bots(t0 + k * 0.07, 0.07)
+            self.assertTrue(r.is_floor(*bot.tile()))
+        self.assertEqual(seen.get("mode"), "descent")
+        for key in ("traps", "items", "goal"):
+            self.assertIn(key, seen)
+        # a nearby goal is the network's job; a far one is walked by BFS
+        r.bosses.clear()
+        bot.held, bot.key, bot.stun_until, bot.ko_until, bot.hp = None, False, 0, 0, bot.max_hp
+        bx, by = bot.tile()
+        bot.x, bot.z = bot.tx, bot.tz = S.tile_center(bx, by)
+        far = max(r.spawn_tiles, key=lambda i: max(abs(i % S.W - bx), abs(i // S.W - by)))
+        r.stairs = far
+        bot.next_think = 0
+        await r.update_bots(t0 + 100, 0.07)
+        path = r.bfs((bx, by), (far % S.W, far // S.W))
+        self.assertEqual(S.tile_center(*path[0]), (bot.tx, bot.tz))
+
     async def test_bot_stays_on_floor_and_carries_the_key(self):
         from ai.bots import Brain
         from helpers import S, vault_room, player

@@ -12,13 +12,14 @@ ACTIVATIONS = {"tanh": torch.tanh, "relu": torch.relu, "elu": F.elu}
 
 class Spec:
     """version 1: classic minesweeper bot (26 actions). version 2: also sees health, the boss and its
-    danger zone, allies and the game mode, and has an attack action (27 actions)."""
+    danger zone, allies and the game mode, and has an attack action (27 actions). version 3: also sees
+    spike traps (and whether they're up), pickups, the goal (stairs / vault door) and the descent mode."""
 
     def __init__(self, radius=3, hidden=(64,), activation="tanh", version=1):
         self.radius = int(radius)
         self.hidden = [int(h) for h in hidden]
         self.activation = activation if activation in ACTIVATIONS else "tanh"
-        self.version = 2 if int(version) >= 2 else 1
+        self.version = max(1, min(3, int(version)))
         self.in_dim = obs_dim(self.radius, self.version)
         self.out_dim = n_actions(self.version)
         dims = [self.in_dim] + self.hidden + [self.out_dim]
@@ -82,6 +83,28 @@ class Spec:
                 h = act(h)
             outs.append(h)
         return outs
+
+
+def upgrade(old, w, new):
+    """Warm start: the weights of a v2 network `old` (Spec) laid out for a v3 network `new` with the
+    same radius / hidden layers / activation. Every v2 input keeps its weights, the new inputs
+    (traps, spikes, pickups, goal) start at zero, and "descent" starts as a copy of "co-op", so
+    the v3 network plays exactly like the v2 one until evolution finds a use for what it now sees."""
+    from .env import N_CHANNELS_V2
+    assert old.version == 2 and new.version == 3
+    assert (old.radius, old.hidden, old.activation) == (new.radius, new.hidden, new.activation)
+    KK = (2 * old.radius + 1) ** 2
+    (W1, b1), *rest = old.weights(w)
+    h = W1.shape[1]
+    win = W1[:N_CHANNELS_V2 * KK].view(N_CHANNELS_V2, KK, h)
+    g = W1[N_CHANNELS_V2 * KK:]                    # dir 3, hp, race, pvp, coop, boss 6
+    zeros = lambda n: torch.zeros(n, KK, h, dtype=W1.dtype, device=W1.device)
+    win3 = torch.cat([win[:12], zeros(4), win[12:13]])           # 12 shared planes, 4 new, out of bounds
+    g3 = torch.cat([g[:7], g[6:7], g[7:], torch.zeros(4, h, dtype=W1.dtype, device=W1.device)])
+    W1n = torch.cat([win3.reshape(-1, h), g3])
+    assert W1n.shape[0] == new.in_dim
+    parts = [W1n.reshape(-1), b1] + [t.reshape(-1) for Wb in rest for t in Wb]
+    return torch.cat(parts)
 
 
 def choose(logits, mask=None, noise=0.0):

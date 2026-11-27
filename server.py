@@ -36,7 +36,7 @@ TICK_HZ = 15
 ACTION_COOLDOWN = 0.08
 
 # power-ups: buried under random safe tiles, exposed when dug up, collected by walking onto them.
-# They are a game-layer feature and are NOT simulated in ai/env.py (bots use them by heuristic).
+# Their effects are NOT simulated in ai/env.py (v3 only sees pickups as items; bots use held ones by heuristic).
 ITEM_DENSITY = 28 / 1024    # power-ups per floor tile
 ITEM_WEIGHTS = {"scatter": 4, "shield": 3, "radar": 3, "boots": 3,
                 "freeze": 3, "gold": 3, "shockwave": 2, "blink": 3,
@@ -294,6 +294,8 @@ class NullWS:
 
 
 BOT_SPEED = 7.0  # world units / second, same as a walking player
+BOT_STEP_SECONDS = TILE / BOT_SPEED   # time a bot takes to walk one tile
+GOAL_NEAR = 4    # v3 bots walk to a goal this close themselves (training puts the stairs 2-4 tiles away)
 
 
 class Boss:
@@ -1433,7 +1435,8 @@ class Room:
                 continue
             p.next_think = now + p.interval
             x, y = p.tile()
-            v2 = getattr(p.brain, "version", 1) >= 2
+            version = getattr(p.brain, "version", 1)
+            v2, v3 = version >= 2, version >= 3
             prey = list(self.bosses.values()) + ([q for q in self.players.values() if q is not p and not q.ko_until]
                                                  if self.mode == "pvp" else [])
             can_hit = any(math.hypot(b.x - p.x, b.z - p.z) <= ATTACK_RANGE * TILE for b in prey)
@@ -1441,8 +1444,8 @@ class Room:
             if not v2 and can_hit:
                 await self.attack(p)
                 continue
-            # heuristic (not learned): when hurt, walk toward visible food nearby
-            if p.hp <= p.max_hp - 40:
+            # heuristic (not learned, v1/v2 only; v3 sees pickups): when hurt, walk toward visible food nearby
+            if not v3 and p.hp <= p.max_hp - 40:
                 food = [(max(abs(i % W - x), abs(i // W - y)), i) for i, k in self.items.items() if k in FOOD]
                 food = [f for f in food if f[0] <= 8]
                 if food:
@@ -1456,29 +1459,35 @@ class Room:
                         cx = None
                     if cx is not None:
                         continue
-            # heuristic (not learned): carry the vault key to the door
+            # the goal: the vault door while carrying the key, else the stairs once the floor is cleared.
+            # v1/v2 always BFS-walk there (heuristic); v3 models learned to reach a nearby goal themselves,
+            # so the walk only takes over when it's further than training ever put it (GOAL_NEAR).
+            goal = None
             if p.key and not self.vault_open:
                 fronts = [t for d in self.doors for t in self.nb(d % W, d // W) if idx(*t) not in self.vault]
                 if fronts:
                     goal = min(fronts, key=lambda t: max(abs(t[0] - x), abs(t[1] - y)))
-                    path = self.bfs((x, y), goal)
-                    if path:
-                        p.tx, p.tz = tile_center(*path[0])
-                        continue
-            # heuristic (not learned): head down the stairs once the floor is cleared
-            if self.stairs is not None:
-                path = self.bfs((x, y), (self.stairs % W, self.stairs // W))
+            elif self.stairs is not None:
+                goal = (self.stairs % W, self.stairs // W)
+            if goal and (not v3 or max(abs(goal[0] - x), abs(goal[1] - y)) > GOAL_NEAR):
+                path = self.bfs((x, y), goal)
                 if path:
                     p.tx, p.tz = tile_center(*path[0])
-                continue
+                    continue
+                if self.stairs is not None and not v3:
+                    continue
             mates = [q for q in self.players.values() if q is not p and not q.ko_until]
             extra = None
             if v2:   # what a v2 model also sees: its health, the mode, teammates and the nearest boss
                 boss = min(self.bosses.values(), key=lambda b: math.hypot(b.x - p.x, b.z - p.z), default=None)
                 # models know race / pvp / coop; descent plays by co-op rules
-                extra = {"hp": p.hp / p.max_hp, "mode": "coop" if self.coop else self.mode, "attack_ok": can_hit,
-                         "allies": [q.tile() for q in mates] if self.coop else [],
+                extra = {"hp": p.hp / p.max_hp, "mode": self.mode if v3 else ("coop" if self.coop else self.mode),
+                         "attack_ok": can_hit, "allies": [q.tile() for q in mates] if self.coop else [],
                          "boss": (*boss.tile(), boss.hp / boss.max_hp, boss.state == "windup") if boss else None}
+                if v3:   # traps (up by the time a step lands), pickups and the goal, all within its view
+                    soon = now + BOT_STEP_SECONDS
+                    extra.update(traps=[(i % W, i // W, self.spikes_up(i, soon)) for i in self.traps if self.revealed[i]],
+                                 items=[(i % W, i // W) for i in self.items], goal=goal)
                 others = [] if self.coop else [q.tile() for q in mates]
             else:
                 others = [q.tile() for q in self.players.values() if q is not p]
@@ -1491,8 +1500,8 @@ class Room:
             if not self.is_floor(tx, ty):
                 continue
             if kind == "move":
-                if idx(tx, ty) in self.traps and self.revealed[idx(tx, ty)]:
-                    continue    # heuristic: bots keep off spike traps they can see
+                if not v3 and idx(tx, ty) in self.traps and self.revealed[idx(tx, ty)]:
+                    continue    # heuristic (v1/v2): bots keep off spike traps they can see
                 p.tx, p.tz = tile_center(tx, ty)
             elif kind == "dig":
                 await self.dig(p, tx, ty)

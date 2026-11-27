@@ -293,6 +293,9 @@ function renderProgress() {
     lineChart('ch-kos', xs, [
       { name: 'Got knocked out', color: SERIES[0], values: h.map((g) => g.kos ?? 0) },
       { name: 'KO’d a rival (PvP)', color: SERIES[1], values: h.map((g) => g.pvp_kos ?? 0) },
+      ...(h.some((g) => g.spikes !== undefined)
+        ? [{ name: 'Spiked (v3)', color: SERIES[2], values: h.map((g) => g.spikes ?? 0) },
+           { name: 'Pickups (v3)', color: SERIES[3], values: h.map((g) => g.items ?? 0) }] : []),
     ], 'lg-kos');
     lineChart('ch-boss', xs, [{ name: 'Boss damage', color: SERIES[0], values: h.map((g) => g.boss_damage ?? 0) }]);
   }
@@ -543,6 +546,12 @@ const netView = (() => {
       } else if (ch === 'x') {
         g.fillStyle = '#2b2b33'; g.beginPath(); g.arc(x + cs / 2, y + cs / 2, cs * 0.22, 0, 7); g.fill();
       }
+      if (target.traps?.includes(c)) {   // v3: spike trap (filled when the spikes are up)
+        g.strokeStyle = '#9aa7b8'; g.lineWidth = 1.5; g.strokeRect(x + cs * 0.22, y + cs * 0.22, cs * 0.56, cs * 0.56);
+        if (target.spikes?.includes(c)) { g.fillStyle = 'rgba(220,60,61,.55)'; g.fillRect(x + cs * 0.22, y + cs * 0.22, cs * 0.56, cs * 0.56); }
+      }
+      if (target.items?.includes(c)) { g.fillStyle = '#ffd23f'; g.beginPath(); g.arc(x + cs / 2, y + cs / 2, cs * 0.16, 0, 7); g.fill(); }
+      if (target.goal?.includes(c)) { g.strokeStyle = '#7ee0ff'; g.lineWidth = 2.5; g.strokeRect(x + 3, y + 3, cs - 6, cs - 6); }
       if (target.danger?.includes(c)) { g.fillStyle = 'rgba(220,60,61,.4)'; g.fillRect(x + 1, y + 1, cs - 2, cs - 2); }
       if (target.others.includes(c)) { g.strokeStyle = SERIES[1]; g.lineWidth = 2; g.strokeRect(x + 2, y + 2, cs - 4, cs - 4); }
       if (target.allies?.includes(c)) { g.strokeStyle = SERIES[2]; g.lineWidth = 2; g.strokeRect(x + 2, y + 2, cs - 4, cs - 4); }
@@ -565,7 +574,9 @@ const netView = (() => {
       const pt = layout.ports[KK + i];
       g.strokeStyle = 'rgba(158,172,189,.18)'; g.beginPath(); g.moveTo(n.x + 6, n.y); g.lineTo(pt.x, pt.y); g.stroke();
     });
-    const GLOBAL_NAMES = ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up'];
+    const GLOBAL_NAMES = target.version >= 3
+      ? ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'descent', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up', 'goal ↕', 'goal ↔', 'goal d', 'goal?']
+      : ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up'];
     const gl = layout.input.slice(-target.glob.length);
     g.font = '10px system-ui';
     target.glob.forEach((v, i) => {
@@ -652,6 +663,24 @@ function drawFrame(f) {
     ctx.fillStyle = SERIES[owner % SERIES.length];
     ctx.beginPath(); ctx.moveTo(x + s * 0.34, y + s * 0.2); ctx.lineTo(x + s * 0.8, y + s * 0.36); ctx.lineTo(x + s * 0.34, y + s * 0.52); ctx.fill();
   }
+  // v3: spike traps (red when up), pickups (gold; food green) and the stairs
+  for (const [i, up] of f.traps || []) {
+    const x = (i % f.w) * s, y = Math.floor(i / f.w) * s;
+    ctx.strokeStyle = '#5b6573'; ctx.lineWidth = 1.5; ctx.strokeRect(x + s * 0.2, y + s * 0.2, s * 0.6, s * 0.6);
+    if (up) { ctx.fillStyle = 'rgba(200,40,40,.7)'; ctx.fillRect(x + s * 0.2, y + s * 0.2, s * 0.6, s * 0.6); }
+    ctx.lineWidth = 1;
+  }
+  for (const [i, kind] of f.items || []) {
+    const x = (i % f.w) * s, y = Math.floor(i / f.w) * s;
+    ctx.fillStyle = kind === 2 ? '#3fae5a' : '#f2b705';
+    ctx.beginPath(); ctx.arc(x + s / 2, y + s / 2, s * 0.2, 0, 7); ctx.fill();
+  }
+  if (f.stairs !== null && f.stairs !== undefined) {
+    const x = (f.stairs % f.w) * s, y = Math.floor(f.stairs / f.w) * s;
+    ctx.fillStyle = '#2c3e57'; ctx.fillRect(x + 2, y + 2, s - 4, s - 4);
+    ctx.fillStyle = '#7ee0ff';
+    for (let k = 0; k < 3; k++) ctx.fillRect(x + s * 0.2 + k * s * 0.2, y + s * (0.3 + k * 0.17), s * 0.6 - k * s * 0.2, Math.max(1.5, s * 0.1));
+  }
   // bot 1's preferences over its reach
   const a0 = f.agents[0];
   if (f.prefs && a0 && !f.done) {
@@ -690,8 +719,8 @@ function drawFrame(f) {
     }
     ctx.globalAlpha = 1;
   });
-  const modeTxt = f.mode ? ` · ${{ race: 'Race', pvp: 'PvP', coop: 'Co-op' }[f.mode]}` : '';
-  $('watchInfo').textContent = `Episode ${f.episode} · step ${f.step}/${f.steps}${modeTxt}` + (f.done ? (f.cleared ? ' · board cleared!' : ' · time up') : '');
+  const modeTxt = f.mode ? ` · ${{ race: 'Race', pvp: 'PvP', coop: 'Co-op', descent: 'Descent' }[f.mode]}` : '';
+  $('watchInfo').textContent = `Episode ${f.episode} · step ${f.step}/${f.steps}${modeTxt}` + (f.done ? (f.cleared ? ' · board cleared!' : ' · time up') : f.stairs != null ? ' · stairs open' : '');
   $('watchAgents').replaceChildren(...f.agents.map((a, k) => el('div', { class: 'agent' },
     el('span', { class: 'dot', style: `background:${SERIES[k % SERIES.length]}` }),
     el('span', {}, `${k + 1}. ${a.label}`), el('span', { class: 'sc' }, fmt(a.score)),

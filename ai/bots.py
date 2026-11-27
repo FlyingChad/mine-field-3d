@@ -25,7 +25,9 @@ class Brain:
         """Room state -> ('move'|'dig'|'flag'|'attack', dx, dy) relative to the bot's tile.
         floor: optional bytearray (1 = floor); walls are seen as "out of bounds", like in training.
         extra (v2 models): {"hp": 0..1, "mode": "race"|"pvp"|"coop", "allies": [(x, y)],
-        "boss": (x, y, hp 0..1, winding_up) or None, "attack_ok": bool}. others_xy are then rivals only."""
+        "boss": (x, y, hp 0..1, winding_up) or None, "attack_ok": bool}. others_xy are then rivals only.
+        v3 models also read "traps": [(x, y, up)], "items": [(x, y)] and "goal": (x, y) or None, and
+        mode may be "descent"."""
         rev = torch.frombuffer(bytearray(revealed), dtype=torch.uint8).view(1, H, W).bool()
         fl = torch.frombuffer(bytearray(floor), dtype=torch.uint8).view(1, H, W).bool() if floor is not None else None
         cnt = torch.tensor(counts, dtype=torch.long).view(1, H, W) if counts else torch.zeros(1, H, W, dtype=torch.long)
@@ -58,9 +60,31 @@ class Brain:
                 bon, bhp, wind = torch.tensor([True]), torch.tensor([float(b[2])]), torch.tensor([bool(b[3])])
                 if b[3]:
                     danger[0, max(0, b[1] - 1):b[1] + 2, max(0, b[0] - 1):b[0] + 2] = True
+            mode = extra.get("mode", "race")
+            mode = mode if mode in MODES else "race"
+            if self.version < 3 and mode == "descent":
+                mode = "coop"
             ex = {"boss": boss, "danger": danger, "allies": allies, "hp": torch.tensor([float(extra.get("hp", 1.0))]),
-                  "mode": torch.tensor([MODES.index(extra.get("mode", "race")) if extra.get("mode") in MODES else 0]),
+                  "mode": torch.tensor([MODES.index(mode)]),
                   "boss_pos": bpos, "boss_on": bon, "boss_hp": bhp, "windup": wind}
+            if self.version >= 3:
+                trap = torch.zeros(1, H, W, dtype=torch.bool)
+                spikes = torch.zeros(1, H, W, dtype=torch.bool)
+                items = torch.zeros(1, H, W, dtype=torch.bool)
+                goal = torch.zeros(1, H, W, dtype=torch.bool)
+                for x, y, up in extra.get("traps", []):
+                    if 0 <= x < W and 0 <= y < H:
+                        trap[0, y, x] = True
+                        spikes[0, y, x] = bool(up)
+                for x, y in extra.get("items", []):
+                    if 0 <= x < W and 0 <= y < H:
+                        items[0, y, x] = True
+                g = extra.get("goal")
+                gpos, gon = torch.zeros(1, 2, dtype=torch.long), torch.tensor([False])
+                if g and 0 <= g[0] < W and 0 <= g[1] < H:
+                    goal[0, g[1], g[0]] = True
+                    gpos, gon = torch.tensor([[g[1], g[0]]]), torch.tensor([True])
+                ex.update(trap=trap, spikes=spikes, items=items, goal=goal, goal_pos=gpos, goal_on=gon)
             obs = encode(rev, cnt, exp, fo, pos, oth, self.spec.radius, fl, ex)
             mask = action_mask(rev, fo, pos, 0, fl, torch.tensor([bool(extra.get("attack_ok", False))]))
         else:

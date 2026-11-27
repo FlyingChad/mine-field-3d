@@ -242,13 +242,17 @@ Pick one of 18 characters and a colour on the join screen: Miner, Robot, Knight,
 Open **http://localhost:8080/lab** to evolve neural-network opponents. This needs PyTorch; see `requirements-ai.txt`.
 
 1. **Training:** set the hyperparameters on the left (board, map layout, network size, population, mutation, reward weights) and press **Start training**. Set *Map layout* to **dungeon** to train bots on rooms and corridors like the game's dungeons.
-   - **Model type 2** (the default) trains bots that play **every mode**. They see their own health, the boss and its wind-up danger zone, which players are teammates, and which mode they're in. They can **attack**.
-   - *Game mode* **mixed** gives each training board a random mode (Race, PvP or Co-op), so one model learns all three.
+   - **Model type 3** (the default) trains bots for the whole dungeon. On top of everything type 2 sees, they see **spike traps** (and whether the spikes are up), **pickups** and a **goal**: the stairs once a Descent floor is cleared, or the vault door while carrying the key. They learn **Descent** as a fourth mode.
+     - On training boards, revealed traps hurt while their spikes are up, pickups pay a small reward (food heals, and is only taken when hurt), and a cleared Descent board opens stairs 2–4 tiles away that everyone is rewarded for reaching.
+     - *Descent practice* (0.5 by default, LIVE) starts that share of Descent boards almost fully dug, so finishing a floor and finding the stairs comes up often enough to learn.
+     - **Warm start:** pick a type 2 model with the same vision radius and layers (such as **allmodes**) in *Start from model*. The type 3 run keeps everything it knew and starts out blind to the new inputs, so it plays exactly like the old model until evolution finds a use for them.
+   - **Model type 2** trains bots that play Race, PvP and Co-op. They see their own health, the boss and its wind-up danger zone, which players are teammates, and which mode they're in. They can **attack**.
+   - *Game mode* **mixed** gives each training board a random mode (Race, PvP, Co-op, and Descent for type 3), so one model learns them all.
    - In Co-op, every bot is scored on the team's average, so they learn to work together. In PvP, knocking out a rival pays.
    - *Bosses* adds a boss to every training board.
    - **Model type 1** is the classic minesweeper-only bot.
    - The starter **allmodes** model is a type 2 bot trained this way.
-   - The Progress tab shows knockouts and boss damage for type 2 runs.
+   - The Progress tab shows knockouts and boss damage for type 2 and 3 runs, plus spike hits and pickups for type 3.
    - **Stopping time-wasting:** untrained bots like to toggle a flag on and off, a "safe" way to pass a turn. Two rewards discourage it:
      - *Per step* (−0.02 by default) makes every turn cost a little;
      - *Removing own flag* (−0.5) charges for taking your own flag back off.
@@ -265,7 +269,8 @@ Open **http://localhost:8080/lab** to evolve neural-network opponents. This need
 4. **Models & matches:** rename, delete or continue training saved models, and pit 2–6 of them against each other over hundreds of games.
 5. **Deploy bots:** add a model to any game room as a player with a character and a difficulty (how fast it acts). Bots follow exactly the same rules as people.
    - Type 2 bots read the room's mode, their health, nearby bosses and their teammates, and decide for themselves when to attack.
-   - Power-ups and food are still used by built-in rules for every bot.
+   - Type 3 bots also decide for themselves about traps, pickups and food, and walk to the stairs or the vault door when it is within 4 tiles; further away, a built-in path-finder takes them there.
+   - Types 1 and 2 use built-in rules for food, traps, the key and the stairs. Held power-ups are used by built-in rules for every bot.
 
 Models are saved in `models/`, configs in `configs/` and run histories in `runs/`.
 

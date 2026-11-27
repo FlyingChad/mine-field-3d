@@ -19,7 +19,16 @@ rich=True adds the game's newer layers so "v2" models can learn them:
     steps (shown as a danger zone) and then smashes everyone within one tile;
   * modes per board: race, pvp (attacks hit rivals; KOs pay `pvp_ko`), coop (no friendly fire;
     fitness() gives every agent the team's average). mode="mixed" draws one per board.
-Version-1 observations/actions are still produced for v1 models, so old models keep working.
+extras=True (v3 models) adds the dungeon's newer pieces on top of rich:
+  * spike traps on safe tiles: once revealed they cycle up/down (`spike_cycle`, `spike_up` steps, each
+    with its own phase) and hurt + stun anyone standing on them while up (`spike_grace` between hits);
+  * pickups on safe tiles, collected by walking onto them once revealed (`item` reward); food heals and
+    is only taken when hurt, like in the game;
+  * a fourth mode, descent (co-op rules; `descent_practice` pre-digs a share of those boards): clearing the board opens stairs a few tiles from an agent and
+    pays `floor` to everyone; the board ends when someone reaches the stairs (`stairs` to everyone) or
+    after `stairs_auto` steps. The stairs are the "goal" the v3 observation points at (in the game the
+    goal is also the vault door while carrying the key).
+Version-1/2 observations/actions are still produced for older models, so they keep working.
 
 `encode()` and `action_mask()` are standalone so the in-game bots (ai/bots.py) build exactly the same
 observations as training does.
@@ -44,20 +53,37 @@ N_GLOBAL = 3                   # v1: direction (dy, dx) and distance to the near
 N_CHANNELS_V2 = 13
 # v2 globals: v1's 3, own hp, mode one-hot (race, pvp, coop), boss dy, dx, distance, present, hp, winding up
 N_GLOBAL_V2 = 13
-MODES = ["race", "pvp", "coop"]
+MODES = ["race", "pvp", "coop", "descent"]   # v2 sees descent as coop (it only knows the first three)
+# v3 adds channels trap (revealed), spikes up now, pickup, goal (stairs / vault door); out of bounds stays last
+N_CHANNELS_V3 = 17
+# v3 globals: v2's with a 4-way mode one-hot (14), then goal dy, dx, distance, present
+N_GLOBAL_V3 = 18
 
 # unflag: charged when an agent removes its own flag. Training-only shaping that stops bots from
 # toggling a flag on and off as a "safe" way to pass a turn (the lab's default is -0.5).
 DEFAULT_REWARDS = dict(reveal=1.0, mine=-10.0, flag_correct=3.0, flag_wrong=-3.0, step=0.0, clear=0.0, unflag=0.0,
-                       ko=-15.0, pvp_ko=20.0, boss_hit=1.0, boss_kill=40.0)
+                       ko=-15.0, pvp_ko=20.0, boss_hit=1.0, boss_kill=40.0, item=2.0, floor=10.0, stairs=20.0)
 # rich-mode rules, in tiles and steps (one step is roughly one bot decision in the game)
 RICH = dict(max_hp=100, mine_damage=35, smash_damage=30, pvp_damage=15, attack_damage=12, boss_hp=300,
-            respawn=10, boss_delay=15, boss_respawn=100, windup=2, cooldown=4, aggro=8, boss_speed=0.7, smash_stun=2)
+            respawn=10, boss_delay=15, boss_respawn=100, windup=2, cooldown=4, aggro=8, boss_speed=0.7, smash_stun=2,
+            # extras (v3), from server.py's TRAP_*, SPIKE_*, ITEM_*, FOOD, STAIRS_AUTO at ~0.5 s per step
+            trap_density=10 / 1024, spike_cycle=6, spike_up=2, spike_damage=15, spike_grace=2,
+            item_density=28 / 1024, food_share=7 / 31, food_heal=35, stairs_auto=60,
+            # curriculum: this share of descent boards start with everything dug except a square of
+            # radius 1..practice_radius around the first dig, so finishing a floor and finding the
+            # stairs comes up often (radius 1 = the safe first dig clears it at once)
+            descent_practice=0.0, practice_radius=3)
 
 
 def obs_dim(radius, version=1):
     K2 = (2 * radius + 1) ** 2
+    if version >= 3:
+        return K2 * N_CHANNELS_V3 + N_GLOBAL_V3
     return K2 * N_CHANNELS + N_GLOBAL if version < 2 else K2 * N_CHANNELS_V2 + N_GLOBAL_V2
+
+
+def n_channels(version=1):
+    return N_CHANNELS_V3 if version >= 3 else N_CHANNELS_V2 if version >= 2 else N_CHANNELS
 
 
 def n_actions(version=1):
@@ -80,7 +106,8 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
     encoded exactly like the area outside the board, in the "out of bounds" channel.
     extra (v2 only): dict with boss, danger, allies (N,H,W) bool; hp (N,) in 0..1; mode (N,) long;
     boss_pos (N,2) long; boss_on (N,) bool; boss_hp (N,) in 0..1; windup (N,) bool.
-    Returns (N, obs_dim(radius, 1 or 2)) float32.
+    v3 when extra also has "goal": trap, spikes, items, goal (N,H,W) bool; goal_pos (N,2); goal_on (N,).
+    Returns (N, obs_dim(radius, 1, 2 or 3)) float32.
     """
     N, H, W = revealed.shape
     r, K = radius, 2 * radius + 1
@@ -93,8 +120,11 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
     n = counts.clamp(max=4)
     planes = [hidden, flagged, exploded,
               shown & (n == 0), shown & (n == 1), shown & (n == 2), shown & (n == 3), shown & (n == 4), others]
+    v3 = extra is not None and "goal" in extra
     if extra is not None:
         planes += [extra["boss"], extra["danger"], extra["allies"]]
+    if v3:
+        planes += [extra["trap"], extra["spikes"], extra["items"], extra["goal"]]
     C = len(planes) + 1
     chans = F.pad(torch.stack(planes, 1).float(), (r, r, r, r))
     inner = torch.zeros(N, 1, H, W, device=dev) if floor is None else (~floor).float().unsqueeze(1)
@@ -130,11 +160,20 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
         bden = bd.clamp(min=1.0)
         zero = torch.zeros(N, device=dev)
         mode = extra["mode"]
-        g += [extra["hp"].float(),
-              (mode == 0).float(), (mode == 1).float(), (mode == 2).float(),
+        modes = [(mode == 0), (mode == 1), (mode == 2), (mode == 3)] if v3 else [(mode == 0), (mode == 1), (mode >= 2)]
+        g += [extra["hp"].float(), *[m.float() for m in modes],
               torch.where(on, bdy / bden, zero), torch.where(on, bdx / bden, zero),
               torch.where(on, bd.clamp(max=16.0) / 16.0, torch.ones(N, device=dev)),
               on.float(), torch.where(on, extra["boss_hp"].float(), zero), (on & extra["windup"]).float()]
+    if v3:
+        gon = extra["goal_on"]
+        gdy = (extra["goal_pos"][:, 0] - pos[:, 0]).float()
+        gdx = (extra["goal_pos"][:, 1] - pos[:, 1]).float()
+        gd = torch.maximum(gdy.abs(), gdx.abs())
+        gden = gd.clamp(min=1.0)
+        zero = torch.zeros(N, device=dev)
+        g += [torch.where(gon, gdy / gden, zero), torch.where(gon, gdx / gden, zero),
+              torch.where(gon, gd.clamp(max=16.0) / 16.0, torch.ones(N, device=dev)), gon.float()]
     return torch.cat([win, torch.stack(g, 1)], 1)
 
 
@@ -181,7 +220,7 @@ def dungeon_bank(h, w, size=96):
 
 class MineEnv:
     def __init__(self, n, agents=1, h=16, w=16, mines=40, steps=250, stun=10, rewards=None, device="cpu",
-                 layout="field", rich=False, mode="race", bosses=False, params=None):
+                 layout="field", rich=False, mode="race", bosses=False, params=None, extras=False):
         """layout: "field" (every tile is floor) or "dungeon" (rooms and corridors from layouts.py).
         For dungeons `mines` is read as a density: each board gets mines/(h*w) of its floor tiles.
         rich / mode / bosses: see the module docstring."""
@@ -194,6 +233,7 @@ class MineEnv:
         self.rich = bool(rich)
         self.mode_name = mode if mode in MODES + ["mixed"] else "race"
         self.bosses = bool(bosses) and self.rich
+        self.extras = bool(extras) and self.rich
         self.p = {**RICH, **(params or {})}
         self.device = torch.device(device)
         self.kernel = torch.ones(1, 1, 3, 3, device=self.device)
@@ -232,7 +272,10 @@ class MineEnv:
         self.safe_total = n_floor - self.board_mines
         # rich-mode state
         mi = MODES.index(self.mode_name) if self.mode_name in MODES else -1
-        self.mode = (torch.randint(0, 3, (N,), device=dev) if mi < 0 else torch.full((N,), mi, dtype=torch.long, device=dev))
+        n_modes = 4 if self.extras else 3
+        if mi == 3 and not self.extras:
+            mi = 2                      # descent without extras is just co-op
+        self.mode = (torch.randint(0, n_modes, (N,), device=dev) if mi < 0 else torch.full((N,), mi, dtype=torch.long, device=dev))
         if not self.rich:
             self.mode.zero_()
         self.hp = torch.full((N, A), float(self.p["max_hp"]), device=dev)
@@ -245,6 +288,16 @@ class MineEnv:
         self.boss_next = torch.full((N,), self.p["boss_delay"], dtype=torch.long, device=dev)
         if self.rich:
             self.stats.update(kos=z(), boss_damage=z(), boss_kills=z(), pvp_kos=z())
+        # extras (v3) state: traps with a phase each, pickups (1 power-up, 2 food), descent stairs
+        self.traps = torch.zeros(N, H, W, dtype=torch.bool, device=dev)
+        self.phase = torch.zeros(N, H, W, dtype=torch.long, device=dev)
+        self.items = torch.zeros(N, H, W, dtype=torch.int8, device=dev)
+        self.spike_cd = torch.zeros(N, A, dtype=torch.long, device=dev)
+        self.stairs_on = torch.zeros(N, dtype=torch.bool, device=dev)
+        self.stairs_pos = torch.zeros(N, 2, dtype=torch.long, device=dev)
+        self.stairs_t = torch.zeros(N, dtype=torch.long, device=dev)
+        if self.extras:
+            self.stats.update(items=z(), spikes=z(), stairs=z())
 
     # ---------------------------------------------------------------- observations
     def others_mask(self, a, split=False):
@@ -254,7 +307,7 @@ class MineEnv:
         rivals = torch.zeros(N, H, W, dtype=torch.bool, device=self.device)
         allies = torch.zeros(N, H, W, dtype=torch.bool, device=self.device)
         ar = torch.arange(N, device=self.device)
-        coop = self.mode == 2
+        coop = self.mode >= 2
         for o in range(self.A):
             if o == a:
                 continue
@@ -276,16 +329,28 @@ class MineEnv:
         danger = F.max_pool2d((boss & winding.view(N, 1, 1)).float().unsqueeze(1), 3, 1, 1).squeeze(1) > 0
         return boss, danger
 
-    def extra(self, a):
+    def spikes_up(self):
+        """(N,H,W) bool: revealed traps whose spikes are up at the current step."""
+        p = self.p
+        return self.traps & self.revealed & ((self.t + self.phase) % p["spike_cycle"] < p["spike_up"])
+
+    def extra(self, a, version=2):
         rivals, allies = self.others_mask(a, split=True)
         boss, danger = self.boss_masks()
-        return rivals, {"boss": boss, "danger": danger, "allies": allies, "hp": self.hp[:, a] / self.p["max_hp"],
-                        "mode": self.mode, "boss_pos": self.boss_pos, "boss_on": self.boss_on,
-                        "boss_hp": self.boss_hp / self.p["boss_hp"], "windup": self.boss_windup > 0}
+        ex = {"boss": boss, "danger": danger, "allies": allies, "hp": self.hp[:, a] / self.p["max_hp"],
+              "mode": self.mode, "boss_pos": self.boss_pos, "boss_on": self.boss_on,
+              "boss_hp": self.boss_hp / self.p["boss_hp"], "windup": self.boss_windup > 0}
+        if version >= 3:
+            N, H, W = self.N, self.H, self.W
+            goal = torch.zeros(N, H, W, dtype=torch.bool, device=self.device)
+            goal[torch.arange(N, device=self.device), self.stairs_pos[:, 0], self.stairs_pos[:, 1]] = self.stairs_on
+            ex.update(trap=self.traps & self.revealed, spikes=self.spikes_up(), items=(self.items > 0) & self.revealed,
+                      goal=goal, goal_pos=self.stairs_pos, goal_on=self.stairs_on)
+        return rivals, ex
 
     def observe(self, a, radius, version=1):
         if version >= 2:
-            rivals, ex = self.extra(a)
+            rivals, ex = self.extra(a, version)
             return encode(self.revealed, self.counts, self.exploded, self.flag_owner, self.pos[:, a], rivals,
                           radius, self.floor, ex)
         return encode(self.revealed, self.counts, self.exploded, self.flag_owner, self.pos[:, a], self.others_mask(a),
@@ -312,7 +377,7 @@ class MineEnv:
         """Per-agent fitness: own score, except co-op boards where everyone gets the team average."""
         s = self.score.clone()
         if self.rich:
-            coop = self.mode == 2
+            coop = self.mode >= 2
             if coop.any():
                 s[coop] = s[coop].mean(1, keepdim=True).expand(-1, self.A)
         return s
@@ -338,6 +403,22 @@ class MineEnv:
         c = F.conv2d(m.float().unsqueeze(1), self.kernel, padding=1).squeeze(1).round().long()
         self.counts[idx] = c - m.long()
         self.generated[idx] = True
+        if self.extras:
+            p = self.p
+            free = self.floor[idx] & ~m & ~excl
+            tr = free & (torch.rand(n, H, W, device=self.device) < p["trap_density"])
+            self.traps[idx] = tr
+            self.phase[idx] = torch.randint(0, p["spike_cycle"], (n, H, W), device=self.device)
+            it = free & ~tr & (torch.rand(n, H, W, device=self.device) < p["item_density"])
+            food = torch.rand(n, H, W, device=self.device) < p["food_share"]
+            self.items[idx] = torch.where(it, torch.where(food, 2, 1), 0).to(torch.int8)
+            practice = (self.mode[idx] == 3) & (torch.rand(n, device=self.device) < p["descent_practice"])
+            if practice.any():
+                rad = torch.randint(1, p["practice_radius"] + 1, (n, 1, 1), device=self.device)
+                far = torch.maximum((yy - ty[idx].view(n, 1, 1)).abs(), (xx - tx[idx].view(n, 1, 1)).abs()) > rad
+                pre = practice.view(n, 1, 1) & far & self.floor[idx] & ~m
+                self.revealed[idx] |= pre
+                self.items[idx] = torch.where(pre, torch.zeros_like(self.items[idx]), self.items[idx])
 
     def _flood(self, seed):
         new = seed & ~self.revealed
@@ -541,15 +622,80 @@ class MineEnv:
 
         if self.bosses:
             self._boss_step(live)
+        at_stairs = torch.zeros(N, dtype=torch.bool, device=self.device)
+        if self.extras:
+            at_stairs = self._extras_step(live)
         if rw["step"]:
             self.score[live] += rw["step"]
-        self.t += 1
         safe_rev = (self.revealed & ~self.mines).reshape(N, -1).sum(1)
-        cleared = live & self.generated & (safe_rev >= self.safe_total)
-        finished = cleared | (live & torch.tensor(self.t >= self.steps, device=self.device))
+        just = live & self.generated & (safe_rev >= self.safe_total) & ~self.cleared
+        descent = self.mode == 3
+        if self.extras and (just & descent).any():
+            self._open_stairs(just & descent)
+        self.cleared |= just
+        self.t += 1
+        timeout = self.stairs_on & (self.t - self.stairs_t >= self.p["stairs_auto"])
+        finished = live & ((self.cleared & ~descent) | at_stairs | timeout
+                           | torch.tensor(self.t >= self.steps, device=self.device))
         if finished.any():
-            self._finish(finished, cleared)
+            self._finish(finished, finished & self.cleared)
         return self.score - before
+
+    def _extras_step(self, live):
+        """Pickups, spikes and the stairs, after everyone has acted. Returns boards whose stairs were reached."""
+        N, A, p, rw = self.N, self.A, self.p, self.rw
+        up = self.spikes_up()
+        self.spike_cd = (self.spike_cd - 1).clamp(min=0)
+        reached = torch.zeros(N, dtype=torch.bool, device=self.device)
+        for a in range(A):
+            y, x = self.pos[:, a, 0], self.pos[:, a, 1]
+            awake = live & ~self.ko[:, a]
+            flat = y * self.W + x
+            kind = _gather(self.items, flat)
+            rev = _gather(self.revealed, flat)
+            hurt = self.hp[:, a] < p["max_hp"]
+            take = awake & (self.stun[:, a] == 0) & rev & ((kind == 1) | ((kind == 2) & hurt))
+            if take.any():
+                t = take.nonzero().squeeze(1)
+                self.items.view(N, -1)[t, flat[t]] = 0
+                food = t[kind[t] == 2]
+                self.hp[food, a] = (self.hp[food, a] + p["food_heal"]).clamp(max=float(p["max_hp"]))
+                self.score[t, a] += rw["item"]
+                self.stats["items"][t, a] += 1
+            spiked = awake & (self.spike_cd[:, a] == 0) & _gather(up, flat)
+            if spiked.any():
+                s = spiked.nonzero().squeeze(1)
+                self.spike_cd[s, a] = p["spike_grace"]
+                self.stats["spikes"][s, a] += 1
+                self._hurt(s, torch.full_like(s, a), p["spike_damage"], stun=1)
+            reached |= (live & self.stairs_on & ~self.ko[:, a]
+                        & (y == self.stairs_pos[:, 0]) & (x == self.stairs_pos[:, 1]))
+        if reached.any():
+            self.score[reached] += rw["stairs"]
+            self.stats["stairs"][reached] += 1
+        return reached
+
+    def _open_stairs(self, boards):
+        """Descent floor cleared: stairs 2-4 tiles from a random conscious agent, the floor bonus for
+        everyone, and the boss leaves (as in server.floor_cleared)."""
+        b = boards.nonzero().squeeze(1)
+        n, H, W = b.numel(), self.H, self.W
+        who = torch.multinomial((~self.ko[b]).float() + 1e-6, 1).squeeze(1)
+        py, px = self.pos[b, who, 0], self.pos[b, who, 1]
+        yy = torch.arange(H, device=self.device).view(1, H, 1)
+        xx = torch.arange(W, device=self.device).view(1, 1, W)
+        d = torch.maximum((yy - py.view(n, 1, 1)).abs(), (xx - px.view(n, 1, 1)).abs())
+        ok = self.floor[b] & ~self.traps[b] & ~self.exploded[b] & (d >= 2) & (d <= 4)
+        here = torch.zeros_like(ok)
+        here[torch.arange(n, device=self.device), py, px] = True
+        ok = torch.where(ok.reshape(n, -1).any(1).view(n, 1, 1), ok, here)
+        spot = torch.multinomial(ok.reshape(n, -1).float(), 1).squeeze(1)
+        self.stairs_pos[b, 0], self.stairs_pos[b, 1] = spot // W, spot % W
+        self.stairs_on[b] = True
+        self.stairs_t[b] = self.t
+        self.score[b] += self.rw["floor"]
+        self.boss_on[b] = False
+        self.boss_next[b] = 1 << 30
 
     def _finish(self, fin, cleared):
         for o in range(self.A):
