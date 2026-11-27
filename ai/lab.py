@@ -250,6 +250,8 @@ class Lab:
             named = (("boss", 9), ("danger", 10), ("allies", 11))
             if spec.version >= 3:   # traps, spikes up, pickups, the goal (v4 sees the same planes)
                 named += (("traps", 12), ("spikes", 13), ("items", 14), ("goal", 15))
+            if spec.version >= 5:   # the logic hint: proven safe, proven mine
+                named += (("safe", 16), ("mine", 17))
             v2 = {k: [int(c) for c in (win[i] > 0).nonzero().view(-1).tolist()] for k, i in named}
 
         def top(contrib):

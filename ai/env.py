@@ -34,7 +34,11 @@ held items (scatter, freeze, shockwave, blink), which take the single item slot.
 held item. Aiming is a fixed rule, the same as the game's: the nearest foe (a rival, or the boss) in
 range for scatter and freeze, everyone around you for the shockwave, and for blink the dug-up tile
 within reach with the most hidden ground around it. So v4 learns *when* to use an item, not where.
-Version-1/2/3 observations/actions are still produced for older models, so they keep working.
+v5 models (the logic hint) see v4's world plus what the visible board proves: two more planes, tiles
+that are certainly safe and certainly mines by the two basic minesweeper rules (`deduce()`, from the
+numbers and craters only, never flags), and the direction / distance to the nearest certainly-safe
+tile. It's an observation only: the rules are v4's.
+Version-1..4 observations/actions are still produced for older models, so they keep working.
 
 `encode()` and `action_mask()` are standalone so the in-game bots (ai/bots.py) build exactly the same
 observations as training does.
@@ -66,6 +70,11 @@ N_CHANNELS_V3 = 17
 N_GLOBAL_V3 = 18
 # v4 (powers): v3's channels; globals v3's 18 + held item one-hot (scatter, freeze, shockwave, blink) + shield
 N_GLOBAL_V4 = 23
+# v5 (logic hint): v3's 16 planes + certainly safe, certainly mine; out of bounds last. Globals v4's 23 +
+# nearest certainly-safe tile dy, dx, distance, present
+N_CHANNELS_V5 = 19
+N_GLOBAL_V5 = 27
+LOGIC_ITERS = 4      # rounds of the two rules (each one can unlock the next)
 HELD = ["", "scatter", "freeze", "shockwave", "blink"]   # held item ids, as in server.HELD
 # item codes on the board when powers=True: 1 generic, 2 food, 3 shield, 4.. held items (4 + HELD index - 1)
 ITEM_CODES = {"radar": 1, "boots": 1, "gold": 1, "apple": 2, "potion": 2, "shield": 3,
@@ -98,6 +107,8 @@ RICH = dict(max_hp=100, mine_damage=35, smash_damage=30, pvp_damage=15, attack_d
 
 def obs_dim(radius, version=1):
     K2 = (2 * radius + 1) ** 2
+    if version >= 5:
+        return K2 * N_CHANNELS_V5 + N_GLOBAL_V5
     if version >= 4:
         return K2 * N_CHANNELS_V3 + N_GLOBAL_V4
     if version >= 3:
@@ -106,7 +117,7 @@ def obs_dim(radius, version=1):
 
 
 def n_channels(version=1):
-    return N_CHANNELS_V3 if version >= 3 else N_CHANNELS_V2 if version >= 2 else N_CHANNELS
+    return N_CHANNELS_V5 if version >= 5 else N_CHANNELS_V3 if version >= 3 else N_CHANNELS_V2 if version >= 2 else N_CHANNELS
 
 
 def n_actions(version=1):
@@ -121,6 +132,34 @@ def _gather(t, flat):
     return t.reshape(N, -1).gather(1, flat)
 
 
+def deduce(revealed, counts, exploded, floor=None, iters=LOGIC_ITERS):
+    """What the visible board proves, by the two basic minesweeper rules:
+      * a number already touching that many known mines -> its other covered neighbours are safe;
+      * a number with exactly as many covered (not known-safe) neighbours as it still needs -> they're
+        all mines.
+    Known mines start as the craters (exploded). Flags are ignored: they can be wrong. Repeats up to
+    `iters` rounds, since each conclusion can unlock the next. Uses only what every player can see.
+    Returns (safe, mine): (N,H,W) bool over covered tiles."""
+    covered = ~revealed if floor is None else (~revealed & floor)
+    num = revealed & ~exploded
+    k = torch.ones(1, 1, 3, 3, device=revealed.device)
+    nsum = lambda t: F.conv2d(t.float().unsqueeze(1), k, padding=1).squeeze(1)
+    near = lambda t: F.max_pool2d(t.float().unsqueeze(1), 3, 1, 1).squeeze(1) > 0
+    cnt = counts.float()
+    mine = exploded.clone()
+    safe = torch.zeros_like(revealed)
+    for _ in range(iters):
+        unknown = covered & ~mine & ~safe
+        U, M = nsum(unknown), nsum(mine)
+        new_m = unknown & near(num & (U > 0) & (cnt - M == U))
+        new_s = unknown & near(num & (U > 0) & (cnt == M)) & ~new_m
+        if not bool((new_m | new_s).any()):
+            break
+        mine |= new_m
+        safe |= new_s
+    return safe, mine & covered
+
+
 def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=None, extra=None):
     """Observation for one agent per board.
 
@@ -131,6 +170,7 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
     boss_pos (N,2) long; boss_on (N,) bool; boss_hp (N,) in 0..1; windup (N,) bool.
     v3 when extra also has "goal": trap, spikes, items, goal (N,H,W) bool; goal_pos (N,2); goal_on (N,).
     v4 when extra also has "held": held (N,) long (index in HELD), shield (N,) bool.
+    v5 when extra also has "logic": True (worked out here with deduce()) or a precomputed (safe, mine).
     Returns (N, obs_dim(radius, version)) float32.
     """
     N, H, W = revealed.shape
@@ -149,6 +189,10 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
         planes += [extra["boss"], extra["danger"], extra["allies"]]
     if v3:
         planes += [extra["trap"], extra["spikes"], extra["items"], extra["goal"]]
+    logic = extra.get("logic") if extra is not None else None
+    if logic is not None:
+        safe, mine = deduce(revealed, counts, exploded, floor) if logic is True else logic
+        planes += [safe, mine]
     C = len(planes) + 1
     chans = F.pad(torch.stack(planes, 1).float(), (r, r, r, r))
     inner = torch.zeros(N, 1, H, W, device=dev) if floor is None else (~floor).float().unsqueeze(1)
@@ -165,17 +209,20 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
     gy = torch.arange(H, device=dev).view(1, H, 1)
     gx = torch.arange(W, device=dev).view(1, 1, W)
     py, px = pos[:, 0].view(N, 1, 1), pos[:, 1].view(N, 1, 1)
-    d = torch.maximum((gy - py).abs(), (gx - px).abs()).float()
-    d = torch.where(hidden, d, torch.full_like(d, 1e9)).reshape(N, -1)
-    dmin, arg = d.min(1)
-    has = dmin < 1e8
-    ty, tx = arg // W, arg % W
-    den = dmin.clamp(min=1.0)
-    g = [
-        torch.where(has, (ty - pos[:, 0]).float() / den, torch.zeros_like(den)),
-        torch.where(has, (tx - pos[:, 1]).float() / den, torch.zeros_like(den)),
-        torch.where(has, dmin.clamp(max=16.0) / 16.0, torch.ones_like(den)),
-    ]
+    cheb = torch.maximum((gy - py).abs(), (gx - px).abs()).float()
+
+    def nearest(where):
+        """dy, dx (unit-ish) and distance (0..1) to the nearest tile in `where`; (0, 0, 1) if none."""
+        d = torch.where(where, cheb, torch.full_like(cheb, 1e9)).reshape(N, -1)
+        dmin, arg = d.min(1)
+        has = dmin < 1e8
+        ty, tx = arg // W, arg % W
+        den = dmin.clamp(min=1.0)
+        return [torch.where(has, (ty - pos[:, 0]).float() / den, torch.zeros_like(den)),
+                torch.where(has, (tx - pos[:, 1]).float() / den, torch.zeros_like(den)),
+                torch.where(has, dmin.clamp(max=16.0) / 16.0, torch.ones_like(den))], has
+
+    g, _ = nearest(hidden)
     if extra is not None:
         on = extra["boss_on"]
         bdy = (extra["boss_pos"][:, 0] - pos[:, 0]).float()
@@ -201,6 +248,9 @@ def encode(revealed, counts, exploded, flag_owner, pos, others, radius, floor=No
     if extra is not None and "held" in extra:
         held = extra["held"]
         g += [(held == k).float() for k in range(1, len(HELD))] + [extra["shield"].float()]
+    if logic is not None:
+        sg, has = nearest(safe)
+        g += sg + [has.float()]
     return torch.cat([win, torch.stack(g, 1)], 1)
 
 
@@ -336,6 +386,7 @@ class MineEnv:
             self.stats.update(uses=z(), shielded=z())
         if self.p["dig_practice"] > 0:
             self._dig_practice()
+        self._logic = None
 
     def _dig_practice(self):
         """Curriculum: a `dig_practice` share of boards start part-dug, so bots learn to dig the edge of
@@ -413,7 +464,15 @@ class MineEnv:
                       goal=goal, goal_pos=self.stairs_pos, goal_on=self.stairs_on)
         if version >= 4:
             ex.update(held=self.held[:, a], shield=self.shield[:, a])
+        if version >= 5:
+            ex["logic"] = self.logic()
         return rivals, ex
+
+    def logic(self):
+        """deduce() for every board, worked out once per step (all agents observe the same board)."""
+        if self._logic is None:
+            self._logic = deduce(self.revealed, self.counts, self.exploded, self.floor)
+        return self._logic
 
     def observe(self, a, radius, version=1):
         if version >= 2:
@@ -651,6 +710,7 @@ class MineEnv:
 
     def step(self, actions):
         """actions: (N, A) long. Returns the per-agent reward for this step, shape (N, A)."""
+        self._logic = None
         N, A, H, W = self.N, self.A, self.H, self.W
         rw = self.rw
         before = self.score.clone()

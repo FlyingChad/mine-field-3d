@@ -559,6 +559,14 @@ const netView = (() => {
       }
       if (target.items?.includes(c)) { g.fillStyle = '#ffd23f'; g.beginPath(); g.arc(x + cs / 2, y + cs / 2, cs * 0.16, 0, 7); g.fill(); }
       if (target.goal?.includes(c)) { g.strokeStyle = '#7ee0ff'; g.lineWidth = 2.5; g.strokeRect(x + 3, y + 3, cs - 6, cs - 6); }
+      if (target.safe?.includes(c)) {   // v5 logic hint: proven safe (green tick) / proven mine (red cross)
+        g.strokeStyle = '#4ad66d'; g.lineWidth = 2.5; g.beginPath();
+        g.moveTo(x + cs * 0.28, y + cs * 0.52); g.lineTo(x + cs * 0.44, y + cs * 0.68); g.lineTo(x + cs * 0.74, y + cs * 0.34); g.stroke();
+      }
+      if (target.mine?.includes(c)) {
+        g.strokeStyle = '#ff5d5d'; g.lineWidth = 2.5; g.beginPath();
+        g.moveTo(x + cs * 0.3, y + cs * 0.3); g.lineTo(x + cs * 0.7, y + cs * 0.7); g.moveTo(x + cs * 0.7, y + cs * 0.3); g.lineTo(x + cs * 0.3, y + cs * 0.7); g.stroke();
+      }
       if (target.danger?.includes(c)) { g.fillStyle = 'rgba(220,60,61,.4)'; g.fillRect(x + 1, y + 1, cs - 2, cs - 2); }
       if (target.others.includes(c)) { g.strokeStyle = SERIES[1]; g.lineWidth = 2; g.strokeRect(x + 2, y + 2, cs - 4, cs - 4); }
       if (target.allies?.includes(c)) { g.strokeStyle = SERIES[2]; g.lineWidth = 2; g.strokeRect(x + 2, y + 2, cs - 4, cs - 4); }
@@ -583,7 +591,7 @@ const netView = (() => {
     });
     const GLOBAL_NAMES = target.version >= 3
       ? ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'descent', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up', 'goal ↕', 'goal ↔', 'goal d', 'goal?',
-        'scatter', 'freeze', 'shock', 'blink', 'shield']
+        'scatter', 'freeze', 'shock', 'blink', 'shield', 'safe ↕', 'safe ↔', 'safe d', 'safe?']
       : ['dir ↕', 'dir ↔', 'dist', 'HP', 'race', 'pvp', 'co-op', 'boss ↕', 'boss ↔', 'boss d', 'boss?', 'boss HP', 'wind-up'];
     const gl = layout.input.slice(-target.glob.length);
     g.font = '10px system-ui';

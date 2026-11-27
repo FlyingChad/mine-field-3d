@@ -417,6 +417,106 @@ class LiveRewards(unittest.TestCase):
         self.assertEqual((env.rw["stairs"], env.rw["mine"]), (77.0, -42.0))
 
 
+def E_window(t, pos, r):
+    """(N,H,W) bool -> (N,(2r+1)^2) bool window around pos (N,2), outside = False (like encode's planes)."""
+    p = torch.nn.functional.pad(t.float(), (r, r, r, r))
+    K = 2 * r + 1
+    return torch.stack([p[n, pos[n, 0]:pos[n, 0] + K, pos[n, 1]:pos[n, 1] + K].reshape(-1) for n in range(t.shape[0])]).bool()
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
+class LogicHint(unittest.TestCase):
+    def test_the_two_rules_chain(self):
+        from ai.env import deduce
+        #  covered:  ▢ ▢ ▢ ▢     the right 2 has two covered neighbours -> both mines; the next 2 then
+        #  numbers:  1 2 2 2     has its two -> the second tile is safe; the 1 then needs the first.
+        rev = torch.tensor([[[0, 0, 0, 0], [1, 1, 1, 1], [1, 1, 1, 1]]], dtype=torch.bool)
+        cnt = torch.tensor([[[0, 0, 0, 0], [1, 2, 2, 2], [0, 0, 0, 0]]])
+        safe, mine = deduce(rev, cnt, torch.zeros_like(rev))
+        self.assertEqual(safe[0, 0].int().tolist(), [0, 1, 0, 0])
+        self.assertEqual(mine[0, 0].int().tolist(), [1, 0, 1, 1])
+        self.assertFalse(bool((safe | mine)[0, 1:].any()), "only covered tiles are marked")
+        # a crater counts as a known mine: a 1 next to it frees its other neighbours
+        rev2 = torch.tensor([[[1, 0, 0], [1, 1, 1]]], dtype=torch.bool)
+        exp2 = torch.tensor([[[1, 0, 0], [0, 0, 0]]], dtype=torch.bool)
+        cnt2 = torch.tensor([[[0, 0, 0], [1, 1, 0]]])
+        safe2, mine2 = deduce(rev2, cnt2, exp2)
+        self.assertEqual(safe2[0, 0].int().tolist(), [0, 1, 1])
+        self.assertFalse(bool(mine2.any()), "the crater itself isn't a covered tile")
+
+    def test_sound_on_real_boards_and_flags_ignored(self):
+        from ai.env import MineEnv, DIG0, FLAG0
+        torch.manual_seed(5)
+        e = MineEnv(128, 2, 16, 16, 40, 200, 3, device="cpu", layout="dungeon", rich=True, mode="race", powers=True)
+        found = 0
+        for _ in range(60):
+            acts = torch.stack([torch.multinomial(e.mask(a, 4).float() + 1e-6, 1).squeeze(1) for a in range(2)], 1)
+            e.step(acts)
+            safe, mine = e.logic()
+            self.assertFalse(bool((safe & e.mines).any()), "a tile proven safe is never a mine")
+            self.assertFalse(bool((mine & ~e.mines).any()), "a tile proven mined always is one")
+            found += int(safe.sum() + mine.sum())
+        self.assertGreater(found, 0)
+        # a wrong flag changes nothing: the hint only reads numbers and craters
+        before = [t.clone() for t in e.logic()]
+        e._logic = None
+        e.flag_owner[(~e.revealed) & ~e.mines] = 0
+        self.assertTrue(all(torch.equal(x, y) for x, y in zip(before, e.logic())))
+
+    def test_v5_shapes_upgrade_and_planes(self):
+        from ai.env import MineEnv, obs_dim, n_channels, N_CHANNELS_V5, N_GLOBAL_V5, DIG0
+        from ai.policy import Spec, upgrade
+        s5 = Spec(2, [16, 8], "tanh", 5)
+        self.assertEqual((s5.in_dim, s5.out_dim, n_channels(5)), (25 * N_CHANNELS_V5 + N_GLOBAL_V5, 28, 19))
+        e = MineEnv(8, 2, 12, 12, 20, 100, 3, rich=True, mode="mixed", bosses=True, powers=True)
+        e.step(torch.full((8, 2), DIG0 + 4))
+        e.traps.zero_(); e.items.zero_()
+        o5 = e.observe(0, 2, 5)
+        self.assertEqual(tuple(o5.shape), (8, obs_dim(2, 5)))
+        self.assertTrue(torch.equal(o5[:, :16 * 25], e.observe(0, 2, 4)[:, :16 * 25]), "v4's planes come first")
+        safe, mine = e.logic()
+        planes = o5[:, :19 * 25].view(8, 19, 25)
+        # the window holds exactly the proven tiles around the agent
+        win = lambda t: E_window(t, e.pos[:, 0], 2)
+        self.assertTrue(torch.equal(planes[:, 16].bool(), win(safe)))
+        self.assertTrue(torch.equal(planes[:, 17].bool(), win(mine)))
+        for old_v in (2, 3, 4):
+            old = Spec(2, [16, 8], "tanh", old_v)
+            w = old.init(1)[0] + torch.randn(old.n_params) * 0.3
+            w5 = upgrade(old, w, s5)
+            self.assertEqual(w5.numel(), s5.n_params)
+            if old_v == 4:
+                l4 = old.forward(w[None], e.observe(0, 2, 4)[None])[0]
+                l5 = s5.forward(w5[None], o5[None])[0]
+                self.assertTrue(torch.allclose(l4, l5, atol=1e-5), "an upgraded v4 plays exactly as before")
+
+    def test_in_game_v5_bot_sees_the_hint(self):
+        from ai.bots import Brain
+        from ai.policy import Spec
+        from ai import env as E
+        from helpers import S, field_room
+        r = field_room("race", name="v5")
+        r.generate(20, 20)
+        bot = Brain.__new__(Brain)
+        bot.name, bot.spec = "v5", Spec(3, [16], "tanh", 5)
+        bot.w = bot.spec.init(1)
+        # dig an opening the way the server does, then check what the brain would see
+        for i in range(S.W * S.H):
+            x, y = i % S.W, i // S.W
+            if max(abs(x - 20), abs(y - 20)) <= 4 and i not in r.mines:
+                r.revealed[i] = 1
+        act = bot.decide(S.W, S.H, r.revealed, r.counts, [], {}, "me", (20, 20), [], r.floor,
+                         {"hp": 1, "mode": "race", "held": "", "shield": False, "use_ok": False})
+        self.assertIn(act[0], ("move", "dig", "flag", "attack", "use"))
+        rev = torch.tensor(list(r.revealed), dtype=torch.bool).view(1, S.H, S.W)
+        cnt = torch.tensor(r.counts).view(1, S.H, S.W)
+        mines = torch.zeros(1, S.H * S.W, dtype=torch.bool)
+        mines[0, list(r.mines)] = True
+        safe, mine = E.deduce(rev, cnt, torch.zeros_like(rev), torch.tensor(list(r.floor), dtype=torch.bool).view(1, S.H, S.W))
+        self.assertFalse(bool((safe & mines.view(1, S.H, S.W)).any()))
+        self.assertFalse(bool((mine & ~mines.view(1, S.H, S.W)).any()))
+
+
 @unittest.skipIf(torch is None, "PyTorch not installed")
 class Curriculum(unittest.TestCase):
     def test_dig_practice_starts_part_dug_at_the_edge(self):

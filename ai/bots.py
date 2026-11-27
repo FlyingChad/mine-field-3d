@@ -28,7 +28,8 @@ class Brain:
         "boss": (x, y, hp 0..1, winding_up) or None, "attack_ok": bool}. others_xy are then rivals only.
         v3 models also read "traps": [(x, y, up)], "items": [(x, y)] and "goal": (x, y) or None, and
         mode may be "descent". v4 models also read "held" (an id from HELD, "" for none), "shield" and
-        "use_ok" (the game found a target for the held item), and may answer ('use', 0, 0)."""
+        "use_ok" (the game found a target for the held item), and may answer ('use', 0, 0). v5 models
+        also get the logic hint, worked out here from the visible board (env.deduce)."""
         rev = torch.frombuffer(bytearray(revealed), dtype=torch.uint8).view(1, H, W).bool()
         fl = torch.frombuffer(bytearray(floor), dtype=torch.uint8).view(1, H, W).bool() if floor is not None else None
         cnt = torch.tensor(counts, dtype=torch.long).view(1, H, W) if counts else torch.zeros(1, H, W, dtype=torch.long)
@@ -92,6 +93,8 @@ class Brain:
                 ex.update(held=torch.tensor([HELD.index(h) if h in HELD else 0]),
                           shield=torch.tensor([bool(extra.get("shield"))]))
                 use_ok = torch.tensor([bool(extra.get("use_ok")) and bool(h)])
+            if self.version >= 5:
+                ex["logic"] = True
             obs = encode(rev, cnt, exp, fo, pos, oth, self.spec.radius, fl, ex)
             mask = action_mask(rev, fo, pos, 0, fl, torch.tensor([bool(extra.get("attack_ok", False))]), use_ok)
         else:

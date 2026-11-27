@@ -26,7 +26,7 @@ SCHEMA = [
         {"key": "run_name", "label": "Run name", "type": "text", "default": "", "help": "Name used for auto-saved models. Blank = timestamp."},
         {"key": "generations", "label": "Generations", "type": "int", "default": 0, "min": 0, "max": 100000, "help": "Stop after this many generations (0 = run until stopped)."},
         {"key": "save_every", "label": "Auto-save every", "type": "int", "default": 10, "min": 1, "max": 1000, "help": "Save the current best model every N generations."},
-        {"key": "seed_model", "label": "Start from model", "type": "model", "default": "", "help": "Continue evolving a saved model (same network shape). An older model (v2, v3) can seed a newer run (v3, v4) with the same radius and layers: it keeps everything it knows."},
+        {"key": "seed_model", "label": "Start from model", "type": "model", "default": "", "help": "Continue evolving a saved model (same network shape). An older model (v2 to v4) can seed a newer run (up to v5) with the same radius and layers: it keeps everything it knows."},
         {"key": "device", "label": "Device", "type": "select", "options": ["auto", "cuda", "cpu"], "default": "auto"},
     ]},
     {"group": "Environment", "fields": [
@@ -55,8 +55,8 @@ SCHEMA = [
          "help": "Share of the 'Hit a mine' reward used in generation 1 of the ease-in. Cheap mistakes early let bots find out that digging pays."},
     ]},
     {"group": "Network", "fields": [
-        {"key": "model_version", "label": "Model type", "type": "select", "options": ["4", "3", "2", "1"], "default": "4",
-         "help": "4 = also holds power-ups and learns when to use them. 3 = sees spike traps, pickups and the stairs, and learns Descent. 2 = every mode: health, bosses, allies, attack. 1 = classic minesweeper only."},
+        {"key": "model_version", "label": "Model type", "type": "select", "options": ["5", "4", "3", "2", "1"], "default": "5",
+         "help": "5 = also gets the logic hint: the covered tiles the visible numbers prove safe or mined, and the way to the nearest safe one. 4 = also holds power-ups and learns when to use them. 3 = sees spike traps, pickups and the stairs, and learns Descent. 2 = every mode: health, bosses, allies, attack. 1 = classic minesweeper only."},
         {"key": "radius", "label": "Vision radius", "type": "int", "default": 3, "min": 1, "max": 7, "help": "The bot sees a (2r+1)² window of tiles around itself."},
         {"key": "hidden", "label": "Hidden layers", "type": "text", "default": "64", "help": "Comma-separated layer sizes, e.g. 64 or 128,64."},
         {"key": "activation", "label": "Activation", "type": "select", "options": ["tanh", "relu", "elu"], "default": "tanh"},
