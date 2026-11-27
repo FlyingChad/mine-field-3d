@@ -7,6 +7,9 @@ const Glow = (color, extra = {}) => new THREE.MeshBasicMaterial({ color, ...extr
 
 // ---------------------------------------------------------------- shared helpers
 function around(ctx, n, minR, maxR, fn) {
+  // Big dungeons push minR (from ctx.lim) past some realms' fixed maxR; without room to place
+  // anything the loop below would never end and the page would freeze while building the world.
+  maxR = Math.max(maxR, minR + 6);
   for (let i = 0; i < n; i++) {
     let x, z;
     do { x = (ctx.rnd() - 0.5) * maxR * 2; z = (ctx.rnd() - 0.5) * maxR * 2; }
