@@ -299,7 +299,7 @@ Open **http://localhost:8080/lab** to evolve neural-network opponents. This need
      - *Per step* (−0.02 by default) makes every turn cost a little;
      - *Removing own flag* (−0.5) charges for taking your own flag back off.
      
-     Both can be changed mid-run. The Flags chart shows "Removed (toggles)" so you can watch the habit fade. These only shape training; the game's scoring is unchanged. Each generation, every network plays several boards on the GPU. The best are kept and the rest are replaced by mutated copies of winners. Fields marked LIVE can be changed mid-run. You can save configs and continue training from a saved model.
+     The Flags chart shows "Removed (toggles)" so you can watch the habit fade. These only shape training; the game's scoring is unchanged. Each generation, every network plays several boards on the GPU. The best are kept and the rest are replaced by mutated copies of winners. Fields marked LIVE can be changed mid-run, and that includes **every reward**: edit them and press *Apply live changes*, and the next generation is scored with the new values. Fitness is re-measured from scratch every generation, so nothing stale carries over, but the fitness chart will jump when the rewards change. You can save configs and continue training from a saved model.
 2. **Progress:** live charts of fitness, tiles revealed, mines hit and flag accuracy, plus a table of every generation. You can also load past runs.
 3. **Watch:** see the current best network, or up to 6 saved models, play live on a top-down board, on a field or a dungeon. The side panel shows what the network is weighing for its next move. **Brain activity** under the board animates bot 1's neural network as it plays:
    - **left:** the tiles it can see;

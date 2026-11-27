@@ -385,6 +385,22 @@ class V4(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "PyTorch not installed")
+class LiveRewards(unittest.TestCase):
+    def test_every_reward_is_live_and_reaches_the_next_env(self):
+        from ai import evolve
+        rewards = [k for k in evolve.FIELDS if k.startswith("reward_")]
+        self.assertTrue(rewards)
+        self.assertEqual([k for k in rewards if not evolve.FIELDS[k].get("live")], [])
+        cfg = evolve.sanitize({"board_w": 8, "board_h": 8, "mines": 6, "episode_steps": 20})
+        tweak = evolve.sanitize({**cfg, "reward_stairs": 77, "reward_mine": -42})
+        for k, v in tweak.items():          # what _train's "tweak" does
+            if evolve.FIELDS.get(k, {}).get("live"):
+                cfg[k] = v
+        env = evolve.make_env(cfg, 2, 2, torch.device("cpu"))
+        self.assertEqual((env.rw["stairs"], env.rw["mine"]), (77.0, -42.0))
+
+
+@unittest.skipIf(torch is None, "PyTorch not installed")
 class InGameBot(unittest.IsolatedAsyncioTestCase):
     async def test_v3_bot_in_descent(self):
         """A v3 brain gets traps, pickups and the goal from a live descent room and acts on them."""
