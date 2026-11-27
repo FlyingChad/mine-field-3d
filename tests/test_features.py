@@ -42,8 +42,10 @@ class Vault(unittest.IsolatedAsyncioTestCase):
         start = next(t for t in r.bfs((fx, fy), max_depth=12) if max(abs(t[0] - fx), abs(t[1] - fy)) >= 4)
         at(a, *start)
         await r.dig(a, *start)
-        self.assertEqual(list(r.buried.values()).count("key"), 1)
-        key = next(i for i, k in r.buried.items() if k == "key")
+        # the first dig's flood fill may already have uncovered the key
+        self.assertEqual(list(r.buried.values()).count("key") + list(r.items.values()).count("key"), 1)
+        key = next(i for i, k in [*r.buried.items(), *r.items.items()] if k == "key")
+        r.buried.pop(key, None)
         self.assertNotIn(key, r.vault)
         self.assertNotIn(key, r.mines)
         self.assertIn("chest", [r.buried.get(i) for i in r.vault])
@@ -54,7 +56,6 @@ class Vault(unittest.IsolatedAsyncioTestCase):
         at(a, fx, fy)
         self.assertTrue(r.locked_out(a, v))
         # pick up the key (lying on a revealed tile) and walk to the door
-        del r.buried[key]
         r.items[key] = "key"
         at(a, key % S.W, key // S.W)
         await r.pickups(time.time())
@@ -85,8 +86,9 @@ class Vault(unittest.IsolatedAsyncioTestCase):
         a = player(r, ws=ws)
         r.place(a)
         await r.dig(a, *a.tile())
-        key = next(i for i, k in r.buried.items() if k == "key")
-        del r.buried[key]
+        key = next(i for i, k in [*r.buried.items(), *r.items.items()] if k == "key")
+        r.buried.pop(key, None)
+        r.items.pop(key, None)
         a.key = True
         r.hurt(a, 999, time.time())
         await r.flush_kos()
@@ -110,7 +112,7 @@ class Vault(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.held, "blink")
 
 
-class Descent(unittest.IsolatedAsyncioTestCase):
+class DescentBase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._cd = S.ACTION_COOLDOWN
         S.ACTION_COOLDOWN = 0
@@ -133,6 +135,8 @@ class Descent(unittest.IsolatedAsyncioTestCase):
                 at(p, i % S.W, i // S.W)
                 await r.dig(p, i % S.W, i // S.W)
 
+
+class Descent(DescentBase):
     async def test_floors_carry_over_and_get_harder(self):
         r = S.Room("deep", "meadow", "field", "descent")
         self.assertEqual((r.layout_kind, r.realm, r.depth), ("dungeon", S.DESCENT_REALMS[0], 1))
@@ -161,6 +165,7 @@ class Descent(unittest.IsolatedAsyncioTestCase):
         # deeper floors: denser mines and more bosses
         r.depth = 7
         r.new_round(next_floor=True)
+        r.modifier = None                     # Swarm would add a boss
         self.assertAlmostEqual(r.n_mines / len(r.floor_tiles),
                                min(S.DESCENT_MAX_DENSITY, S.MINE_DENSITY * (1 + S.DESCENT_MINES_PER_FLOOR * 6)), places=2)
         self.assertEqual(r.boss_target_count(), 3)
@@ -200,6 +205,137 @@ class Descent(unittest.IsolatedAsyncioTestCase):
         finally:
             S.NEXT_ROUND_DELAY = S_delay
         self.assertEqual((r.depth, p.score), (1, 0))
+
+
+class Shop(DescentBase):
+    async def stairs_up(self, r, p):
+        await self.clear_floor(r, p)
+        self.assertIsNotNone(r.stairs)
+        return p.ws.of("stairs")[-1]
+
+    async def test_flags_pay_when_a_floor_is_cleared(self):
+        r = S.Room("deep", "meadow", "dungeon", "descent")
+        p = player(r)
+        r.place(p)
+        await r.dig(p, *p.tile())
+        m = next(iter(r.mines))
+        r.flags[m] = p.id
+        st = await self.stairs_up(r, p)
+        self.assertEqual(st["flags"], {p.id: S.FLAG_CORRECT})
+
+    async def test_buying(self):
+        r = S.Room("deep", "meadow", "dungeon", "descent")
+        p = player(r)
+        r.place(p)
+        st = await self.stairs_up(r, p)
+        self.assertEqual(len(st["shop"]), S.SHOP_OFFERS)
+        r.shop = list(S.SHOP)                    # make every offer available for the test
+        p.score = 1000
+        for k in ("vitality", "shield", "boots", "radar", "life", "supply"):
+            await r.buy(p, k)
+        self.assertEqual(p.bought, set(S.SHOP))
+        self.assertEqual(p.max_hp, S.MAX_HP + S.VITALITY_HP)
+        self.assertIn(p.held, S.HELD)
+        self.assertEqual(1000 - p.score, sum(r.price(k) for k in S.SHOP))
+        # once each; and not with too few points
+        score = p.score
+        await r.buy(p, "vitality")
+        self.assertEqual(p.score, score)
+        q = player(r, "Poor", "#000")
+        q.score = 0
+        await r.buy(q, "shield")
+        self.assertNotIn("shield", q.bought)
+        # perks arrive on the next floor; vitality lasts the run
+        await r.next_floor()
+        self.assertTrue(p.shield)
+        self.assertGreater(p.boots_until, time.time())
+        self.assertEqual((p.hp, p.max_hp), (S.MAX_HP + S.VITALITY_HP,) * 2)
+        self.assertEqual(p.perks, set())
+        await r.dig(p, *p.tile())
+        await r.perk_tick()
+        self.assertTrue(p.ws.of("radar"))
+        # no shopping without stairs, and a new run resets max health
+        await r.buy(p, "vitality")
+        self.assertEqual(p.max_hp, S.MAX_HP + S.VITALITY_HP)
+        S_delay, S.NEXT_ROUND_DELAY = S.NEXT_ROUND_DELAY, 0
+        try:
+            await r.restart_later()
+        finally:
+            S.NEXT_ROUND_DELAY = S_delay
+        self.assertEqual(p.max_hp, S.MAX_HP)
+
+    async def test_prices_rise_with_depth(self):
+        r = S.Room("deep", "meadow", "dungeon", "descent")
+        a = r.price("life")
+        r.depth = 5
+        self.assertGreater(r.price("life"), a)
+
+
+class Modifiers(unittest.IsolatedAsyncioTestCase):
+    def room(self, mod):
+        r = S.Room("mod", "meadow", "dungeon", "descent")
+        r.depth = 2
+        r.new_round(next_floor=True)
+        r.modifier = mod
+        return r
+
+    def test_rolled_from_floor_two_and_never_repeats(self):
+        r = S.Room("mod", "meadow", "dungeon", "descent")
+        self.assertIsNone(r.modifier)
+        last = None
+        for d in range(2, 12):
+            r.depth = d
+            r.new_round(next_floor=True)
+            self.assertIn(r.modifier, S.MODIFIERS)
+            self.assertNotEqual(r.modifier, last)
+            last = r.modifier
+        self.assertEqual(r.snapshot()["modifier"]["id"], last)
+        self.assertIsNone(S.Room("race", "meadow", "dungeon").modifier)
+
+    async def test_rich_volatile_swarm_trove(self):
+        r = self.room("rich")
+        p = player(r)
+        r.place(p)
+        await r.dig(p, *p.tile())
+        self.assertEqual(p.score, 2 * sum(r.revealed))
+        r = self.room("volatile")
+        p = player(r)
+        r.place(p)
+        await r.dig(p, *p.tile())
+        m = next(iter(r.mines))
+        at(p, m % S.W, m // S.W)
+        p.last_action = 0
+        await r.dig(p, m % S.W, m // S.W)
+        self.assertEqual(p.hp, S.MAX_HP - S.VOLATILE_DAMAGE)
+        r = self.room("swarm")
+        player(r)
+        self.assertEqual(r.boss_target_count(), 2)
+        t = self.room("trove")
+        t.generate(*divmod(t.floor_tiles[0], S.W)[::-1])
+        plain = self.room("rich")
+        plain.generate(*divmod(plain.floor_tiles[0], S.W)[::-1])
+        self.assertGreater(len(t.buried) / len(t.floor_tiles), 1.6 * len(plain.buried) / len(plain.floor_tiles))
+
+    async def test_unstable_ground(self):
+        r = self.room("unstable")
+        ws = FakeWS()
+        p = player(r, ws=ws)
+        r.place(p)
+        await r.dig(p, *p.tile())
+        for i in r.floor_tiles:               # dig everything so there's ground to cave in
+            if i not in r.mines:
+                r.revealed[i] = 1
+        r.safe_left = 0
+        r.stairs = None
+        before = sum(r.revealed)
+        await r.crumble(time.time())
+        c = ws.of("crumble")[-1]
+        self.assertTrue(3 <= len(c["tiles"]) <= 9)
+        self.assertEqual(sum(r.revealed), before - len(c["tiles"]))
+        self.assertEqual(r.safe_left, len(c["tiles"]))
+        self.assertGreater(max(abs(c["x"] - p.tile()[0]), abs(c["y"] - p.tile()[1])), S.UNSTABLE_RADIUS + 1)
+        await r.crumble(time.time())          # not again before UNSTABLE_EVERY
+        self.assertEqual(len(ws.of("crumble")), 1)
 
 
 class Traps(unittest.IsolatedAsyncioTestCase):

@@ -225,6 +225,23 @@ body.touch .center { padding: 18px; }
 @keyframes bannerIn { from { opacity: 0; transform: translate(-50%, -50%) scale(.85); } }
 #fade { position: fixed; inset: 0; background: #000; opacity: 0; pointer-events: none; transition: opacity .9s; }
 body.touch .banner #bannerBig { font-size: 34px; }
+.modRow { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #c6d1de; max-width: 220px; }
+.chip.mod { background: #a0522d; white-space: nowrap; }
+/* the stairs shop */
+.shop { left: 50%; bottom: 96px; transform: translateX(-50%); width: min(640px, calc(100vw - 24px)); padding: 10px 12px; }
+.shopHead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.shopHead .pts { margin-left: auto; font-weight: 800; color: #ffd23f; font-variant-numeric: tabular-nums; }
+.shopItems { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.shopItems button { display: grid; gap: 3px; text-align: left; padding: 8px 10px; border-radius: 10px; border: 1px solid #2c3e55;
+  background: #0b1522; color: #c6d1de; font-size: 12px; }
+.shopItems button b { color: #fff; font-size: 14px; }
+.shopItems button .cost { color: #ffd23f; font-weight: 800; }
+.shopItems button:hover:not(:disabled) { border-color: #ffd23f; }
+.shopItems button:disabled { opacity: .45; cursor: not-allowed; }
+.shopItems button.owned { opacity: 1; border-color: #4fd67a; }
+.shopItems button.owned .cost { color: #4fd67a; }
+body.touch .shop { bottom: auto; top: calc(10px + env(safe-area-inset-top)); }
+@media (max-width: 560px) { .shopItems { grid-template-columns: 1fr; } }
 .daily .dT { font-size: 11px; color: #a9b6c7; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
 .daily ol { font-size: 12px; gap: 2px; }
 .daily ol li .sw { width: 9px; height: 9px; border-radius: 3px; }

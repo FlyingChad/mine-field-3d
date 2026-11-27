@@ -33,6 +33,8 @@ const QUICK = { help: 'Help!', boss: 'Boss here!', nice: 'Nice!', follow: 'Follo
 let quickIds = Object.keys(QUICK);
 
 let depth = null;                        // descent: the floor the team is on
+let modifier = null;                     // descent: this floor's twist { id, name, desc }
+let shopOffers = [], shopOwned = new Set(), lifeBought = false;   // descent: the stairs shop
 let stairs = null;                       // descent: { i, group } the staircase down, once the floor is cleared
 
 function renderModeRow() {
@@ -152,6 +154,22 @@ function layoutExtent(layoutStr) {
   return m + T / 2;
 }
 
+// The realm's sky, fog and lights; the Darkness floor modifier turns them right down and lights a
+// lantern around the player instead.
+const lantern = new THREE.PointLight(0xffd59a, 0, 22, 1.4);
+scene.add(lantern);
+function lightRealm() {
+  const dark = modifier?.id === 'dark';
+  // colours mix in linear space, so "dark" has to be very small numbers to look dark on screen
+  const sky = dark ? new THREE.Color(0x020306).lerp(new THREE.Color(realm.sky), 0.015) : new THREE.Color(realm.sky);
+  scene.background = sky;
+  scene.fog = dark ? new THREE.Fog(sky, 4, 22) : new THREE.Fog(realm.sky, realm.fog[0], realm.fog[1]);
+  hemi.color.set(realm.hemi[0]); hemi.groundColor.set(realm.hemi[1]); hemi.intensity = realm.hemi[2] * (dark ? 0.04 : 1);
+  sun.color.set(realm.sun[0]); sun.intensity = realm.sun[1] * (dark ? 0.02 : 1);
+  lantern.intensity = 260;
+  lantern.visible = dark;   // an invisible light costs nothing in the shaders; it's only on dark floors
+}
+
 // (Re)build everything that belongs to the realm: ground, board meshes, scenery, weather, lighting.
 function buildWorld(realmId, extent) {
   realm = REALM_BY_ID[realmId] || REALMS[0];
@@ -163,10 +181,7 @@ function buildWorld(realmId, extent) {
   worldBuilt = true;
   const bw = extent * 2, bh = extent * 2;
 
-  scene.background = new THREE.Color(realm.sky);
-  scene.fog = new THREE.Fog(realm.sky, realm.fog[0], realm.fog[1]);
-  hemi.color.set(realm.hemi[0]); hemi.groundColor.set(realm.hemi[1]); hemi.intensity = realm.hemi[2];
-  sun.color.set(realm.sun[0]); sun.intensity = realm.sun[1];
+  lightRealm();
   $('realmName').textContent = realm.name;
 
   const grass = new THREE.Mesh(new THREE.PlaneGeometry(600, 600),
@@ -637,6 +652,41 @@ function setStairs(xy) {
   stairs = { i: y * W + x, x, y, group };
 }
 
+function renderModRow() {
+  $('modRow').hidden = !modifier;
+  if (modifier) { $('modChip').textContent = modifier.name.toUpperCase(); $('modDesc').textContent = modifier.desc; }
+}
+
+// the stairs shop: shown while the stairs are open; each offer can be bought once per floor
+function renderShop() {
+  const box = $('shop');
+  const mine = players.get(myId);
+  box.hidden = !shopOffers.length || spectating || !mine || roundState !== 'playing';
+  if (box.hidden) return;
+  $('shopPts').textContent = `${mine.score} pts`;
+  const held = heldKind(me.fx);
+  $('shopItems').replaceChildren(...shopOffers.map((o) => {
+    const b = document.createElement('button'); b.type = 'button';
+    const owned = shopOwned.has(o.id);
+    const why = owned ? '' : mine.score < o.cost ? 'Not enough points'
+      : o.id === 'supply' && held ? 'Your hands are full' : o.id === 'life' && lifeBought ? 'Already bought this floor' : '';
+    b.disabled = owned || !!why;
+    b.classList.toggle('owned', owned);
+    const nm = document.createElement('b'); nm.textContent = o.name;
+    const ds = document.createElement('span'); ds.textContent = o.desc;
+    const cs = document.createElement('span'); cs.className = 'cost'; cs.textContent = owned ? '✓ Bought' : why ? `${o.cost} pts · ${why}` : `${o.cost} pts`;
+    b.append(nm, ds, cs);
+    b.addEventListener('click', () => { send({ t: 'buy', id: o.id }); b.disabled = true; });
+    return b;
+  }));
+}
+let shopKey = '';
+function refreshShop() {   // cheap check every tick; rebuild only when something that matters changed
+  const mine = players.get(myId);
+  const key = `${shopOffers.map((o) => o.id)}|${[...shopOwned]}|${mine?.score}|${heldKind(me.fx)}|${lifeBought}|${roundState}`;
+  if (key !== shopKey) { shopKey = key; renderShop(); }
+}
+
 function showBanner(big, small, secs = 3) {
   $('bannerBig').textContent = big; $('bannerSmall').textContent = small || '';
   const b = $('banner'); b.hidden = false;
@@ -761,9 +811,9 @@ function makeAvatar(color, name, charId, hatId = '') {
   return av;
 }
 
-function drawHpBar(av, hp) {
+function drawHpBar(av, hp, max = maxHp) {
   if (!av?.hpCanvas) return;
-  const g = av.hpCanvas.getContext('2d'), k = Math.max(0, Math.min(1, hp / maxHp));
+  const g = av.hpCanvas.getContext('2d'), k = Math.max(0, Math.min(1, hp / max));
   g.clearRect(0, 0, 128, 20);
   g.fillStyle = 'rgba(10,18,30,.75)'; g.beginPath(); g.roundRect(0, 0, 128, 20, 8); g.fill();
   g.fillStyle = k > 0.6 ? '#4fd67a' : k > 0.3 ? '#ffd23f' : '#ff5d5d';
@@ -1193,7 +1243,7 @@ function connect(name, room, { spectate = false } = {}) {
 
 function leaveGame() {
   $('hud').hidden = true; $('results').hidden = true; $('reconnect').hidden = true; $('quick').hidden = true;
-  $('fade').style.opacity = 0;
+  $('fade').style.opacity = 0; $('shop').hidden = true; shopOffers = [];
   setSpectating(false);
   openPicker(false);
 }
@@ -1241,6 +1291,9 @@ function applySnapshot(s) {
   depth = s.depth ?? null;
   setStairs(s.stairs);
   renderModeRow();
+  modifier = s.modifier || null;
+  renderModRow(); lightRealm();
+  shopOffers = s.shop || []; shopOwned = new Set(); lifeBought = false; shopKey = '';
   for (let i = 0; i < W * H; i++) if (!floor[i]) tiles[i] = -3;
   for (const [x, y, v] of s.tiles) {
     tiles[y * W + x] = v;
@@ -1342,14 +1395,39 @@ function handle(m) {
       setStairs([m.x, m.y]);
       teamLives = m.lives; renderModeRow();
       for (const id of [...bosses.keys()]) removeBoss(id);   // the floor's monsters flee
-      showBanner('FLOOR CLEARED!', `+${m.bonus} each · +1 life · find the stairs down (or wait ${m.auto | 0}s)`, 4);
+      showBanner('FLOOR CLEARED!', `+${m.bonus} each · +1 life · shop, then find the stairs down (or wait ${m.auto | 0}s)`, 4);
+      shopOffers = m.shop || []; shopOwned = new Set(); lifeBought = false; shopKey = '';
+      for (const [pid, pts] of Object.entries(m.flags || {})) {
+        const pp = playerPos(pid);
+        if (pp) floatText(`+${pts} flags`, '#ffd23f', pp[0], pp[1] + 4.4, pp[2]);
+      }
       feed({ text: 'Stairs down', color: '#c77dff' }, ` opened! Step on them to descend to floor ${m.depth + 1}.`);
       sfx.door(1);
       const [wx, wz] = tileCenter(m.x, m.y);
       burst(new THREE.Vector3(wx, 1, wz), { count: 120, colors: [0xc77dff, 0xffffff, 0x8a3ffc], speed: [3, 10], life: 1.4, size: 0.35 });
       break;
     }
+    case 'bought': {
+      const o = shopOffers.find((x) => x.id === m.id);
+      if (m.pid === myId) { shopOwned.add(m.id); sfx.pickup(1); }
+      if (m.id === 'life') { lifeBought = true; teamLives = m.lives; renderModeRow(); }
+      shopKey = '';
+      feed(who(m.pid), ' bought ', { text: o?.name ?? m.id, color: '#ffd23f' }, ` (−${m.cost})`);
+      break;
+    }
+    case 'crumble': {
+      for (const [x, y] of m.tiles) tiles[y * W + x] = -2;
+      refreshBoard();
+      setCounters(m);
+      const [wx, wz] = tileCenter(m.x, m.y);
+      burst(new THREE.Vector3(wx, 0.6, wz), { count: 90, colors: [0x8a6a4a, realm.cover[0], 0x555555], speed: [2, 6], up: 0.6, life: 1.2, size: 0.4 });
+      const v = distVol(wx, wz);
+      sfx.smash(v * 0.6); cam.shake = Math.max(cam.shake, v * 0.5);
+      if (v > 0.5) feed('The ground caves in nearby!');
+      break;
+    }
     case 'descending':
+      shopOffers = []; shopKey = '';
       showBanner(`DESCENDING…`, `to floor ${m.depth}`, m.in + 1);
       feed(m.by ? who(m.by) : 'The team', ` heads down to floor ${m.depth}`);
       $('fade').style.opacity = 1;     // fade to black; the next floor's 'round' fades back in
@@ -1383,7 +1461,7 @@ function handle(m) {
           scene.remove(ex.av.group);
           Object.assign(ex, { name: r.name, color: r.color, char: r.char, hat: r.hat || '' });
           ex.av = makeAvatar(r.color, r.name, r.char, r.hat);
-          drawHpBar(ex.av, ex.hp ?? maxHp);
+          drawHpBar(ex.av, ex.hp ?? maxHp, ex.maxHp ?? maxHp);
           if (r.id === myId) { picker.color = r.color; }
         }
       }
@@ -1398,10 +1476,11 @@ function handle(m) {
       break;
     }
     case 'players':
-      for (const [id, x, z, r, s, st, fx = 0, hp = maxHp] of m.p) {
+      for (const [id, x, z, r, s, st, fx = 0, hp = maxHp, mh = maxHp] of m.p) {
         const p = players.get(id); if (!p) continue;
         p.score = s; p.stun = st; p.fx = fx;
-        if (p.hp !== hp) { p.hp = hp; drawHpBar(p.av, hp); }
+        if (p.hp !== hp || p.maxHp !== mh) { p.hp = hp; p.maxHp = mh; drawHpBar(p.av, hp, mh); }
+        if (id === myId) me.maxHp = mh;
         if (id === myId) { me.stun = st; me.fx = fx; me.hp = hp; continue; }
         p.tx = x; p.tz = z; p.tr = r;
         if (Number.isNaN(p.x)) { p.x = x; p.z = z; p.r = r; }
@@ -1541,6 +1620,11 @@ function handle(m) {
       break;
     }
     case 'pickup': {
+      if (m.perk) {   // a Boots perk bought in the shop upstairs
+        bootsUntil = performance.now() + m.dur * 1000;
+        feed('Your ', { text: 'Boots', color: ITEM_INFO.boots.css }, ' perk kicks in!');
+        break;
+      }
       removeItem(m.y * W + m.x);
       const [wx, wz] = tileCenter(m.x, m.y);
       const info = ITEM_INFO[m.kind];
@@ -1754,7 +1838,7 @@ function handle(m) {
     }
     case 'respawn': {
       const p = players.get(m.pid);
-      if (p) { p.hp = m.hp; drawHpBar(p.av, m.hp); }
+      if (p) { p.hp = m.hp; drawHpBar(p.av, m.hp, p.maxHp ?? maxHp); }
       if (m.pid === myId) { me.x = m.x; me.z = m.z; me.kx = me.kz = 0; me.y = 2; me.hp = m.hp; koUntil = 0; }
       else if (p) { p.x = p.tx = m.x; p.z = p.tz = m.z; }
       burst(new THREE.Vector3(m.x, 1, m.z), { count: 50, colors: [0xffffff, 0x9ff8ff], speed: [2, 5], life: 0.8, size: 0.3, gravity: -2 });
@@ -1790,8 +1874,9 @@ function handle(m) {
       applySnapshot(m.snapshot);
       $('fade').style.opacity = 0;
       if (m.depth) {
-        showBanner(`FLOOR ${m.depth}`, `${realm.name} · more mines, tougher monsters`, 3.5);
-        feed({ text: `Floor ${m.depth}`, color: '#c77dff' }, `: ${realm.name}. Keep going!`);
+        showBanner(`FLOOR ${m.depth}`, modifier ? `${realm.name} · ${modifier.name}: ${modifier.desc}` : `${realm.name} · more mines, tougher monsters`, 4.5);
+        feed({ text: `Floor ${m.depth}`, color: '#c77dff' }, `: ${realm.name}`, modifier ? ' · ' : '. Keep going!',
+          modifier ? { text: modifier.name, color: '#ff9f43' } : '', modifier ? `. ${modifier.desc}` : '');
       }
       if (m.spawns?.[myId]) { [me.x, me.z] = m.spawns[myId]; me.kx = me.kz = 0; me.y = 1; }
       for (const [id, [x, z]] of Object.entries(m.spawns || {})) {
@@ -2519,6 +2604,7 @@ function updateCamera(dt) {
     cam.shake = Math.max(0, cam.shake - dt * 2.5);
   }
   camera.lookAt(target);
+  lantern.position.set(me.x, me.y + 3.2, me.z);
   sun.position.set(me.x + 30, 60, me.z + 18); sun.target.position.set(me.x, 0, me.z); sun.target.updateMatrixWorld();
 }
 
@@ -2675,11 +2761,12 @@ function frame(now) {
   $('stun').textContent = me.hp === 0 ? `KNOCKED OUT · back in ${koLeft}` : me.fx & 8 ? 'FROZEN' : 'STUNNED';
   $('stun').classList.toggle('ko', me.hp === 0);
   // your own health in the HUD
-  const hk2 = Math.max(0, Math.min(1, me.hp / maxHp));
+  const myMax = me.maxHp || maxHp, hk2 = Math.max(0, Math.min(1, me.hp / myMax));
   $('hpFill').style.width = `${hk2 * 100}%`;
   $('hpFill').style.background = hk2 > 0.6 ? '#4fd67a' : hk2 > 0.3 ? '#ffd23f' : '#ff5d5d';
-  $('hpText').textContent = `${me.hp} / ${maxHp}`;
+  $('hpText').textContent = `${me.hp} / ${myMax}`;
   drawMinimap(now);
+  refreshShop();
   $('stun').classList.toggle('frozen', !!(me.fx & 8));
   if (roundState === 'over') $('nextIn').textContent = Math.max(0, Math.ceil((overEndsAt - performance.now()) / 1000));
 

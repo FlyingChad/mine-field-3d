@@ -218,7 +218,8 @@ class Bosses(Base):
             await r.update_bosses(t, 0.07)
             self.assertTrue(r.is_floor(*b.tile()))
         a.x, a.z = b.x, b.z
-        a.hp, a.stun_until, a.shield = S.MAX_HP, 0, False
+        # the boss may have caught and knocked out the player while it roamed: start fresh
+        a.hp, a.stun_until, a.shield, a.ko_until = S.MAX_HP, 0, False, 0
         b.cooldown_until, b.state = 0, "chase"
         await r.update_bosses(t, 0.07)
         self.assertEqual(b.state, "windup")

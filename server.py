@@ -120,6 +120,35 @@ DESCENT_LIFE_PER_FLOOR = 1       # lives gained for each floor cleared
 STAIRS_AUTO = 30.0               # seconds before the team descends anyway
 DESCEND_DELAY = 2.5              # seconds between stepping on the stairs and arriving below
 
+# the stairs shop: while the stairs are open, each player may buy each of the floor's SHOP_OFFERS once,
+# paying with their own points. Prices go up SHOP_PRICE_PER_FLOOR per floor.
+SHOP = {
+    "vitality": {"name": "Vitality", "cost": 40, "desc": "+20 max health for the rest of the run"},
+    "shield":   {"name": "Shield",   "cost": 25, "desc": "Start the next floor with a shield"},
+    "boots":    {"name": "Boots",    "cost": 20, "desc": "Start the next floor with 20 s of boots"},
+    "radar":    {"name": "Radar",    "cost": 30, "desc": "A radar sweep where you land on the next floor"},
+    "life":     {"name": "Spare life", "cost": 60, "desc": "+1 team life (one per floor, for the team)"},
+    "supply":   {"name": "Supply drop", "cost": 30, "desc": "A random held power-up, right now"},
+}
+SHOP_OFFERS = 3
+SHOP_PRICE_PER_FLOOR = 0.15      # cost x (1 + this * (depth - 1))
+VITALITY_HP = 20
+PERK_BOOTS = 20.0                # seconds of boots from the Boots perk
+
+# floor modifiers: from floor 2 on, each descent floor rolls one twist (never the same twice in a row)
+VOLATILE_DAMAGE = 50
+MODIFIERS = {
+    "dark":     {"name": "Darkness",        "desc": "You can only see what's close. Bring a light."},
+    "unstable": {"name": "Unstable ground", "desc": "Every few seconds a patch of dug ground caves back in."},
+    "rich":     {"name": "Rich veins",      "desc": "Every tile you dig is worth double points."},
+    "swarm":    {"name": "Swarm",           "desc": "One more boss, but every boss is weaker."},
+    "trove":    {"name": "Treasure trove",  "desc": "Twice as many power-ups buried."},
+    "volatile": {"name": "Volatile",        "desc": f"Mines hit much harder ({VOLATILE_DAMAGE} damage)."},
+}
+SWARM_HP = 0.6
+UNSTABLE_EVERY = 10.0            # seconds between cave-ins
+UNSTABLE_RADIUS = 1              # 3x3 patches
+
 # the dungeon vault: a side room sealed by a locked door (two door tiles across a corridor). A key is
 # buried somewhere else in the dungeon; whoever carries it to the door opens it for everyone and earns
 # VAULT_OPEN_REWARD. Inside wait a treasure chest (CHEST_POINTS) and extra loot. Door tiles are walls
@@ -220,7 +249,9 @@ class Player:
         self.rot = 0.0
         self.stun_until = 0.0
         self.last_action = 0.0
-        self.hp = MAX_HP
+        self.hp = self.max_hp = MAX_HP   # max_hp grows with the Vitality perk (descent)
+        self.perks: set[str] = set()       # descent: perks bought for the next floor
+        self.bought: set[str] = set()      # descent: shop offers bought on this floor
         self.ko_until = 0.0       # > 0 while knocked out
         self.reset_items()
 
@@ -382,6 +413,13 @@ class Room:
         if not next_floor:   # lives carry over from floor to floor in a descent
             self.lives = COOP_LIVES_BASE + len(getattr(self, "players", {}) or {})
         self.failed = False
+        # descent: this floor's twist (none on floor 1, never the same twice running) and the shop
+        prev = getattr(self, "modifier", None) if next_floor else None
+        self.modifier = (random.choice([m for m in MODIFIERS if m != prev])
+                         if self.mode == "descent" and self.depth >= 2 else None)
+        self.next_crumble = 0.0
+        self.shop: list[str] = []          # offer ids, set when the stairs open
+        self.life_bought = False
 
     # ---------- descent ----------
     async def floor_cleared(self, p):
@@ -398,13 +436,85 @@ class Room:
         self.stairs = idx(sx, sy)
         self.stairs_auto = time.time() + STAIRS_AUTO
         bonus = FLOOR_BONUS * self.depth
+        flagged = {}   # correct flags pay out here, since a descent round only "ends" when the run fails
+        for i, pid in list(self.flags.items()):
+            if i in self.mines and pid in self.players:
+                flagged[pid] = flagged.get(pid, 0) + FLAG_CORRECT
+                del self.flags[i]
         for q in self.players.values():
-            q.score += bonus
+            q.score += bonus + flagged.get(q.id, 0)
+            await self.stat(q, flags=flagged.get(q.id, 0) // FLAG_CORRECT)
         self.lives += DESCENT_LIFE_PER_FLOOR
         self.bosses.clear()                 # the floor's monsters flee
         self.next_boss_at = float("inf")
+        self.shop = random.sample(list(SHOP), SHOP_OFFERS)
+        for q in self.players.values():
+            q.bought.clear()
         await self.broadcast({"t": "stairs", "x": sx, "y": sy, "depth": self.depth, "bonus": bonus,
-                              "lives": self.lives, "auto": STAIRS_AUTO, "by": p.id})
+                              "flags": flagged, "lives": self.lives, "auto": STAIRS_AUTO, "by": p.id,
+                              "shop": [{"id": k, **SHOP[k], "cost": self.price(k)} for k in self.shop]})
+
+    async def perk_tick(self):
+        """Radar perks fire as soon as the new floor has mines to show."""
+        if self.mines is None:
+            return
+        for p in self.players.values():
+            if getattr(p, "radar_pending", False):
+                p.radar_pending = False
+                x, y = p.tile()
+                near = [[m % W, m // W] for m in self.mines
+                        if max(abs(m % W - x), abs(m // W - y)) <= RADAR_RADIUS + 2 and not self.revealed[m]]
+                await self.send_to(p, {"t": "radar", "mines": near, "dur": RADAR_SECONDS})
+
+    def price(self, k):
+        return round(SHOP[k]["cost"] * (1 + SHOP_PRICE_PER_FLOOR * (self.depth - 1)))
+
+    async def buy(self, p, k):
+        """A shop purchase: only while the stairs are open, once per offer per player, paid in points."""
+        if (self.stairs is None or self.descend_at or k not in self.shop or k in p.bought
+                or (k == "life" and self.life_bought)):
+            return
+        cost = self.price(k)
+        if p.score < cost or (k == "supply" and p.held):
+            return
+        p.score -= cost
+        p.bought.add(k)
+        if k == "vitality":
+            p.max_hp += VITALITY_HP
+            p.hp += VITALITY_HP
+        elif k == "life":
+            self.life_bought = True
+            self.lives += 1
+        elif k == "supply":
+            p.held = random.choice([h for h in HELD if h and h != "scatter"])
+        else:
+            p.perks.add(k)            # shield / boots / radar: applied on the next floor
+        await self.broadcast({"t": "bought", "pid": p.id, "id": k, "cost": cost, "lives": self.lives if k == "life" else None,
+                              "held": p.held if k == "supply" else None})
+
+    async def crumble(self, now):
+        """Unstable ground: a 3x3 patch of dug-up ground away from everyone caves back in (no new mines)."""
+        if self.modifier != "unstable" or self.mines is None or self.stairs is not None or now < self.next_crumble:
+            return
+        self.next_crumble = now + UNSTABLE_EVERY
+        cand = [i for i in self.floor_tiles if self.revealed[i] and i not in self.booms]
+        random.shuffle(cand)
+        r = UNSTABLE_RADIUS
+        for c in cand[:40]:
+            cx, cy = c % W, c // W
+            if any(max(abs(q.tile()[0] - cx), abs(q.tile()[1] - cy)) <= r + 1 for q in self.players.values()):
+                continue
+            area = [idx(x, y) for y in range(cy - r, cy + r + 1) for x in range(cx - r, cx + r + 1)
+                    if self.is_floor(x, y) and self.revealed[idx(x, y)] and idx(x, y) not in self.booms
+                    and idx(x, y) not in self.items and idx(x, y) not in self.traps and idx(x, y) != self.stairs]
+            if len(area) < 3:
+                continue
+            for i in area:
+                self.revealed[i] = 0
+            self.safe_left += len(area)
+            await self.broadcast({"t": "crumble", "tiles": [[i % W, i // W] for i in area], "safeLeft": self.safe_left,
+                                  "x": cx, "y": cy})
+            return
 
     async def check_stairs(self, now):
         if self.stairs is None or self.state != "playing":
@@ -424,14 +534,25 @@ class Room:
         self.depth += 1
         self.new_round(next_floor=True)
         spawns = {}
+        now = time.time()
         for q in self.players.values():
-            q.hp, q.ko_until, q.stun_until, q.frozen_until = MAX_HP, 0.0, 0.0, 0.0
+            q.hp, q.ko_until, q.stun_until, q.frozen_until = q.max_hp, 0.0, 0.0, 0.0
             q.key, q.boots_until, q.gold_until = False, 0.0, 0.0   # held items and shields come along
             self.place(q)
             spawns[q.id] = [round(q.x, 2), round(q.z, 2)]
+            # perks bought in the shop upstairs
+            if "shield" in q.perks:
+                q.shield = True
+            if "boots" in q.perks:
+                q.boots_until = now + PERK_BOOTS
+            q.radar_pending = "radar" in q.perks    # sent once the floor's mines exist (first dig)
         for q in self.players.values():
             await self.stat(q, deepest=self.depth)
         await self.broadcast({"t": "round", "snapshot": self.snapshot(), "spawns": spawns, "depth": self.depth})
+        for q in self.players.values():
+            if "boots" in q.perks:
+                await self.send_to(q, {"t": "pickup", "pid": q.id, "x": -1, "y": -1, "kind": "boots", "dur": PERK_BOOTS, "perk": True})
+            q.perks.clear()
 
     # ---------- the vault ----------
     def setup_vault(self):
@@ -587,7 +708,7 @@ class Room:
             return 0
         n = 2 if len(self.players) >= 4 else 1
         if self.mode == "descent":   # deeper floors are more crowded
-            n += min(2, (self.depth - 1) // DESCENT_FLOORS_PER_BOSS)
+            n += min(2, (self.depth - 1) // DESCENT_FLOORS_PER_BOSS) + (self.modifier == "swarm")
         return n
 
     def walkable_step(self, x, y, dx, dy):
@@ -640,7 +761,8 @@ class Room:
             if self.coop:   # a bigger team faces a tougher boss
                 b.max_hp = b.hp = round(b.max_hp * (1 + COOP_BOSS_HP_PER_PLAYER * max(0, len(self.players) - 1)))
             if self.mode == "descent":   # and so does a deeper floor
-                b.max_hp = b.hp = round(b.max_hp * (1 + DESCENT_BOSS_HP_PER_FLOOR * (self.depth - 1)))
+                b.max_hp = b.hp = round(b.max_hp * (1 + DESCENT_BOSS_HP_PER_FLOOR * (self.depth - 1))
+                                        * (SWARM_HP if self.modifier == "swarm" else 1))
             self.bosses[b.id] = b
             self.next_boss_at = now + 6.0     # stagger a second spawn
             await self.broadcast({"t": "bossSpawn", "id": b.id, "kind": kind, "name": b.name, "x": round(x, 2), "z": round(z, 2)})
@@ -820,7 +942,7 @@ class Room:
             self.mines = set(rng.sample(candidates, min(self.n_mines, len(candidates))))
         self.recount()
         safe = [i for i in self.floor_tiles if i not in self.mines and i not in forbidden]
-        n_items = min(len(safe), round(ITEM_DENSITY * len(self.floor_tiles)))
+        n_items = min(len(safe), round(ITEM_DENSITY * len(self.floor_tiles) * (2 if self.modifier == "trove" else 1)))
         pool = {k: w for k, w in ITEM_WEIGHTS.items() if not (self.coop and k == "scatter")}
         kinds = rng.choices(list(pool), weights=list(pool.values()), k=n_items)
         self.buried = dict(zip(rng.sample(safe, n_items), kinds))
@@ -869,6 +991,8 @@ class Room:
             "realm": self.realm,
             "depth": self.depth if self.mode == "descent" else None,
             "stairs": None if self.stairs is None else [self.stairs % W, self.stairs // W],
+            "modifier": None if not self.modifier else {"id": self.modifier, **MODIFIERS[self.modifier]},
+            "shop": [{"id": k, **SHOP[k], "cost": self.price(k)} for k in self.shop],
             "minesLeft": self.mines_left(),
             "safeLeft": self.safe_left,
             "next": max(0, (self.round_ends_at or 0) - time.time()),
@@ -971,7 +1095,7 @@ class Room:
                         queue.append((nx, ny))
         if not opened:
             return
-        gain = len(opened) * (GOLD_MULT if time.time() < p.gold_until else 1)
+        gain = len(opened) * (GOLD_MULT if time.time() < p.gold_until else 1) * (2 if self.modifier == "rich" else 1)
         p.score += gain
         for pid, amt in penalties.items():
             if pid in self.players:
@@ -996,7 +1120,7 @@ class Room:
             p.shield = False
             penalty, stun, damage = 0, 0, 0
         else:
-            penalty, stun, damage = MINE_PENALTY, STUN_SECONDS, MINE_DAMAGE
+            penalty, stun, damage = MINE_PENALTY, STUN_SECONDS, VOLATILE_DAMAGE if self.modifier == "volatile" else MINE_DAMAGE
             p.score += penalty
             p.stun_until = now + stun
             self.hurt(p, damage, now)
@@ -1048,7 +1172,7 @@ class Room:
     async def respawns(self, now):
         for q in list(self.players.values()):
             if q.ko_until and now >= q.ko_until:
-                q.ko_until, q.hp, q.stun_until = 0.0, MAX_HP, 0.0
+                q.ko_until, q.hp, q.stun_until = 0.0, q.max_hp, 0.0
                 q.frozen_until = 0.0
                 self.place(q)
                 await self.broadcast({"t": "respawn", "pid": q.id, "x": round(q.x, 2), "z": round(q.z, 2), "hp": q.hp})
@@ -1066,7 +1190,7 @@ class Room:
             i = idx(x, y)
             kind = self.items.get(i)
             if (not kind or (kind in HELD and p.held) or (kind == "shield" and p.shield)
-                    or (kind in FOOD and p.hp >= MAX_HP)):
+                    or (kind in FOOD and p.hp >= p.max_hp)):
                 continue
             del self.items[i]
             dur = 0
@@ -1080,7 +1204,7 @@ class Room:
                                       "points": CHEST_POINTS})
                 continue
             if kind in FOOD:
-                heal = min(FOOD[kind], MAX_HP - p.hp)
+                heal = min(FOOD[kind], p.max_hp - p.hp)
                 p.hp += heal
                 await self.broadcast({"t": "pickup", "pid": p.id, "x": x, "y": y, "kind": kind, "dur": 0,
                                       "heal": heal, "hp": p.hp})
@@ -1318,7 +1442,7 @@ class Room:
                 await self.attack(p)
                 continue
             # heuristic (not learned): when hurt, walk toward visible food nearby
-            if p.hp <= MAX_HP - 40:
+            if p.hp <= p.max_hp - 40:
                 food = [(max(abs(i % W - x), abs(i // W - y)), i) for i, k in self.items.items() if k in FOOD]
                 food = [f for f in food if f[0] <= 8]
                 if food:
@@ -1352,7 +1476,7 @@ class Room:
             if v2:   # what a v2 model also sees: its health, the mode, teammates and the nearest boss
                 boss = min(self.bosses.values(), key=lambda b: math.hypot(b.x - p.x, b.z - p.z), default=None)
                 # models know race / pvp / coop; descent plays by co-op rules
-                extra = {"hp": p.hp / MAX_HP, "mode": "coop" if self.coop else self.mode, "attack_ok": can_hit,
+                extra = {"hp": p.hp / p.max_hp, "mode": "coop" if self.coop else self.mode, "attack_ok": can_hit,
                          "allies": [q.tile() for q in mates] if self.coop else [],
                          "boss": (*boss.tile(), boss.hp / boss.max_hp, boss.state == "windup") if boss else None}
                 others = [] if self.coop else [q.tile() for q in mates]
@@ -1461,7 +1585,9 @@ class Room:
         for q in self.players.values():
             q.score = 0
             q.stun_until = 0
-            q.hp, q.ko_until = MAX_HP, 0.0
+            q.hp = q.max_hp = MAX_HP
+            q.ko_until = 0.0
+            q.perks.clear(); q.bought.clear()
             q.reset_items()
             q.round_id = self.run_id
             self.place(q)   # the new layout has different floor, so everyone gets a fresh spawn
@@ -1549,7 +1675,7 @@ async def resume(room, token, ws):
     if p.color in {q.color for q in room.players.values() if q is not p}:
         p.color = pick_color(room, None)
     if p.round_id != room.run_id:            # a new round (or descent run) started while they were away
-        p.score, p.hp, p.ko_until, p.stun_until = 0, MAX_HP, 0.0, 0.0
+        p.score, p.hp, p.max_hp, p.ko_until, p.stun_until = 0, MAX_HP, MAX_HP, 0.0, 0.0
         p.reset_items()
         p.round_id = room.run_id
         room.place(p)
@@ -1671,6 +1797,8 @@ async def ws_handler(request):
                 await (room.dig if t == "dig" else room.flag)(player, x, y)
             elif t == "attack":
                 await room.attack(player)
+            elif t == "buy":
+                await room.buy(player, data.get("id") if isinstance(data.get("id"), str) else "")
             elif t in ("use", "throw"):
                 try:
                     x, y = int(data.get("x", -1)), int(data.get("y", -1))
@@ -1815,11 +1943,13 @@ async def tick_loop(app):
                 await room.pickups(now)
                 await room.check_doors()
                 await room.check_stairs(now)
+                await room.crumble(now)
+                await room.perk_tick()
                 await room.spikes(now)
                 await room.respawns(now)
                 await room.broadcast({"t": "players", "p": [
                     [p.id, round(p.x, 2), round(p.z, 2), round(p.rot, 2), p.score,
-                     round(max(0.0, p.stun_until - now), 2), p.fx(now), p.hp]
+                     round(max(0.0, p.stun_until - now), 2), p.fx(now), p.hp, p.max_hp]
                     for p in room.players.values()],
                     "b": [b.row(now) for b in room.bosses.values()]})
     task = asyncio.create_task(loop())

@@ -79,7 +79,29 @@ Add `?mode=pvp`, `?mode=coop` or `?mode=descent` to a link to preselect a mode.
 
 Descent plays by the co-op rules (one team, shared lives, no friendly fire, no scatter bombs), but clearing the dungeon doesn't end the game. It opens a **staircase down**, marked by a purple beam and a pulsing square on the minimap. Step on it, or wait 30 seconds, and the whole team descends to the next floor.
 
-Clearing a floor gives everyone **+10 × the floor number** and the team **+1 life**.
+Clearing a floor gives everyone **+10 × the floor number** and the team **+1 life**. Correct flags pay out (+3 each) when the floor is cleared.
+
+**The stairs shop:** while the stairs are open, a shop shows 3 random offers. Each player buys with their own points, and can buy each offer once per floor. Prices rise 15% per floor.
+
+| Offer | Base price | Effect |
+|---|---|---|
+| Vitality | 40 | +20 max health for the rest of the run |
+| Shield | 25 | Start the next floor with a shield |
+| Boots | 20 | Start the next floor with 20 s of boots |
+| Radar | 30 | A radar sweep around where you land on the next floor |
+| Spare life | 60 | +1 team life; one per floor for the whole team |
+| Supply drop | 30 | A random held power-up, right away (hands must be empty) |
+
+**Floor modifiers:** from floor 2 on, every floor rolls a twist, never the same one twice in a row. It's shown on the floor banner and under the mode in the top-left panel:
+
+| Modifier | Effect |
+|---|---|
+| Darkness | Fog closes in and the lights go out; a lantern lights the ground around you |
+| Unstable ground | Every 10 s a 3×3 patch of dug ground caves back in, away from players |
+| Rich veins | Every tile you dig is worth double points |
+| Swarm | One extra boss, but every boss has 60% health |
+| Treasure trove | Twice as many power-ups are buried |
+| Volatile | Mines hit for 50 damage instead of 35 |
 
 Every floor down is harder:
 

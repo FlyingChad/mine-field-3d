@@ -100,6 +100,7 @@
     <div class="room">Room <b id="roomName"></b> · <b id="realmName"></b></div>
     <div class="hp" title="Health"><i id="hpFill"></i><span id="hpText">100 / 100</span></div>
     <div id="modeRow" class="modeRow"><span id="modeChip" class="chip"></span><span id="teamInfo"></span></div>
+    <div id="modRow" class="modRow" hidden><span id="modChip" class="chip mod"></span><span id="modDesc"></span></div>
     <div class="stat"><span class="icon mine"></span><b id="minesLeft">0</b> mines left</div>
     <div class="stat"><span class="icon safe"></span><b id="safeLeft">0</b> safe tiles left</div>
     <button id="lookBtn" class="secondary small" type="button">Change character</button>
@@ -119,6 +120,11 @@
     <button type="button" id="specLeave" class="secondary small">Leave</button>
   </div>
   <div id="reconnect" class="panel reconnect" hidden>Connection lost. Reconnecting…</div>
+  <div id="shop" class="panel shop" hidden>
+    <div class="shopHead"><b>Stairs shop</b> <span class="hint">spend your points before you go down</span>
+      <span id="shopPts" class="pts"></span></div>
+    <div id="shopItems" class="shopItems"></div>
+  </div>
   <div id="fade"></div>
   <div id="banner" class="banner" hidden><div id="bannerBig"></div><div id="bannerSmall"></div></div>
   <div id="inventory" class="panel" hidden>

@@ -88,6 +88,20 @@ Real-time multiplayer competitive minesweeper in a 3D world. Players are avatars
     - The run ends only via co-op lives (`flush_kos` → `end_round` failed). `over` carries `depth` and `runSecs`, and `store.Descents` records the team (`GET /api/descents`, the "Deepest descents" column on the join screen). The `deepest` stat (a max, via `stat(deepest=)`) unlocks the `lantern` hat.
     - Client: the `round` handler rebuilds the world when `snapshot.realm` changes, and `#fade` / `showBanner` cover the floor change.
     - Bots BFS-walk to the stairs, and v2 brains are told the mode is `"coop"`, since the AI only knows race, pvp and coop.
+    - `floor_cleared` also pays correct flags (`stairs.flags`), because descent never reaches a normal `end_round`.
+    - **Shop** (`SHOP`, `SHOP_OFFERS`, `SHOP_PRICE_PER_FLOOR`): `floor_cleared` picks `room.shop` (sent in `stairs.shop` and in snapshots). `buy {id}` → `Room.buy`, valid only while the stairs are open and not yet descending, once per offer per player (`p.bought`), and `life` once per floor (`room.life_bought`).
+    - Shop effects:
+      - `vitality` raises `p.max_hp`. **Use `p.max_hp`, never `MAX_HP`, for a player's health cap**; it's sent as the 9th field of each `players` row, and a new run resets it.
+      - `shield`, `boots` and `radar` go into `p.perks` and are applied in `next_floor()`. Radar waits for the floor's mines in `perk_tick()`.
+      - `supply` gives a held item now. The `bought` message is broadcast.
+    - **Modifiers** (`MODIFIERS`): `room.modifier` is rolled in `new_round(next_floor=True)` from depth 2 and sent in snapshots as `{id, name, desc}`.
+      - `rich`: ×2 gain in `open_tiles`.
+      - `swarm`: +1 in `boss_target_count`, × `SWARM_HP` boss HP.
+      - `trove`: ×2 items in `generate`.
+      - `volatile`: `VOLATILE_DAMAGE` in `explode`.
+      - `unstable`: `Room.crumble(now)` every `UNSTABLE_EVERY` re-covers a 3×3 of revealed tiles away from players (no mine changes, `safe_left` goes up) → `crumble {tiles, safeLeft, x, y}`.
+      - `dark`: client-only. `lightRealm()` dims the lights and fog (colours are linear, so use tiny values) and turns on the `lantern` PointLight. That light is `visible = false` on other floors so it costs nothing in shaders.
+    - Headless Chrome (SwiftShader) is very slow with point lights (spooky, volcano, dark floors) and can time out; check those with `--dump-dom` plus a debug `document.title`, or on a real GPU.
 - **Touch / mobile** (game.js `IS_TOUCH`, `body.touch` CSS; `?touch=1` forces it on desktop):
   - Controls: a pointer-events joystick (analogue; full tilt sprints) and Dig / Flag / Attack / Use / Jump buttons.
   - Dig and Flag act on `digTarget()`, shown by the pulsing yellow `digMark`: the tapped tile if it's in reach, else the hidden tile in the facing direction (`me.r`), else the hidden neighbour closest to it. Holding Dig repeats every 320 ms.
@@ -187,7 +201,7 @@ Server → client:
 - `welcome {id, room, spectator, token, resumed?, serverTime, cfg:{…, realm, mode, daily, throwRange, scatterRadius, bootsSpeed, freezeRange, blinkRange, shockRadius, held, maxHp, keyBit, spikeCycle, spikeUp, quick, resumeSeconds}, spawn, snapshot}` (the snapshot includes `layout` (W*H string of 0/1), `layoutKind`, `items:[[x,y,kind]]`, `traps:[[x,y,phase]]`, `doors:[[x,y]]` (empty once open) and `daily`)
 - `roster {players:[{id,name,color,char,hat}]}`
 - `profile {stats, unlocked, hats, new?}` (only to its owner)
-- `stairs {x, y, depth, bonus, lives, auto, by}`, `descending {by|null, depth, in}` (descent); snapshots also carry `realm`, `depth` and `stairs`
+- `stairs {x, y, depth, bonus, flags, lives, auto, by, shop:[{id,name,desc,cost}]}`, `descending {by|null, depth, in}`, `bought {pid, id, cost, lives, held}`, `crumble {tiles, safeLeft, x, y}` (descent); snapshots also carry `realm`, `depth`, `stairs`, `modifier` and `shop`. Client → server `buy {id}`.
 - `emote {pid, id}`, `ping {pid, x, y}`, `door {pid, tiles, reward}` (followed by a `reveal`), `drop {pid|null, x, y, kind}` (the key), `spike {pid, x, y, shielded, dmg, stun}`
 - `players {p:[[id,x,z,rot,score,stunLeft,fx,hp]]}` (15 Hz tick; `fx` bits: 1 shield, 2 boots, 4 gold rush, 8 frozen, `KEY_BIT` (1024) carrying the key; `(fx >> 4) & 15` is the index of the held item in `cfg.held`)
 - the `players` message also has `b:[[id,kind,x,z,rot,hp,maxHp,state]]` (state 0 wander, 1 chase, 2 wind-up, 3 frozen, 4 stunned)
